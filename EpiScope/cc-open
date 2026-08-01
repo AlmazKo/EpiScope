@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# cc-open <claude-session-id> — bring the user to the terminal window
+# running that Claude Code session, whatever terminal it lives in.
+# Falls back to opening a fresh kitty at the session's cwd when the
+# session has no terminal window. Exit 1 = session unknown, nothing done.
+#
+# Resolution comes from ~/.claude/state/cc-states.json (published by
+# EpiScope's TerminalTracker); cwd fallback from ~/.claude/sessions/*.json.
+#
+# A copy of this script ships inside EpiScope.app as the default; a
+# user copy in ~/.local/bin, ~/bin or ~/dotfiles/bin overrides it.
+
+SID="$1"
+[ -z "$SID" ] && { echo "usage: cc-open <claude-session-id>" >&2; exit 2; }
+
+KITTEN="${KITTEN:-/Applications/kitty.app/Contents/MacOS/kitten}"
+[ -x "$KITTEN" ] || KITTEN="$(command -v kitten || true)"
+
+eval "$(/usr/bin/env python3 - "$SID" <<'EOF'
+import glob, json, os, shlex, sys, time
+sid = sys.argv[1]
+home = os.path.expanduser("~")
+term = ref = sock = cwd = ""
+snap = os.path.join(home, ".claude/state/cc-states.json")
+try:
+    if time.time() - os.path.getmtime(snap) < 5:
+        data = json.load(open(snap))
+        if data.get("v") == 1:
+            # One session id can map to several live instances (e.g. resumed in
+            # a new terminal while the old one lingers), so rank the matches
+            # instead of taking the first: jump to the focused window, else the
+            # most recently launched instance (its per-pid session file
+            # startedAt) — stable, unlike a file mtime that jumps on every
+            # status write. A resume started later than the original wins.
+            matches = [(pid, e) for pid, e in data["states"].items()
+                       if e.get("session_id") == sid]
+            def _rank(item):
+                pid, e = item
+                started = 0
+                try:
+                    with open(os.path.join(home, ".claude/sessions", pid + ".json")) as fh:
+                        started = json.load(fh).get("startedAt") or 0
+                except Exception:
+                    pass
+                return (1 if e.get("focused") else 0, started)
+            if matches:
+                _, e = max(matches, key=_rank)
+                term, ref = e.get("term") or "", str(e.get("ref") or "")
+                sock = e.get("sock") or ""
+                cwd = e.get("cwd") or ""
+except Exception:
+    pass
+if not cwd:
+    for f in glob.glob(os.path.join(home, ".claude/sessions/*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        if d.get("sessionId") == sid:
+            cwd = d.get("cwd") or ""
+            break
+print(f"TERM_KIND={shlex.quote(term)} REF={shlex.quote(ref)} SOCK={shlex.quote(sock)} CWD={shlex.quote(cwd)}")
+EOF
+)"
+
+case "$TERM_KIND" in
+  kitty)
+    # Window ids are per-instance — the publisher tells us which
+    # instance's socket minted REF. Try that first; the blind sweep over
+    # every live socket is only the legacy-snapshot fallback (and may
+    # focus a same-id window of another instance, so it goes last).
+    if [ -n "$REF" ] && [ -n "$KITTEN" ]; then
+      CANDIDATES=""
+      [ -n "$SOCK" ] && CANDIDATES="$SOCK"
+      [ -n "$KITTY_LISTEN_ON" ] && CANDIDATES="$CANDIDATES $KITTY_LISTEN_ON"
+      for S in $(ls -t /tmp/kitty* 2>/dev/null); do
+        [ -S "$S" ] && CANDIDATES="$CANDIDATES unix:$S"
+      done
+      for S in $CANDIDATES; do
+        if "$KITTEN" @ --to "$S" focus-window --match "id:$REF" >/dev/null 2>&1; then
+          osascript -e 'tell application "kitty" to activate' >/dev/null 2>&1
+          exit 0
+        fi
+      done
+    fi
+    ;;
+  terminal)
+    # ref = "<window id>:<tab index>" (Terminal tabs have no stable id)
+    if [ -n "$REF" ]; then
+      WID="${REF%%:*}"; TIDX="${REF##*:}"
+      osascript -e "tell application \"Terminal\"
+        set selected of tab $TIDX of window id $WID to true
+        set index of window id $WID to 1
+        activate
+      end tell" >/dev/null 2>&1 && exit 0
+    fi
+    open -a Terminal 2>/dev/null && exit 0
+    ;;
+  ghostty)
+    # ref = terminal (surface) unique id. `focus` alone raises the window
+    # but does not switch tabs — hence the explicit select tab.
+    if [ -n "$REF" ]; then
+      RESULT=$(osascript - "$REF" <<'EOF' 2>/dev/null
+on run argv
+  set target to item 1 of argv
+  tell application "Ghostty"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in terminals of t
+          if (id of s) is target then
+            select tab t
+            focus s
+            activate window w
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+EOF
+)
+      [ "$RESULT" = "ok" ] && exit 0
+    fi
+    open -a Ghostty 2>/dev/null && exit 0
+    ;;
+  agterm)
+    # ref = "<window id>:<session id>". agterm (com.umputun.agterm) has no
+    # AppleScript dictionary — drive it over its control socket via agtermctl,
+    # which ships in the app bundle (Homebrew symlinks it onto PATH).
+    if [ -n "$REF" ]; then
+      AWID="${REF%%:*}"; ASID="${REF##*:}"
+      CTL="$(command -v agtermctl || true)"
+      [ -x "$CTL" ] || CTL="/Applications/agterm.app/Contents/MacOS/agtermctl"
+      if [ -x "$CTL" ] && [ -n "$ASID" ]; then
+        "$CTL" window select "$AWID" >/dev/null 2>&1
+        "$CTL" session select --target "$ASID" --window "$AWID" >/dev/null 2>&1
+        open -b com.umputun.agterm >/dev/null 2>&1 && exit 0
+      fi
+    fi
+    open -a agterm 2>/dev/null && exit 0
+    ;;
+  # xterm is ancestry-detected only (no scripting dictionary) — the best
+  # we can do is bring XQuartz forward.
+  xterm)
+    open -a XQuartz 2>/dev/null && exit 0
+    ;;
+  # JetBrains IDEs: REF is the IDE bundle id. No per-tab focus API, so
+  # we just bring the IDE app forward.
+  jetbrains)
+    [ -n "$REF" ] && open -b "$REF" 2>/dev/null && exit 0
+    ;;
+  # Claude desktop ("Code" tab): REF is the app bundle id. No per-session
+  # focus API — bring the Claude app forward.
+  claude-desktop)
+    [ -n "$REF" ] && open -b "$REF" 2>/dev/null && exit 0
+    ;;
+  iterm2)
+    if [ -z "$REF" ]; then
+      open -a iTerm 2>/dev/null && exit 0
+    fi
+    RESULT=$(osascript - "$REF" <<'EOF' 2>/dev/null
+on run argv
+  set target to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (unique ID of s) is target then
+            select s
+            select t
+            select w
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "notfound"
+end run
+EOF
+)
+    [ "$RESULT" = "ok" ] && exit 0
+    ;;
+esac
+
+# No terminal window found — open a kitty at the session's cwd. No -n:
+# spawning extra kitty instances is exactly what created untrackable
+# windows in the first place; activating the running instance is the
+# least-wrong landing.
+if [ -n "$CWD" ] && [ -d "$CWD" ]; then
+  open -a kitty --args --single-instance --directory "$CWD" 2>/dev/null && exit 0
+  open -a Terminal "$CWD" 2>/dev/null && exit 0
+fi
+exit 1

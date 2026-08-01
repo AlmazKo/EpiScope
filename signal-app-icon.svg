@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- solid red squircle background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#E53935"/>
+  <!-- centered white question mark -->
+  <text x="512" y="512"
+        font-family="-apple-system, SF Pro, Helvetica Neue, Arial, sans-serif"
+        font-weight="700"
+        font-size="640"
+        text-anchor="middle"
+        dominant-baseline="central"
+        fill="#ffffff">?</text>
+</svg>
