@@ -4,6 +4,74 @@ All notable changes to EpiScope are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/); versions track the app's
 `MARKETING_VERSION` and the `vX.Y` release tags.
 
+## [0.7] — 2026-08-04
+
+### Added
+- **Menu-bar fleet chart** — the status item draws six fixed slots, one per
+  session that is busy or needs you: dashes scroll while a session works, the
+  bar turns red and blinks at 1 Hz on a permission prompt, amber at 0.5 Hz when
+  a turn is waiting on you. The dropdown splits into *Needs attention* and
+  *Active*, each row with a coloured state icon.
+- **Error state** — a Claude API stream that dies without a Stop hook, or a
+  Codex turn that ends in a terminal error, shows a neutral `Error` badge in the
+  table instead of masquerading as Idle or Busy. Deliberately not an attention
+  state: no blink, no sound, no banner.
+- **Session context in notifications** — a banner carries the session's
+  AI-generated description, so several waiting sessions are tellable apart
+  without opening the app.
+- **Host application icons** — any app hosting a session gets its real icon,
+  including terminals EpiScope has no adapter for.
+
+### Changed
+- **One owner for expensive work.** Every transcript walk, index pass, chart
+  fold and CLI run goes through a single scheduler: exclusion groups (at most
+  one walk at a time, structurally), leases so a minutes-long child process
+  holds its group without parking a thread, coalescing that also sees work
+  already running, and launch admission so a cold start belongs to the visible
+  table rather than the full-text backfill.
+- **Incremental scanning for all three providers.** Codex and Claude Desktop
+  folded their whole transcript on every pass — up to 12 MB re-decoded once a
+  second for a live session; they now fold only the appended tail. The
+  rate-limit walk and the tool-activity summary stopped re-reading the corpus
+  as well.
+- **Per-provider behaviour lives on the type.** `SessionProvider` answers with
+  exhaustive switches, so a new provider fails to compile instead of silently
+  inheriting Claude's answer; the project-directory codec has one home.
+
+### Fixed
+- Codex and Claude Desktop sessions were silently missing from every daily and
+  weekly report, which therefore understated the fleet's cost.
+- The weekly report was lost every Monday: the week was marked done before the
+  run started, and the run was then refused because the daily one was still
+  preparing.
+- Deep search returned nothing for the whole session on a fresh install — the
+  read connection opened before the database file existed and never retried.
+- The chart grouped and coloured half the projects under paths the table never
+  showed, because a hyphenated project name decodes ambiguously from its
+  directory.
+- Clicking the Model, Name or Started headers moved the sort arrow without
+  reordering anything.
+- A live Codex or Claude Desktop row blanked its title, project and cost once a
+  second while being rescanned.
+- Codex token accounting and rate-limit window mapping.
+
+### Security
+- `cc-open` interpolated a value from `~/.claude/state/cc-states.json` into
+  AppleScript source, so a forged snapshot could run arbitrary commands from a
+  row double-click or a notification tap. Window and tab now go in as
+  arguments.
+- Rendered Markdown made any URL clickable and the system opener honours
+  `file://`, so a link in model output was one click from launching something.
+  Only web links stay clickable.
+- Session ids from other tools' files named files we create and delete without
+  validation, so a crafted id could empty an arbitrary file once a second.
+- Analysis packets (verbatim conversation text) moved out of world-readable
+  `/private/tmp`; the analysis run no longer inherits the user's own tool
+  permissions or MCP servers.
+- A symlinked `~/.claude/settings.json` is written through rather than
+  replaced, so a dotfiles repo keeps owning the file, and an edit that lands
+  mid-merge is no longer lost.
+
 ## [0.6] — 2026-07-06
 
 ### Added
