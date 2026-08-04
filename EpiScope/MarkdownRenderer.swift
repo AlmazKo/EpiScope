@@ -12,9 +12,10 @@ import AppKit
 //   - / * / + list items        → "• " prefix, body inline-parsed
 //   > blockquote                → italic body
 //   [text](url)                 → link colour + underline
+//   Markdown tables             → monospaced box-drawing grid
 //
-// Tables, nested lists, images, raw HTML, footnotes, task lists,
-// strikethrough, autolinks are deliberately out of scope.
+// Images, raw HTML, footnotes, task lists, strikethrough and autolinks are
+// deliberately out of scope.
 enum MarkdownRenderer {
 
     // codeBackground tints `inline code` and fenced blocks. Off by default —
@@ -26,7 +27,8 @@ enum MarkdownRenderer {
         baseFont: NSFont,
         color: NSColor = .labelColor,
         paragraphStyle: NSParagraphStyle? = nil,
-        codeBackground: NSColor? = nil
+        codeBackground: NSColor? = nil,
+        scrollableTables: Bool = false
     ) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let lines = source.components(separatedBy: "\n")
@@ -63,14 +65,23 @@ enum MarkdownRenderer {
                     rows.append(parseRow(lines[j]))
                     j += 1
                 }
-                out.append(renderTable(
+                let table = renderTable(
                     header: header,
                     alignments: alignments,
                     rows: rows,
                     baseFont: baseFont,
                     color: color,
                     paragraph: paragraphStyle
-                ))
+                )
+                if scrollableTables {
+                    out.append(NSAttributedString(
+                        attachment: ScrollableTableAttachment(table: table, baseFont: baseFont)
+                    ))
+                    out.append(plain("\n", font: baseFont, color: color,
+                                     paragraph: paragraphStyle))
+                } else {
+                    out.append(table)
+                }
                 i = j
                 continue
             }
@@ -540,6 +551,138 @@ enum MarkdownRenderer {
             i += 1
         }
         return nil
+    }
+}
+
+// A Markdown table is a single monospaced grid: wrapping any row breaks all
+// following column borders. In transcript mode, host that grid in a TextKit 2
+// view attachment so only the table scrolls sideways, not the prose around it.
+private final class ScrollableTableAttachment: NSTextAttachment {
+    let table: NSAttributedString
+    let documentSize: NSSize
+    let baseFont: NSFont
+
+    init(table: NSAttributedString, baseFont: NSFont) {
+        self.table = table
+        self.baseFont = baseFont
+        let measured = table.boundingRect(
+            with: NSSize(width: 100_000, height: 100_000),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        self.documentSize = NSSize(
+            width: max(1, ceil(measured.width) + 2),
+            height: max(1, ceil(measured.height) + 2)
+        )
+        super.init(data: nil, ofType: nil)
+        allowsTextAttachmentView = true
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    fileprivate func layoutBounds(for lineFragment: CGRect) -> CGRect {
+        let availableWidth = max(1, lineFragment.width)
+        return CGRect(
+            x: 0,
+            y: baseFont.descender,
+            width: min(documentSize.width, availableWidth),
+            height: documentSize.height
+        )
+    }
+
+    override func attachmentBounds(
+        for attributes: [NSAttributedString.Key: Any],
+        location: any NSTextLocation,
+        textContainer: NSTextContainer?,
+        proposedLineFragment: CGRect,
+        position: CGPoint
+    ) -> CGRect {
+        layoutBounds(for: proposedLineFragment)
+    }
+
+    override func viewProvider(
+        for parentView: NSView?,
+        location: any NSTextLocation,
+        textContainer: NSTextContainer?
+    ) -> NSTextAttachmentViewProvider? {
+        ScrollableTableViewProvider(
+            textAttachment: self,
+            parentView: parentView,
+            textLayoutManager: textContainer?.textLayoutManager,
+            location: location
+        )
+    }
+}
+
+private final class ScrollableTableViewProvider: NSTextAttachmentViewProvider {
+    override func loadView() {
+        guard let attachment = textAttachment as? ScrollableTableAttachment else {
+            view = NSView()
+            return
+        }
+
+        let tableView = NSTextView(frame: NSRect(origin: .zero, size: attachment.documentSize))
+        tableView.isEditable = false
+        tableView.isSelectable = true
+        tableView.isRichText = true
+        tableView.drawsBackground = false
+        tableView.textContainerInset = .zero
+        tableView.textContainer?.lineFragmentPadding = 0
+        tableView.textContainer?.containerSize = attachment.documentSize
+        tableView.textContainer?.widthTracksTextView = false
+        tableView.textStorage?.setAttributedString(attachment.table)
+        tableView.setAccessibilityLabel("Markdown table")
+        tableView.setAccessibilityValue(attachment.table.string)
+
+        let scrollView = HorizontalTableScrollView()
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.horizontalScrollElasticity = .automatic
+        scrollView.verticalScrollElasticity = .none
+        scrollView.documentView = tableView
+        view = scrollView
+        tracksTextAttachmentViewBounds = true
+    }
+
+    override func attachmentBounds(
+        for attributes: [NSAttributedString.Key: Any],
+        location: any NSTextLocation,
+        textContainer: NSTextContainer?,
+        proposedLineFragment: CGRect,
+        position: CGPoint
+    ) -> CGRect {
+        guard let attachment = textAttachment as? ScrollableTableAttachment else {
+            return .zero
+        }
+        return attachment.layoutBounds(for: proposedLineFragment)
+    }
+}
+
+private final class HorizontalTableScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        let wantsHorizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+            || event.modifierFlags.contains(.shift)
+        guard !wantsHorizontal else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        // A table has no vertical overflow of its own. Keep the transcript's
+        // normal vertical scrolling when the pointer happens to be over it.
+        var ancestor = superview
+        while let view = ancestor {
+            if let outerScroll = view as? NSScrollView, outerScroll !== self {
+                outerScroll.scrollWheel(with: event)
+                return
+            }
+            ancestor = view.superview
+        }
+        super.scrollWheel(with: event)
     }
 }
 

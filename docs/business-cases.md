@@ -718,12 +718,14 @@ mode.
 #### Scenario: Details open
 - **WHEN** the operator double-clicks a finished session, or presses Messages on a live one
 - **THEN** the chart above covers only that session — 15-minute bars that skip empty windows, with Input / Cache / Output checkboxes
+- **AND** `Your messages` and `AI responses` independently toggle the orange user-message and purple assistant-response markers
 - **AND** the conversation is shown below it
 
 #### Scenario: What the transcript contains
 - **WHEN** the transcript renders
 - **THEN** only the user ↔ assistant dialogue is shown
 - **AND** tool calls and diffs are hidden
+- **AND** the role label stays colour-coded while its message timestamp uses a subdued secondary-label style
 
 ### Requirement: Render Markdown with the built-in parser
 
@@ -732,6 +734,11 @@ The app SHALL render the model's Markdown without an external dependency.
 #### Scenario: A formatted answer
 - **WHEN** an answer contains markup
 - **THEN** the app renders headers, lists, `code`, fenced blocks, quotes and tables drawn with box-drawing characters
+
+#### Scenario: A table is wider than the conversation pane
+- **WHEN** a rendered Markdown table does not fit the transcript width
+- **THEN** that table scrolls horizontally without wrapping or breaking its grid
+- **AND** prose around the table continues to wrap to the conversation pane
 
 ### Requirement: Never let rendered text launch anything
 

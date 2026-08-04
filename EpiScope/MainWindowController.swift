@@ -105,7 +105,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // button and a spinner while the indexer is still scanning.
     private let reindexButton = NSButton()
     private let reindexSpinner = NSProgressIndicator()
-    private let transcriptView = NSTextView()
+    // TextKit 2 enables view-backed attachments: wide Markdown tables can
+    // scroll horizontally while the surrounding conversation still wraps.
+    private let transcriptView = NSTextView(usingTextLayoutManager: true)
     private let transcriptScroll = NSScrollView()
     private let divider = NSBox()
     private var outsideClickMonitor: Any?
@@ -2588,10 +2590,20 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let blockStart = body.length
             let isUser = event.kind == .user
             let stamp = event.timestamp.map(timeStampFormatter.string(from:)) ?? ""
-            let header = "\(isUser ? "USER" : "ASSISTANT") \(stamp)\n"
-            body.append(NSAttributedString(string: header, attributes: [
+            body.append(NSAttributedString(string: isUser ? "USER" : "ASSISTANT", attributes: [
                 .font: NSFont.systemFont(ofSize: headerFontSize, weight: .semibold),
                 .foregroundColor: isUser ? NSColor.systemBlue : NSColor.systemPurple,
+                .paragraphStyle: headerPara,
+            ]))
+            if !stamp.isEmpty {
+                body.append(NSAttributedString(string: " \(stamp)", attributes: [
+                    .font: NSFont.systemFont(ofSize: headerFontSize),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: headerPara,
+                ]))
+            }
+            body.append(NSAttributedString(string: "\n", attributes: [
+                .font: NSFont.systemFont(ofSize: headerFontSize),
                 .paragraphStyle: headerPara,
             ]))
             let bodyFont = NSFont.systemFont(ofSize: bodyFontSize)
@@ -2599,7 +2611,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 event.text,
                 baseFont: bodyFont,
                 color: .labelColor,
-                paragraphStyle: bodyPara
+                paragraphStyle: bodyPara,
+                scrollableTables: true
             ))
             body.append(NSAttributedString(string: "\n", attributes: [
                 .font: bodyFont,

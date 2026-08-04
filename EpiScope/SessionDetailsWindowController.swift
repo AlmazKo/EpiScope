@@ -1,10 +1,9 @@
 import AppKit
 
 // Cumulative input + cache + output line chart for a single session,
-// plotted over the session timeline. Three checkboxes along the top
-// toggle individual series; the y-axis rescales to the tallest enabled
-// series so a tiny line isn't squashed by a much larger one. Vertical
-// markers on the time axis mark each user message.
+// plotted over the session timeline. Checkboxes along the top toggle
+// individual series and conversation markers; the y-axis rescales to the
+// tallest enabled series so a tiny line isn't squashed by a much larger one.
 @MainActor
 final class SessionUsageChartView: NSView {
     var events: [SessionIndexer.TranscriptEvent] = [] {
@@ -21,8 +20,10 @@ final class SessionUsageChartView: NSView {
                                        target: nil, action: nil)
     private let outputToggle = NSButton(checkboxWithTitle: "Output",
                                         target: nil, action: nil)
-    private let userToggle = NSButton(checkboxWithTitle: "You",
+    private let userToggle = NSButton(checkboxWithTitle: "Your messages",
                                       target: nil, action: nil)
+    private let assistantToggle = NSButton(checkboxWithTitle: "AI responses",
+                                           target: nil, action: nil)
 
     override var isFlipped: Bool { false }
 
@@ -41,6 +42,7 @@ final class SessionUsageChartView: NSView {
             (cacheToggle,  ChartCanvas.cacheColor,  1),
             (outputToggle, ChartCanvas.outputColor, 2),
             (userToggle,   ChartCanvas.userMarkerColor, 3),
+            (assistantToggle, ChartCanvas.assistantMarkerColor, 4),
         ]
         for (button, color, tag) in buttons {
             button.translatesAutoresizingMaskIntoConstraints = false
@@ -69,6 +71,8 @@ final class SessionUsageChartView: NSView {
             outputToggle.leadingAnchor.constraint(equalTo: cacheToggle.trailingAnchor, constant: 16),
             userToggle.topAnchor.constraint(equalTo: topAnchor),
             userToggle.leadingAnchor.constraint(equalTo: outputToggle.trailingAnchor, constant: 16),
+            assistantToggle.topAnchor.constraint(equalTo: topAnchor),
+            assistantToggle.leadingAnchor.constraint(equalTo: userToggle.trailingAnchor, constant: 16),
 
             canvas.topAnchor.constraint(equalTo: topAnchor, constant: legendHeight),
             canvas.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -84,6 +88,7 @@ final class SessionUsageChartView: NSView {
         case 1: canvas.showCache = on
         case 2: canvas.showOutput = on
         case 3: canvas.showUserMarkers = on
+        case 4: canvas.showAssistantMarkers = on
         default: break
         }
         canvas.needsDisplay = true
@@ -97,12 +102,14 @@ final class ChartCanvas: NSView {
     static let outputColor = NSColor.systemBlue
 
     static let userMarkerColor = NSColor.systemOrange
+    static let assistantMarkerColor = NSColor.systemPurple
 
     var events: [SessionIndexer.TranscriptEvent] = []
     var showInput: Bool = true
     var showCache: Bool = true
     var showOutput: Bool = true
     var showUserMarkers: Bool = true
+    var showAssistantMarkers: Bool = true
 
     override var isFlipped: Bool { false }
 
@@ -140,11 +147,13 @@ final class ChartCanvas: NSView {
         }
         guard maxY > 0 else { drawEmptyState(); return }
 
-        // X domain spans every timestamped event (incl. user messages)
-        // so markers near the ends stay on-plot.
+        // X domain spans every timestamped conversation event so markers near
+        // the ends stay on-plot.
         let userTimes = events.compactMap { $0.kind == .user ? $0.timestamp : nil }
-        let tMin = min(points.first!.t, userTimes.min() ?? points.first!.t)
-        let tMax = max(points.last!.t, userTimes.max() ?? points.last!.t)
+        let assistantTimes = events.compactMap { $0.kind == .assistant ? $0.timestamp : nil }
+        let conversationTimes = userTimes + assistantTimes
+        let tMin = min(points.first!.t, conversationTimes.min() ?? points.first!.t)
+        let tMax = max(points.last!.t, conversationTimes.max() ?? points.last!.t)
         let span = max(tMax.timeIntervalSince(tMin), 1)
 
         let inset: CGFloat = 8
@@ -177,15 +186,10 @@ final class ChartCanvas: NSView {
         // User-message markers — solid verticals drawn under the data
         // lines so the curves read on top.
         if showUserMarkers, !userTimes.isEmpty {
-            let marks = NSBezierPath()
-            marks.lineWidth = 1
-            Self.userMarkerColor.withAlphaComponent(0.5).setStroke()
-            for t in userTimes {
-                let mx = xPos(t)
-                marks.move(to: NSPoint(x: mx, y: plot.minY))
-                marks.line(to: NSPoint(x: mx, y: plot.maxY))
-            }
-            marks.stroke()
+            drawMarkers(userTimes, color: Self.userMarkerColor, in: plot, xPos: xPos)
+        }
+        if showAssistantMarkers, !assistantTimes.isEmpty {
+            drawMarkers(assistantTimes, color: Self.assistantMarkerColor, in: plot, xPos: xPos)
         }
 
         // Data lines.
@@ -238,6 +242,21 @@ final class ChartCanvas: NSView {
         f.setLocalizedDateFormatFromTemplate("MMMd HH:mm")
         return f
     }()
+
+    private func drawMarkers(_ timestamps: [Date],
+                             color: NSColor,
+                             in plot: NSRect,
+                             xPos: (Date) -> CGFloat) {
+        let marks = NSBezierPath()
+        marks.lineWidth = 1
+        color.withAlphaComponent(0.5).setStroke()
+        for timestamp in timestamps {
+            let x = xPos(timestamp)
+            marks.move(to: NSPoint(x: x, y: plot.minY))
+            marks.line(to: NSPoint(x: x, y: plot.maxY))
+        }
+        marks.stroke()
+    }
 
     private func drawEmptyState() {
         let s = NSAttributedString(string: "No usage data recorded yet", attributes: [
