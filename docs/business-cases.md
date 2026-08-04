@@ -291,6 +291,7 @@ session.
 - **WHEN** the operator opens the session
 - **THEN** `cc-open` resolves that terminal directly by id and focuses it
 - **AND** Ghostty selects the native tab containing that surface
+- **AND** app activation happens before terminal focus, so Ghostty cannot restore the previously selected tab over the target
 
 #### Scenario: Ghostty scripting stalls
 - **GIVEN** Ghostty does not complete the focus Apple Event

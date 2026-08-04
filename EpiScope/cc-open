@@ -155,9 +155,8 @@ on run argv
   set targetID to item 1 of argv
   tell application "Ghostty"
     set targetTerminal to terminal id targetID
-    if targetTerminal does not exist then error "Terminal not found" number 1
-    focus targetTerminal
     activate
+    focus targetTerminal
   end tell
 end run
 EOF
