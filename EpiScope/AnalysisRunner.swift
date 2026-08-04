@@ -8,10 +8,10 @@ import Foundation
 // timeout with a SIGTERM → grace → SIGKILL ladder.
 //
 // The agent gets a read-only tool whitelist and its cwd is a scratch dir
-// under /private/tmp — so its own transcript lands in a ~/.claude project
-// dir that SessionIndexer treats as temporary and never shows or scans
-// (no self-pollution of the session table), and the read-only tools mean
-// transcript text can't steer it into touching the machine.
+// under the per-user temp root — so its own transcript lands in a ~/.claude
+// project dir that SessionIndexer treats as temporary and never shows or
+// scans (no self-pollution of the session table), and the read-only tools
+// mean transcript text can't steer it into touching the machine.
 
 nonisolated struct AnalysisRequest {
     // Full prompt text; packet/catalog files are referenced by path so
@@ -75,6 +75,9 @@ final class AnalysisRunner {
     private(set) var isRunning = false
     private(set) var startedAt: Date?
     private var process: Process?
+    // The analysis group is held for as long as the child lives; releasing it
+    // is what lets a queued run start.
+    private var activeLease: WorkScheduler.Lease?
     private var cancelled = false
     private var timedOut = false
     private var timeoutWork: DispatchWorkItem?
@@ -107,23 +110,56 @@ final class AnalysisRunner {
         }
     }
 
+    // Packets are verbatim conversation text, so the scratch root is the
+    // per-user temp dir (/var/folders/…, created 0700 by the OS and private to
+    // this account) rather than world-writable /private/tmp, where any other
+    // local user could read them — or pre-create the root as a symlink. It
+    // still resolves under /private/var, so SessionIndexer keeps classifying
+    // the agent's own session as temporary and never shows it.
+    nonisolated static var scratchRoot: URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("episcope-analysis", isDirectory: true)
+    }
+
     static func makeWorkDir() -> URL {
-        let dir = URL(fileURLWithPath: "/private/tmp/episcope-analysis", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = scratchRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
         return dir
     }
 
+    // An analysis is minutes of a child process. It may wait for anything else
+    // in its group, and it must hold nothing anyone else needs — so it takes a
+    // lease on the analysis group for the lifetime of the process, and only
+    // that group. Nothing outside it ever queues behind an analysis.
     func run(_ request: AnalysisRequest,
              completion: @escaping (Result<AnalysisOutcome, AnalysisError>) -> Void) {
+        WorkScheduler.shared.lease(group: WorkScheduler.Group.analysis) { [weak self] lease in
+            DispatchQueue.main.async {
+                guard let self else { lease.release(); return }
+                MainActor.assumeIsolated {
+                    self.launch(request, lease: lease, completion: completion)
+                }
+            }
+        }
+    }
+
+    private func launch(_ request: AnalysisRequest, lease: WorkScheduler.Lease,
+                        completion: @escaping (Result<AnalysisOutcome, AnalysisError>) -> Void) {
         guard !isRunning else {
+            lease.release()
             completion(.failure(.launchFailed("an analysis is already running")))
             return
         }
         guard let cli = ClaudeCLI.locate() else {
+            lease.release()
             completion(.failure(.cliNotFound))
             return
         }
+        // Held until the process is reaped in finish(); the group stays busy
+        // for exactly as long as the CLI runs.
+        activeLease = lease
 
         let p = Process()
         p.executableURL = cli
@@ -133,6 +169,16 @@ final class AnalysisRunner {
             "--model", request.model,
             "--max-turns", String(request.maxTurns),
             "--allowedTools", "Read,Grep,Glob",
+            // --allowedTools pre-approves tools; it does not disable the rest.
+            // Without the three flags below the run would inherit the user's
+            // own permissions.allow, defaultMode and MCP servers — so how
+            // contained this agent is would depend on how somebody else
+            // configured their CLI, while it chews on transcript text written
+            // by whoever the observed sessions talked to.
+            "--disallowedTools",
+            "Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task",
+            "--permission-mode", "default",
+            "--strict-mcp-config",
         ]
         for dir in request.addDirs { args += ["--add-dir", dir.path] }
         p.arguments = args
@@ -169,6 +215,8 @@ final class AnalysisRunner {
         } catch {
             isRunning = false
             process = nil
+            activeLease?.release()
+            activeLease = nil
             completion(.failure(.launchFailed(error.localizedDescription)))
             return
         }
@@ -219,6 +267,8 @@ final class AnalysisRunner {
         process = nil
         isRunning = false
         startedAt = nil
+        activeLease?.release()
+        activeLease = nil
 
         if cancelled {
             cleanUp(request.workDir)
@@ -231,7 +281,7 @@ final class AnalysisRunner {
             return
         }
         if status != 0 {
-            // Keep workDir for a post-mortem; /private/tmp is periodically
+            // Keep workDir for a post-mortem; the temp root is periodically
             // purged by the OS anyway.
             let tail = String(data: stderr.suffix(2000), encoding: .utf8) ?? ""
             completion(.failure(.exit(code: status,
@@ -245,7 +295,7 @@ final class AnalysisRunner {
 
     private func cleanUp(_ workDir: URL) {
         // Only ever remove our own scratch dirs, whatever the request said.
-        guard workDir.path.hasPrefix("/private/tmp/episcope-analysis/") else { return }
+        guard workDir.path.hasPrefix(Self.scratchRoot.path + "/") else { return }
         try? FileManager.default.removeItem(at: workDir)
     }
 

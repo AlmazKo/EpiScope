@@ -13,22 +13,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var reportsWindow = ReportsWindowController(
         indexer: indexer, searchIndex: searchIndex,
         store: reportStore, runner: analysisRunner)
-    private var blinkTimer: Timer?
-    private var blinkInterval: TimeInterval?
-    private var blinkOn = true
+    private let chart = MenuBarChart()
+    // TEMPORARY — see MenuBarChartDemo.swift, delete with it.
+    private let chartDemo = MenuBarChartDemo()
     // The set of live session ids at the last reindex. A live-state flip
     // (thinking↔idle, kitty paint) fires every second for an active
     // session but rarely changes which sessions exist — only reindex when
     // the membership actually changes, not on every flip.
     private var lastLiveSessionIds: Set<String> = []
-    // Refreshes the limit-gauge cache off-main so the status-bar menu
-    // never reads disk on open.
-    private var limitsCacheTimer: Timer?
     // nil until the first poll completes — that way an already-pending
     // session present at launch doesn't fire the "new permission"
     // chime.
     private var lastWaitingCount: Int?
-    private var dailyInsightsTimer: Timer?
 
     // Sound shown in the menu under "Sound ▶". "None" disables the
     // chime entirely. Persisted in UserDefaults under chimeSoundKey.
@@ -47,71 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
-    // Two cached NSImages:
-    //   - iconIdle is a template glyph (just "?"), tinted by AppKit
-    //     to whatever colour the menu bar wants for the appearance.
-    //   - iconWaiting is a fixed red disc with a white "?", used only
-    //     while a Claude session is paused on a permission prompt.
-    // Dimming for an active state's blink-off phase goes through
-    // button.alphaValue; idle stays fully opaque.
-    private static let dimmedAlpha: CGFloat = 0.35
-    private static let iconSize = NSSize(width: 22, height: 22)
-
     // Shared content width for the status-bar dropdown: the limit gauges are
     // drawn to exactly this width (bars right-aligned to its right edge), and
     // session rows truncate their path to fit, so a long cwd can't blow the
     // menu out and everything lines up against one right edge.
     private static let menuContentWidth: CGFloat = 300
-
-    private static let iconIdle: NSImage = {
-        let img = NSImage(size: iconSize, flipped: false) { rect in
-            drawQuestionMark(in: rect, color: .black)
-            return true
-        }
-        img.isTemplate = true
-        return img
-    }()
-
-    private static let iconWaiting: NSImage = {
-        NSImage(size: iconSize, flipped: false) { rect in
-            NSColor.systemRed.setFill()
-            NSBezierPath(ovalIn: rect.insetBy(dx: 2, dy: 2)).fill()
-            drawQuestionMark(in: rect, color: .white)
-            return true
-        }
-    }()
-
-    // Shown (blinking) when sessions have finished and are waiting on the
-    // user, but none is paused on a permission prompt — a yellow disc, the
-    // same colour as the "Finished" badge in the table.
-    private static let iconFinished: NSImage = {
-        // Warm amber, like the macOS microphone-in-use indicator — not a
-        // glaring yellow.
-        let amber = NSColor(srgbRed: 0.91, green: 0.58, blue: 0.12, alpha: 1)
-        return NSImage(size: iconSize, flipped: false) { rect in
-            amber.setFill()
-            NSBezierPath(ovalIn: rect.insetBy(dx: 2, dy: 2)).fill()
-            drawQuestionMark(in: rect, color: .white)
-            return true
-        }
-    }()
-
-    // str.size() returns line height (ascent + descent + leading),
-    // which would leave the glyph sitting low. Centre by capHeight +
-    // descender so the visible cap of "?" lands on the geometric mid.
-    private static func drawQuestionMark(in rect: NSRect, color: NSColor) {
-        let font = NSFont.boldSystemFont(ofSize: 14)
-        let str = NSAttributedString(string: "?", attributes: [
-            .font: font,
-            .foregroundColor: color,
-        ])
-        let strW = str.size().width
-        let baselineY = (rect.height - font.capHeight) / 2 + font.descender
-        str.draw(at: NSPoint(
-            x: (rect.width - strW) / 2,
-            y: baselineY
-        ))
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance only: a second EpiScope would race the first
@@ -137,8 +73,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // are display-only but must render at full strength.
         menu.autoenablesItems = false
         statusItem.menu = menu
+        chart.attach(to: statusItem)
+        chartDemo.start(chart: chart, statusItem: statusItem)   // TEMPORARY
 
-        monitor.onUpdate = { [weak self] in self?.render() }
+        monitor.onUpdate = { [weak self] in
+            guard let self else { return }
+            // SessionMonitor already tails Codex rollouts to detect unresolved
+            // approvals for the table/menu. Hand that verdict to the terminal
+            // tracker too, so the same transition can produce a notification;
+            // don't make a second rollout scanner just for banners.
+            let codexWaiting = Set(self.monitor.waiting.compactMap { session in
+                session.entrypoint == "codex" ? session.sessionId : nil
+            })
+            TerminalTracker.shared.updateCodexWaitingSessionIds(codexWaiting)
+            self.render()
+        }
         monitor.onLiveStateChange = { [weak self] in
             // Finished (done) state lives in kittyStates, which changes here
             // rather than via onUpdate — refresh the icon so the yellow blink
@@ -163,11 +112,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and db opened before indexer.start() so the initial publish lands.
         indexer.onEntriesUpdated = { [weak self] entries in
             self?.searchIndex.reconcile(entries: entries)
-            // Feed the tracker each session's ai-title (what Claude shows as the
-            // Ghostty tab title) so it can bind sessions to tabs by title.
+            // Feed the tracker each session's terminal label for Ghostty
+            // binding, plus the AI-generated description used as notification
+            // context. Keep them separate: a custom name can bind a tab, but it
+            // must not masquerade as an AI description in a banner.
             var titles: [String: String] = [:]
-            for e in entries { if let label = e.title ?? e.name, !label.isEmpty { titles[e.sessionId] = label } }
-            TerminalTracker.shared.updateSessionTitles(titles)
+            var descriptions: [String: String] = [:]
+            for e in entries {
+                if let label = e.title ?? e.name, !label.isEmpty {
+                    titles[e.sessionId] = label
+                }
+                if let description = e.title, !description.isEmpty {
+                    descriptions[e.sessionId] = description
+                }
+            }
+            TerminalTracker.shared.updateSessionMetadata(
+                titles: titles, descriptions: descriptions)
         }
         searchIndex.onProgress = { done, total in
             NotificationCenter.default.post(
@@ -195,20 +155,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.mainWindow.show()
             self?.mainWindow.enterInsights()
         }
-        // Daily insights: check every 30 min whether today's run is due
-        // (first tick a minute in, so the indexer has published entries).
-        let insightsTimer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async {
+        // Daily insights: check every 30 min whether today's run is due. The
+        // first check waits a minute, so the indexer has published entries.
+        WorkScheduler.shared.register(.init(
+            id: "insights-schedule", interval: 1800, target: .main, initialDelay: 60
+        ) { [weak self] in
+            MainActor.assumeIsolated {
                 self?.maybeRunDailyInsights()
                 self?.maybeRunWeeklyInsights()
             }
-        }
-        insightsTimer.tolerance = 120
-        dailyInsightsTimer = insightsTimer
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
-            self?.maybeRunDailyInsights()
-            self?.maybeRunWeeklyInsights()
-        }
+        })
         render()
 
         // Quietly install / migrate the Claude Code integration on every
@@ -225,12 +181,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep the limit-gauge cache warm in the background so opening the
         // status-bar menu is pure-cache (no disk I/O on the main thread).
         LimitChart.refreshLimitsCache()
-        let lt = Timer(timeInterval: 20, repeats: true) { _ in
+        WorkScheduler.shared.register(.init(
+            id: "limits-cache", interval: 20, target: .main, initialDelay: 20
+        ) {
             LimitChart.refreshLimitsCache()
-        }
-        lt.tolerance = 5
-        RunLoop.main.add(lt, forMode: .common)
-        limitsCacheTimer = lt
+        })
 
         LoginItem.ensureFirstRun()
 
@@ -246,33 +201,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         indexer.flushIndexToDisk()
     }
 
-    // Status-item attention level. Waiting (a permission prompt) wins over
-    // finished, which wins over idle.
-    private enum Attention { case idle, waiting, finished }
-
-    private func currentAttention() -> Attention {
-        // Unattended, not the full waiting list: an acknowledged prompt (e.g. a
-        // detached session the user can't answer in place) stops driving the
-        // alarm while still showing in the Needs-attention list.
-        if !monitor.unattendedWaiting.isEmpty { return .waiting }
-        if monitor.kittyStates.values.contains("done") { return .finished }
-        return .idle
-    }
-
     private func render() {
-        // Chime on the same signal the red blink uses — a newly unattended
-        // prompt (fresh or re-armed). Acknowledging one won't re-chime.
-        let count = monitor.unattendedWaiting.count
+        // Chime when another live permission/question request appears. Opening
+        // its terminal leaves the count unchanged, so it does not re-chime.
+        let count = monitor.waiting.count
         if let prev = lastWaitingCount, count > prev {
             playChime()
         }
         lastWaitingCount = count
 
-        let attn = currentAttention()
-        // Finished (yellow) blinks at half the rate of waiting (red).
-        let interval: TimeInterval = attn == .finished ? 1.0 : 0.5
-        updateBlink(active: attn != .idle, interval: interval)
-        applySymbol(attn, blinkOn: true)
+        guard !chartDemo.isRunning else { return }   // TEMPORARY
+        chart.update(bars: currentBars())
+    }
+
+    private enum FleetState: Equatable {
+        case request
+        case finished
+        case active
+
+        var rank: Int {
+            switch self {
+            case .request: 0
+            case .finished: 1
+            case .active: 2
+            }
+        }
+
+        var bar: MenuBarChart.Bar {
+            switch self {
+            case .request: .permission
+            case .finished: .question
+            case .active: .active
+            }
+        }
+
+        var statusText: String? {
+            switch self {
+            case .request: nil       // Use the concrete waitingFor description.
+            case .finished: "Finished"
+            case .active: "Busy"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .request: "exclamationmark"
+            case .finished: "checkmark"
+            case .active: "play.fill"
+            }
+        }
+
+        var iconBackgroundColor: NSColor {
+            switch self {
+            case .request: .systemRed
+            case .finished: .systemYellow
+            case .active: .systemBlue
+            }
+        }
+
+        var iconForegroundColor: NSColor {
+            switch self {
+            case .finished: .black
+            case .request, .active: .white
+            }
+        }
+    }
+
+    private struct FleetSession {
+        let session: SessionInfo
+        let state: FleetState
+    }
+
+    // One fleet entry per session that is doing something or wants something.
+    // Attention first — permission prompts, then sessions waiting on an
+    // answer — so the two blinking colours sit at the left edge; the rest
+    // keep a stable order (by session id) so a bar doesn't hop across the
+    // chart every time the fleet is re-sampled.
+    //
+    // An idle session gets no bar at all: it is open, not running, and a bar
+    // for it would say the machine is busier than it is. Busy is the same
+    // verdict the table uses — the session file's own `busy`, or the
+    // tracker's `thinking`.
+    //
+    // Permission and question requests remain urgent until Claude reports that
+    // the session has actually left `waiting` / `done`. Merely opening or
+    // focusing its terminal does not acknowledge the request.
+    private func currentFleet() -> [FleetSession] {
+        let waitingIds = Set(monitor.waiting.map(\.sessionId))
+        var fleet: [FleetSession] = []
+        for (sid, info) in monitor.liveSessions {
+            let state: FleetState?
+            if waitingIds.contains(sid) {
+                state = .request
+            } else if monitor.kittyStates[sid] == "done" {
+                state = .finished
+            } else if info.status == "busy" || monitor.kittyStates[sid] == "thinking" {
+                state = .active
+            } else {
+                state = nil
+            }
+            if let state {
+                fleet.append(FleetSession(session: info, state: state))
+            }
+        }
+        return fleet.sorted {
+            ($0.state.rank, $0.session.sessionId)
+                < ($1.state.rank, $1.session.sessionId)
+        }
+    }
+
+    private func currentBars() -> [MenuBarChart.Bar] {
+        currentFleet().map { $0.state.bar }
     }
 
     private func playChime() {
@@ -311,47 +350,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // afplay children in flight, kept alive until they exit (see above).
     private var chimeProcs: [Process] = []
 
-    private func applySymbol(_ attn: Attention, blinkOn: Bool) {
-        guard let button = statusItem.button else { return }
-        let img: NSImage
-        switch attn {
-        case .idle:     img = Self.iconIdle
-        case .waiting:  img = Self.iconWaiting
-        case .finished: img = Self.iconFinished
-        }
-        if button.image !== img { button.image = img }
-        if !button.title.isEmpty { button.title = "" }
-        // Idle is shown at full opacity; only the blink-off phase of an
-        // active (waiting / finished) state dims.
-        let alpha: CGFloat = (attn == .idle || blinkOn) ? 1.0 : Self.dimmedAlpha
-        if button.alphaValue != alpha { button.alphaValue = alpha }
-    }
-
-    private func updateBlink(active: Bool, interval: TimeInterval = 0.5) {
-        if active {
-            // Already blinking at the right rate — leave it running.
-            if blinkTimer != nil, blinkInterval == interval { return }
-            blinkTimer?.invalidate()
-            blinkOn = true
-            blinkInterval = interval
-            let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.tickBlink() }
-            }
-            t.tolerance = interval * 0.1
-            RunLoop.main.add(t, forMode: .common)
-            blinkTimer = t
-        } else {
-            blinkTimer?.invalidate()
-            blinkTimer = nil
-            blinkInterval = nil
-        }
-    }
-
-    private func tickBlink() {
-        blinkOn.toggle()
-        applySymbol(currentAttention(), blinkOn: blinkOn)
-    }
-
     // MARK: - Menu
 
     // Cocoa fires this right before the menu opens — perfect spot to
@@ -373,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "Sound":
             refreshSoundsMenu(menu)
         default:
-            rebuildMenu(menu, sessions: monitor.waiting)
+            rebuildMenu(menu)
         }
     }
 
@@ -634,10 +632,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return max(0, min(100, elapsed / window * 100))
         }
         func rows(_ lim: LimitChart.RealLimits) -> [LimitGaugeSectionView.Row] {
-            [.init(window: "5h", pct: lim.fiveHour,
-                   timePct: timePct(lim.fiveHourReset, window: 5 * 3600)),
-             .init(window: "Week", pct: lim.sevenDay,
-                   timePct: timePct(lim.sevenDayReset, window: 7 * 24 * 3600))]
+            var result: [LimitGaugeSectionView.Row] = []
+            if let pct = lim.fiveHour {
+                result.append(.init(window: "5h", pct: pct,
+                                    timePct: timePct(lim.fiveHourReset, window: 5 * 3600)))
+            }
+            if let pct = lim.sevenDay {
+                result.append(.init(window: "Week", pct: pct,
+                                    timePct: timePct(lim.sevenDayReset, window: 7 * 24 * 3600)))
+            }
+            return result
         }
         for (i, v) in vendors.enumerated() {
             if i > 0 { menu.addItem(.separator()) }
@@ -751,30 +755,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func rebuildMenu(_ menu: NSMenu, sessions: [SessionInfo]) {
+    private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
 
         if limitGaugesEnabled { addLimitGauges(to: menu) }
 
-        // Finished = live sessions the tracker flagged "done" (turn over,
-        // not yet looked at) that aren't currently waiting on permission.
-        let finished = monitor.liveSessions.values
-            .filter { monitor.kittyStates[$0.sessionId] == "done" }
-            .sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+        // Use the exact same fleet verdict as the fixed menu-bar slots. The
+        // chart cuts at six; the dropdown deliberately lists the whole fleet.
+        let fleet = currentFleet()
+        let attention = fleet.filter { $0.state != .active }
+        let active = fleet.filter { $0.state == .active }
 
-        if sessions.isEmpty && finished.isEmpty {
-            let item = NSMenuItem(title: "Nothing needs attention", action: nil, keyEquivalent: "")
+        if fleet.isEmpty {
+            let item = NSMenuItem(title: "No active sessions", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         } else {
-            // Waiting + finished share one section — both are sessions that
-            // want the user's attention. Waiting (blocked on a prompt) first.
-            menu.addItem(headerItem("Needs attention"))
-            for session in sessions {
-                menu.addItem(makeItem(for: session))
+            if !attention.isEmpty {
+                menu.addItem(headerItem("Needs attention"))
+                for entry in attention {
+                    menu.addItem(makeItem(for: entry.session, state: entry.state))
+                }
             }
-            for session in finished {
-                menu.addItem(makeItem(for: session, statusText: "Finished"))
+            if !active.isEmpty {
+                menu.addItem(headerItem("Active"))
+                for entry in active {
+                    menu.addItem(makeItem(for: entry.session, state: entry.state))
+                }
             }
         }
 
@@ -797,14 +804,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(searchItem)
     }
 
-    private func makeItem(for session: SessionInfo, statusText: String? = nil) -> NSMenuItem {
+    private func makeItem(for session: SessionInfo, state: FleetState) -> NSMenuItem {
         let item = NSMenuItem(title: session.folderName,
                               action: #selector(selectSession(_:)),
                               keyEquivalent: "")
         item.target = self
         item.representedObject = session
-        item.attributedTitle = formattedTitle(for: session, statusText: statusText)
+        item.attributedTitle = formattedTitle(for: session, statusText: state.statusText)
+        item.image = fleetIcon(for: state)
         return item
+    }
+
+    private func fleetIcon(for state: FleetState) -> NSImage? {
+        let symbolConfiguration = NSImage.SymbolConfiguration(
+            pointSize: 10,
+            weight: .semibold
+        ).applying(.init(paletteColors: [state.iconForegroundColor]))
+        guard let symbol = NSImage(
+            systemSymbolName: state.symbolName,
+            accessibilityDescription: nil
+        )?
+            .withSymbolConfiguration(symbolConfiguration)
+        else { return nil }
+
+        let size = NSSize(width: 22, height: 22)
+        let image = NSImage(size: size, flipped: false) { rect in
+            state.iconBackgroundColor.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
+
+            let symbolRect = NSRect(
+                x: rect.midX - symbol.size.width / 2,
+                y: rect.midY - symbol.size.height / 2,
+                width: symbol.size.width,
+                height: symbol.size.height
+            )
+            symbol.draw(in: symbolRect)
+            return true
+        }
+        // Keep semantic state colours in the menu instead of letting AppKit
+        // turn the whole image into a label-coloured template.
+        image.isTemplate = false
+        return image
     }
 
     private func formattedTitle(for session: SessionInfo, statusText: String? = nil) -> NSAttributedString {
@@ -927,11 +967,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let today = df.string(from: Date())
         let defaults = UserDefaults.standard
         guard defaults.string(forKey: Self.lastDailyInsightsKey) != today,
-              !analysisRunner.isRunning,
+              !reportsWindow.isAnalysisRunning,
               ClaudeCLI.locate() != nil
         else { return }
-        defaults.set(today, forKey: Self.lastDailyInsightsKey)
-        reportsWindow.runDailyInsights()
+        // Mark the day only once a run actually started. The old order marked
+        // first, so either refusal — a run already in flight, or nothing worth
+        // reporting yet — burned the day silently.
+        if reportsWindow.runDailyInsights() {
+            defaults.set(today, forKey: Self.lastDailyInsightsKey)
+        }
     }
 
     private static let lastWeeklyInsightsKey = "lastWeeklyInsightsWeek"
@@ -950,11 +994,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let week = df.string(from: Date())
         let defaults = UserDefaults.standard
         guard defaults.string(forKey: Self.lastWeeklyInsightsKey) != week,
-              !analysisRunner.isRunning,
+              !reportsWindow.isAnalysisRunning,
               ClaudeCLI.locate() != nil
         else { return }
-        defaults.set(week, forKey: Self.lastWeeklyInsightsKey)
-        reportsWindow.runWeeklyInsights()
+        // Monday fires both runs in the same tick, and the daily one wins the
+        // race: `runner.isRunning` is still false during its prep phase, so the
+        // weekly passed this guard, marked the week done and was then refused
+        // by the reports window. That lost the weekly report every Monday.
+        if reportsWindow.runWeeklyInsights() {
+            defaults.set(week, forKey: Self.lastWeeklyInsightsKey)
+        }
     }
 
     // MARK: - About panel

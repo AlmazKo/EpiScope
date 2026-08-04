@@ -8,7 +8,7 @@ the terminal icon in the table, window and session binding, the focus dance
 double click or a click on the banner.
 
 Code: `TerminalTracker.swift` (MARK: `Agterm adapter`), focus in `cc-open` (the
-`agterm)` case), icon in `MainWindowController.terminalIcon(for:)`.
+`agterm)` case), icon in `MainWindowController.terminalIcon(for:bundleId:)`.
 
 ---
 

@@ -116,10 +116,13 @@ final class ChartCanvas: NSView {
             events.compactMap {
                 guard let ts = $0.timestamp,
                       let i = $0.cumInput,
+                      let w = $0.cumCacheWrite,
                       let c = $0.cumCacheRead,
                       let o = $0.cumOutput
                 else { return nil }
-                return (ts, i, c, o)
+                // Match the main table: cache creation is shown with Input;
+                // cached reads remain the separate Cache series.
+                return (ts, i + w, c, o)
             }
             .sorted { $0.t < $1.t }
 

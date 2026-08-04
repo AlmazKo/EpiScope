@@ -53,7 +53,8 @@ final class SessionStore {
                 continue
             }
             guard let data = fm.contents(atPath: path),
-                  let info = try? decoder.decode(SessionInfo.self, from: data)
+                  let info = try? decoder.decode(SessionInfo.self, from: data),
+                  SessionID.isValid(info.sessionId)
             else { continue }
             let c = Cached(mtime: mtime, size: size, info: info)
             next[name] = c

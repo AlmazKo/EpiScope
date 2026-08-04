@@ -1,17 +1,45 @@
 #!/usr/bin/env bash
-# cc-open <claude-session-id> — bring the user to the terminal window
-# running that Claude Code session, whatever terminal it lives in.
+# cc-open <session-id> [claude-desktop-session-id] — bring the user to the terminal window or application
+# running that Claude Code / Codex session.
 # Falls back to opening a fresh kitty at the session's cwd when the
 # session has no terminal window. Exit 1 = session unknown, nothing done.
 #
 # Resolution comes from ~/.claude/state/cc-states.json (published by
 # EpiScope's TerminalTracker); cwd fallback from ~/.claude/sessions/*.json.
 #
-# A copy of this script ships inside EpiScope.app as the default; a
-# user copy in ~/.local/bin, ~/bin or ~/dotfiles/bin overrides it.
+# This script ships inside EpiScope.app and must match the snapshot schema
+# published by the same EpiScope version.
+
+# System binaries first. cc-open inherits EpiScope's environment, and a
+# LaunchAgent-started app takes its PATH from `launchctl setenv`, which any
+# local process can rewrite — a planted `python3` earlier on PATH would run
+# before any branch below. kitten and agtermctl still resolve normally.
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# Everything below is resolved from files any local process can write
+# (~/.claude/state/cc-states.json) and ends up in a URL, an `open -b`
+# argument or an AppleScript argument. Real session ids are uuids (the
+# Claude app prefixes local_), real bundle ids are reverse-DNS.
+ok_id() {
+  case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac
+}
+ok_bundle() {
+  case "$1" in ''|-*|*[!A-Za-z0-9.-]*) return 1 ;; *) return 0 ;; esac
+}
 
 SID="$1"
-[ -z "$SID" ] && { echo "usage: cc-open <claude-session-id>" >&2; exit 2; }
+[ -z "$SID" ] && { echo "usage: cc-open <session-id>" >&2; exit 2; }
+ok_id "$SID" || { echo "cc-open: refusing malformed session id" >&2; exit 2; }
+CLAUDE_DESKTOP_SID="${2:-}"
+[ -n "$CLAUDE_DESKTOP_SID" ] && { ok_id "$CLAUDE_DESKTOP_SID" || exit 2; }
+
+# Historical Claude App sessions may have no live cc-states entry. The table
+# supplies the metadata's cliSessionId explicitly; Claude uses it to bridge the
+# indexed local_<uuid> record to the exact Code/Cowork session in the app.
+if [ -n "$CLAUDE_DESKTOP_SID" ]; then
+  open "claude://code/$CLAUDE_DESKTOP_SID" 2>/dev/null && exit 0
+  open -b com.anthropic.claudefordesktop 2>/dev/null && exit 0
+fi
 
 KITTEN="${KITTEN:-/Applications/kitty.app/Contents/MacOS/kitten}"
 [ -x "$KITTEN" ] || KITTEN="$(command -v kitten || true)"
@@ -20,7 +48,7 @@ eval "$(/usr/bin/env python3 - "$SID" <<'EOF'
 import glob, json, os, shlex, sys, time
 sid = sys.argv[1]
 home = os.path.expanduser("~")
-term = ref = sock = cwd = ""
+term = ref = bundle_id = sock = cwd = ""
 snap = os.path.join(home, ".claude/state/cc-states.json")
 try:
     if time.time() - os.path.getmtime(snap) < 5:
@@ -46,6 +74,7 @@ try:
             if matches:
                 _, e = max(matches, key=_rank)
                 term, ref = e.get("term") or "", str(e.get("ref") or "")
+                bundle_id = e.get("bundle_id") or ""
                 sock = e.get("sock") or ""
                 cwd = e.get("cwd") or ""
 except Exception:
@@ -59,7 +88,7 @@ if not cwd:
         if d.get("sessionId") == sid:
             cwd = d.get("cwd") or ""
             break
-print(f"TERM_KIND={shlex.quote(term)} REF={shlex.quote(ref)} SOCK={shlex.quote(sock)} CWD={shlex.quote(cwd)}")
+print(f"TERM_KIND={shlex.quote(term)} REF={shlex.quote(ref)} APP_BUNDLE={shlex.quote(bundle_id)} SOCK={shlex.quote(sock)} CWD={shlex.quote(cwd)}")
 EOF
 )"
 
@@ -70,13 +99,15 @@ case "$TERM_KIND" in
     # every live socket is only the legacy-snapshot fallback (and may
     # focus a same-id window of another instance, so it goes last).
     if [ -n "$REF" ] && [ -n "$KITTEN" ]; then
-      CANDIDATES=""
-      [ -n "$SOCK" ] && CANDIDATES="$SOCK"
-      [ -n "$KITTY_LISTEN_ON" ] && CANDIDATES="$CANDIDATES $KITTY_LISTEN_ON"
-      for S in $(ls -t /tmp/kitty* 2>/dev/null); do
-        [ -S "$S" ] && CANDIDATES="$CANDIDATES unix:$S"
-      done
-      for S in $CANDIDATES; do
+      # /tmp is world-writable, so these paths are untrusted: keep them in an
+      # array rather than a space-joined string that re-splits and re-globs.
+      CANDIDATES=()
+      [ -n "$SOCK" ] && CANDIDATES+=("$SOCK")
+      [ -n "$KITTY_LISTEN_ON" ] && CANDIDATES+=("$KITTY_LISTEN_ON")
+      while IFS= read -r S; do
+        [ -S "$S" ] && CANDIDATES+=("unix:$S")
+      done < <(ls -t -d /tmp/kitty* 2>/dev/null)
+      for S in "${CANDIDATES[@]}"; do
         if "$KITTEN" @ --to "$S" focus-window --match "id:$REF" >/dev/null 2>&1; then
           osascript -e 'tell application "kitty" to activate' >/dev/null 2>&1
           exit 0
@@ -85,44 +116,71 @@ case "$TERM_KIND" in
     fi
     ;;
   terminal)
-    # ref = "<window id>:<tab index>" (Terminal tabs have no stable id)
-    if [ -n "$REF" ]; then
-      WID="${REF%%:*}"; TIDX="${REF##*:}"
-      osascript -e "tell application \"Terminal\"
-        set selected of tab $TIDX of window id $WID to true
-        set index of window id $WID to 1
-        activate
-      end tell" >/dev/null 2>&1 && exit 0
-    fi
-    open -a Terminal 2>/dev/null && exit 0
-    ;;
-  ghostty)
-    # ref = terminal (surface) unique id. `focus` alone raises the window
-    # but does not switch tabs — hence the explicit select tab.
-    if [ -n "$REF" ]; then
-      RESULT=$(osascript - "$REF" <<'EOF' 2>/dev/null
+    # ref = "<window id>:<tab index>" (Terminal tabs have no stable id).
+    # Both halves go in as osascript arguments, never as script text: ref
+    # comes from a file any local process can write, and interpolating it
+    # into the source would let it inject its own AppleScript statements
+    # (`do shell script`). Same argv form as the Ghostty/iTerm2 branches.
+    WID=""; TIDX=""
+    case "$REF" in *:*) WID="${REF%%:*}"; TIDX="${REF##*:}" ;; esac
+    case "$WID" in ''|*[!0-9]*) WID="" ;; esac
+    case "$TIDX" in ''|*[!0-9]*) WID="" ;; esac
+    if [ -n "$WID" ]; then
+      RESULT=$(osascript - "$WID" "$TIDX" <<'EOF' 2>/dev/null
 on run argv
-  set target to item 1 of argv
-  tell application "Ghostty"
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with s in terminals of t
-          if (id of s) is target then
-            select tab t
-            focus s
-            activate window w
-            activate
-            return "ok"
-          end if
-        end repeat
-      end repeat
-    end repeat
+  set wid to (item 1 of argv) as integer
+  set tidx to (item 2 of argv) as integer
+  tell application "Terminal"
+    set selected of tab tidx of window id wid to true
+    set index of window id wid to 1
+    activate
   end tell
-  return "notfound"
+  return "ok"
 end run
 EOF
 )
       [ "$RESULT" = "ok" ] && exit 0
+    fi
+    open -a Terminal 2>/dev/null && exit 0
+    ;;
+  ghostty)
+    # ref = terminal (surface) unique id. Ghostty exposes application-level
+    # terminal lookup by that stable id; `focus` selects the surface's native
+    # tab and brings its window forward. Do not rediscover the hierarchy here:
+    # walking windows/tabs/terminals and then sending commands to the temporary
+    # loop objects can hang Ghostty's preview AppleScript implementation.
+    if [ -n "$REF" ]; then
+      osascript - "$REF" <<'EOF' >/dev/null 2>&1 &
+on run argv
+  set targetID to item 1 of argv
+  tell application "Ghostty"
+    set targetTerminal to terminal id targetID
+    if targetTerminal does not exist then error "Terminal not found" number 1
+    focus targetTerminal
+    activate
+  end tell
+end run
+EOF
+      AS_PID=$!
+      # AppleScript support is explicitly preview-quality in Ghostty 1.3. A
+      # bounded wait keeps a bad event from accumulating a stuck osascript on
+      # every table/notification click. Five seconds is generous for a local
+      # Apple Event while still making the app-level fallback useful.
+      for _ in {1..50}; do
+        kill -0 "$AS_PID" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$AS_PID" 2>/dev/null; then
+        kill "$AS_PID" 2>/dev/null
+        for _ in {1..10}; do
+          kill -0 "$AS_PID" 2>/dev/null || break
+          sleep 0.1
+        done
+        kill -KILL "$AS_PID" 2>/dev/null
+        wait "$AS_PID" 2>/dev/null
+      elif wait "$AS_PID"; then
+        exit 0
+      fi
     fi
     open -a Ghostty 2>/dev/null && exit 0
     ;;
@@ -150,12 +208,26 @@ EOF
   # JetBrains IDEs: REF is the IDE bundle id. No per-tab focus API, so
   # we just bring the IDE app forward.
   jetbrains)
-    [ -n "$REF" ] && open -b "$REF" 2>/dev/null && exit 0
+    ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
     ;;
-  # Claude desktop ("Code" tab): REF is the app bundle id. No per-session
-  # focus API — bring the Claude app forward.
+  # Any app bundle that has no dedicated adapter yet. Process ancestry gives
+  # us its bundle id, which is enough for both automatic icons and activation.
+  application)
+    # Codex exposes a documented deep link for an exact local thread. Activating
+    # the bundle alone lands on whichever thread happened to be visible last.
+    if [ "$APP_BUNDLE" = "com.openai.codex" ] || [ "$REF" = "com.openai.codex" ]; then
+      open "codex://threads/$SID" 2>/dev/null && exit 0
+    fi
+    ok_bundle "$APP_BUNDLE" && open -b "$APP_BUNDLE" 2>/dev/null && exit 0
+    ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
+    ;;
+  # Claude desktop (Code / local-agent mode) accepts a bridge session id in its
+  # registered URL scheme, so open the exact session instead of whichever one
+  # happened to be visible last. Live ~/.claude sessions already use SID as the
+  # bridge id; indexed local_<uuid> sessions pass cliSessionId as argv[2] above.
   claude-desktop)
-    [ -n "$REF" ] && open -b "$REF" 2>/dev/null && exit 0
+    open "claude://code/$SID" 2>/dev/null && exit 0
+    ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
     ;;
   iterm2)
     if [ -z "$REF" ]; then

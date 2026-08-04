@@ -395,17 +395,18 @@ enum MarkdownRenderer {
                 flushBuffer()
                 let label = String(chars[(i + 1)..<closeBracket])
                 let url = String(chars[(closeBracket + 2)..<closeParen])
+                let target = URL(string: url).flatMap(clickableTarget)
                 // The label is markdown too — a `code` span inside a link has
                 // to render as code, not as literal backticks painted in link
                 // colour. Style the parsed label, don't re-flatten it.
                 let text = NSMutableAttributedString(attributedString: renderInline(
-                    label, baseFont: baseFont, color: .linkColor,
+                    label, baseFont: baseFont, color: target == nil ? color : .linkColor,
                     paragraph: paragraph, codeBackground: codeBackground))
-                let whole = NSRange(location: 0, length: text.length)
-                text.addAttribute(.underlineStyle,
-                                  value: NSUnderlineStyle.single.rawValue, range: whole)
-                if let real = URL(string: url) {
-                    text.addAttribute(.link, value: real, range: whole)
+                if let target {
+                    let whole = NSRange(location: 0, length: text.length)
+                    text.addAttribute(.underlineStyle,
+                                      value: NSUnderlineStyle.single.rawValue, range: whole)
+                    text.addAttribute(.link, value: target, range: whole)
                 }
                 out.append(text)
                 i = closeParen + 1
@@ -416,6 +417,18 @@ enum MarkdownRenderer {
         }
         flushBuffer()
         return out
+    }
+
+    // Everything this renderer draws — transcripts and report bodies alike —
+    // is model output, and NSTextView hands a clicked link straight to
+    // NSWorkspace with no confirmation. A file:///…/x.command opens in
+    // Terminal and a custom scheme reaches whichever app registered it, so
+    // only the web schemes become links; the rest render as ordinary text.
+    private static func clickableTarget(_ url: URL) -> URL? {
+        switch url.scheme?.lowercased() {
+        case "http", "https", "mailto": return url
+        default: return nil
+        }
     }
 
     // MARK: - Lists

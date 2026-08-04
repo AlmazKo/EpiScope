@@ -16,14 +16,17 @@ import UserNotifications
 //      (osascript costs ~250 ms, polled every other tick). Sessions in
 //      no known terminal are published with term = null.
 //   3. State per session: hook signal (~/.claude/state/sig-<session_id>)
-//      beats CC status (busy → thinking, idle → done); a focused window
-//      acknowledges (wipe signal, mark attended-<session_id>, render idle).
+//      complements CC status (busy → thinking, idle → done); transcript
+//      terminal events add a table-only `error` state. A focused window
+//      acknowledges `done`, while permission requests stay active until CC
+//      leaves `waiting`.
 //   4. Snapshot goes to cc-states.json (v1 envelope, atomic rename,
 //      mtime is the heartbeat).
 //
 // It also owns user notifications: a banner on the done /
-// needs_permission transitions, removed once the session is attended.
-// Clicking a banner focuses the hosting terminal via cc-open — the
+// needs_permission transitions. Finished is removed once attended; a
+// permission banner remains until Claude or Codex leaves `waiting`.
+// Clicking a banner focuses the hosting terminal/app via cc-open — the
 // exact same path as a double-click in the sessions table.
 final class TerminalTracker: NSObject {
     static let shared = TerminalTracker()
@@ -36,11 +39,11 @@ final class TerminalTracker: NSObject {
     // delegate for the whole app.
     var onReportNotificationClick: (() -> Void)?
 
-    private static let interval: TimeInterval = 1.0
+    static let interval: TimeInterval = 1.0
+    static let jobId = "terminal-tracker"
     private static let scriptEvery = 2  // AppleScript / kitty enumerations every 2 s
 
     private let queue = DispatchQueue(label: "episcope.terminal-tracker", qos: .utility)
-    private var timer: DispatchSourceTimer?
     // Codex discovery walks every process (`ps -axo`), which is the most
     // expensive thing in a tick. Codex appearing/leaving is fine to notice
     // a couple of seconds late, so refresh it on this slower cadence and
@@ -77,15 +80,35 @@ final class TerminalTracker: NSObject {
     // the index by AppDelegate; read on `queue` in assignGhostty. Lets us bind
     // an unnamed session to its Ghostty tab by title.
     private var sessionTitles: [String: String] = [:]
+    // sessionId -> AI-generated session description. This deliberately excludes
+    // the user's custom name. It becomes the short first line of notification
+    // bodies and is pushed from the already-parsed index, so notification
+    // delivery never needs to read a transcript.
+    private var sessionDescriptions: [String: String] = [:]
+    // SessionMonitor is the single rollout-tail reader for Codex approval
+    // state. AppDelegate pushes its current waiting ids onto this queue so the
+    // notification state machine can treat them as needs_permission without a
+    // second filesystem scan.
+    private var codexWaitingSessionIds: Set<String> = []
     // CC liveness/tty without a `ps` every tick: each pid is ps'd once (to
     // resolve its tty and confirm it's really a claude process), then liveness
     // is a cheap kill(0). ccChecked holds every pid already ps'd (claude or
     // not); ccTty maps confirmed-claude pids to their tty ("" = no tty).
     private var ccTty: [Int: String] = [:]
     private var ccChecked: Set<Int> = []
-    // Codex pid → (rollout sessionId, cwd). A process holds these for
+    // Codex pid → (rollout sessionId, cwd, rollout path). A process holds these for
     // its lifetime, so lsof runs once per pid, not every tick.
-    private var codexInfoCache: [Int: (sessionId: String, cwd: String)] = [:]
+    private var codexInfoCache: [Int: (sessionId: String, cwd: String, rolloutPath: String)] = [:]
+
+    // Transcript tails are only decoded after the file changes. The state
+    // tracker ticks every second, so this keeps a settled session to one stat
+    // instead of repeatedly reading its jsonl.
+    private struct TurnOutcomeCacheEntry {
+        let mtime: Date
+        let size: UInt64
+        let errored: Bool
+    }
+    private var turnOutcomeCache: [String: TurnOutcomeCacheEntry] = [:]
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
     private var stateDir: String { home + "/.claude/state" }
@@ -99,6 +122,12 @@ final class TerminalTracker: NSObject {
         // window. Window ids are per-instance, so a ref is meaningless
         // to consumers without the socket that minted it.
         var sock: String? = nil
+    }
+
+    private struct AncestryHost {
+        let term: String
+        let ref: String?
+        let bundleId: String?
     }
 
     // Terminals recognisable by walking up the process tree (executable
@@ -144,11 +173,13 @@ final class TerminalTracker: NSObject {
         try? FileManager.default.createDirectory(
             atPath: stateDir, withIntermediateDirectories: true)
 
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + 1, repeating: Self.interval)
-        t.setEventHandler { [weak self] in self?.tickOnce() }
-        t.resume()
-        timer = t
+        // The tick keeps running on this subsystem's own serial queue — it is
+        // what serializes a tick against updateSessionMetadata / acknowledge —
+        // but the cadence now comes from the shared scheduler.
+        WorkScheduler.shared.register(.init(
+            id: Self.jobId, interval: Self.interval, target: .queue(queue),
+            initialDelay: Self.interval
+        ) { [weak self] in self?.tickOnce() })
     }
 
     // MARK: - Tick
@@ -196,13 +227,14 @@ final class TerminalTracker: NSObject {
 
         var states: [String: Entry] = [:]
         var bySid: [String: Entry] = [:]
-        // pid → (term kind, optional ref). For JetBrains the ref is the IDE
-        // bundle id so cc-open can activate the right app. Resolved eagerly when
+        // pid → host found in the process ancestry. For application hosts the
+        // bundle id lets both cc-open and the table use the exact installed app.
+        // Resolved eagerly when
         // any session isn't precisely placed (i.e. is a ghostty candidate) —
         // it both vetoes wrong ghostty matches below and serves as the loop's
         // fallback — and skipped entirely (no ps) when everything is located.
         let ghosttyEligible = sessions.filter { ghosttyCandidate($0, kitty: kitty, ttys: ttys) }
-        let ancestry: [Int: (term: String, ref: String?)] =
+        let ancestry: [Int: AncestryHost] =
             ghosttyEligible.isEmpty ? [:] : ancestryLookup(pids: sessions.map(\.pid))
         // Ghostty surfaces expose no tty, so they're matched by title / cwd —
         // which a session running under another terminal in the same directory
@@ -221,11 +253,18 @@ final class TerminalTracker: NSObject {
             // the app. State still comes from the hooks (computeState), with no
             // focus dance (we can't detect a Claude.app window's focus).
             if s.entrypoint == "claude-desktop" {
-                let state = computeState(sid: s.sessionId, status: s.status ?? "",
-                                         located: true, focused: false)
+                let turnErrored = claudeTurnErrored(sessionId: s.sessionId, cwd: s.cwd)
+                let state = computeState(
+                    sid: s.sessionId,
+                    status: s.attentionStatus ?? "",
+                    statusUpdatedAt: s.statusUpdatedAt,
+                    turnErrored: turnErrored,
+                    located: true,
+                    focused: false)
                 let entry = Entry(
                     state: state, session_id: s.sessionId,
                     term: "claude-desktop", ref: "com.anthropic.claudefordesktop",
+                    bundle_id: "com.anthropic.claudefordesktop",
                     sock: nil, tty: ttys[s.pid], cwd: s.cwd, focused: false, wid: nil)
                 states[String(s.pid)] = entry
                 bySid[s.sessionId] = entry
@@ -255,18 +294,32 @@ final class TerminalTracker: NSObject {
                 term = ancestry[s.pid]?.term
                 ancestryRef = ancestry[s.pid]?.ref
             }
-            // Codex has no hook signals / "done" semantics here — just
-            // publish it as idle so its terminal (term/ref) is exposed.
-            let state = s.entrypoint == "codex" ? "idle" : computeState(
-                sid: s.sessionId,
-                status: s.status ?? "",
-                located: loc != nil,
-                focused: loc?.focused ?? false)
+            // Codex has no hook signals / "done" semantics here. Its rollout
+            // tail exposes both unresolved approvals and terminal turn errors.
+            let state: String
+            if s.entrypoint == "codex" {
+                if codexWaitingSessionIds.contains(s.sessionId) {
+                    state = "needs_permission"
+                } else if let info = codexInfoCache[s.pid], codexTurnErrored(at: info.rolloutPath) {
+                    state = "error"
+                } else {
+                    state = "idle"
+                }
+            } else {
+                state = computeState(
+                    sid: s.sessionId,
+                    status: s.attentionStatus ?? "",
+                    statusUpdatedAt: s.statusUpdatedAt,
+                    turnErrored: claudeTurnErrored(sessionId: s.sessionId, cwd: s.cwd),
+                    located: loc != nil,
+                    focused: loc?.focused ?? false)
+            }
             let entry = Entry(
                 state: state,
                 session_id: s.sessionId,
                 term: term,
                 ref: loc?.ref ?? ancestryRef,
+                bundle_id: ancestry[s.pid]?.bundleId,
                 sock: loc?.sock,
                 tty: tty,
                 cwd: s.cwd,
@@ -347,7 +400,7 @@ final class TerminalTracker: NSObject {
             guard (comm.components(separatedBy: "/").last ?? comm) == "codex" else { continue }
             seenPids.insert(pid)
 
-            let info: (sessionId: String, cwd: String)
+            let info: (sessionId: String, cwd: String, rolloutPath: String)
             if let cached = codexInfoCache[pid] {
                 info = cached
             } else if let resolved = codexLsof(pid: pid) {
@@ -367,9 +420,10 @@ final class TerminalTracker: NSObject {
     }
 
     // lsof the codex pid → its open rollout jsonl (→ session uuid) + cwd.
-    private func codexLsof(pid: Int) -> (sessionId: String, cwd: String)? {
+    private func codexLsof(pid: Int) -> (sessionId: String, cwd: String, rolloutPath: String)? {
         guard let out = runShell(["/usr/sbin/lsof", "-p", String(pid), "-Fn"]) else { return nil }
         var sessionId: String?
+        var rolloutPath: String?
         var cwd = ""
         var isCwd = false
         for line in out.split(separator: "\n") {
@@ -381,10 +435,11 @@ final class TerminalTracker: NSObject {
             if path.contains("/.codex/sessions/"), path.hasSuffix(".jsonl"),
                let name = path.components(separatedBy: "/").last {
                 sessionId = String(name.dropLast(6).suffix(36))   // strip ".jsonl"
+                rolloutPath = path
             }
         }
-        guard let sid = sessionId else { return nil }
-        return (sid, cwd)
+        guard let sid = sessionId, let rolloutPath else { return nil }
+        return (sid, cwd, rolloutPath)
     }
 
     // MARK: - kitty adapter
@@ -770,7 +825,7 @@ final class TerminalTracker: NSObject {
 
     // MARK: - ancestry fallback (terminal kind without window ref / focus)
 
-    private func ancestryLookup(pids: [Int]) -> [Int: (term: String, ref: String?)] {
+    private func ancestryLookup(pids: [Int]) -> [Int: AncestryHost] {
         guard let out = runShell(["/bin/ps", "-axo", "pid=,ppid=,comm="])
         else { return [:] }
         var parent: [Int: Int] = [:]
@@ -783,25 +838,42 @@ final class TerminalTracker: NSObject {
             parent[pid] = ppid
             exePath[pid] = String(parts[2]).trimmingCharacters(in: .whitespaces)
         }
-        var res: [Int: (term: String, ref: String?)] = [:]
+        var res: [Int: AncestryHost] = [:]
         for start in pids {
             var pid = start
+            var nearestBundleId: String?
             for _ in 0..<15 {
                 let path = exePath[pid] ?? ""
                 let base = path.components(separatedBy: "/").last ?? ""
+                let bundleId = Self.bundleId(exePath: path)
+                if nearestBundleId == nil { nearestBundleId = bundleId }
                 if let term = Self.termsByAncestorExe[base] {
                     // For JetBrains, attach the IDE bundle id so cc-open
                     // can activate the exact app.
-                    res[start] = (term, term == "jetbrains" ? Self.bundleId(exePath: path) : nil)
+                    let hostBundleId = bundleId ?? nearestBundleId
+                    res[start] = AncestryHost(
+                        term: term,
+                        ref: term == "jetbrains" ? hostBundleId : nil,
+                        bundleId: hostBundleId)
                     break
                 }
                 // Any other JetBrains product → bundle id com.jetbrains*.
-                if let bid = Self.bundleId(exePath: path), bid.hasPrefix("com.jetbrains") {
-                    res[start] = ("jetbrains", bid)
+                if let bundleId, bundleId.hasPrefix("com.jetbrains") {
+                    res[start] = AncestryHost(
+                        term: "jetbrains", ref: bundleId, bundleId: bundleId)
                     break
                 }
                 guard let up = parent[pid], up > 1 else { break }
                 pid = up
+            }
+            // No dedicated adapter is needed for an application we have never
+            // seen before: its outer .app bundle is enough to show its icon and
+            // bring it forward. Keep walking for known terminals first so an
+            // Electron helper cannot hide a more precise host above it.
+            if res[start] == nil, let nearestBundleId {
+                res[start] = AncestryHost(
+                    term: "application", ref: nearestBundleId,
+                    bundleId: nearestBundleId)
             }
         }
         return res
@@ -811,7 +883,10 @@ final class TerminalTracker: NSObject {
     // tracker queue (ancestryLookup runs there).
     nonisolated(unsafe) private static var bundleIdCache: [String: String?] = [:]
     private static func bundleId(exePath: String) -> String? {
-        guard let r = exePath.range(of: ".app/Contents/MacOS/") else { return nil }
+        // Use the outermost bundle. Electron and IDE helpers often execute from
+        // Contents/Frameworks/<Helper>.app, but the icon users recognise belongs
+        // to the containing application.
+        guard let r = exePath.range(of: ".app/") else { return nil }
         let appPath = String(exePath[..<r.lowerBound]) + ".app"
         if let cached = bundleIdCache[appPath] { return cached }
         var bid: String?
@@ -824,15 +899,153 @@ final class TerminalTracker: NSObject {
         return bid
     }
 
+    // MARK: - terminal turn outcomes
+
+    private struct ClaudeOutcomeRecord: Decodable {
+        let type: String?
+        let isApiErrorMessage: Bool?
+        let error: String?
+    }
+
+    private struct CodexOutcomeRecord: Decodable {
+        let type: String?
+        let payload: Payload?
+
+        struct Payload: Decodable {
+            let type: String?
+            let reason: String?
+        }
+    }
+
+    private func claudeTurnErrored(sessionId: String, cwd: String) -> Bool {
+        let path = ClaudeProjectPath.transcript(
+            sessionId: sessionId, cwd: cwd,
+            in: URL(fileURLWithPath: home + "/.claude/projects", isDirectory: true)).path
+        return cachedTurnOutcome(path: path) { data in
+            let decoder = JSONDecoder()
+            for line in data.split(separator: 0x0a, omittingEmptySubsequences: true).reversed() {
+                guard let record = try? decoder.decode(ClaudeOutcomeRecord.self, from: Data(line)) else {
+                    continue
+                }
+                switch record.type {
+                case "assistant":
+                    return record.isApiErrorMessage == true || record.error != nil
+                case "user":
+                    // A retry/new prompt supersedes the previous failed turn.
+                    return false
+                default:
+                    continue
+                }
+            }
+            return false
+        }
+    }
+
+    private func codexTurnErrored(at path: String) -> Bool {
+        cachedTurnOutcome(path: path) { data in
+            let decoder = JSONDecoder()
+            for line in data.split(separator: 0x0a, omittingEmptySubsequences: true).reversed() {
+                guard let record = try? decoder.decode(CodexOutcomeRecord.self, from: Data(line)),
+                      record.type == "event_msg",
+                      let event = record.payload?.type else { continue }
+                switch event {
+                case "task_complete":
+                    return false
+                case "error":
+                    return true
+                case "stream_error":
+                    // Retry/reconnect progress, not a terminal outcome. If
+                    // retries are exhausted Codex follows with `error`.
+                    continue
+                case "turn_aborted":
+                    // A user cancellation is a normal stopped turn. Other abort
+                    // reasons indicate that Codex could not finish the turn.
+                    let normalReasons = ["interrupted", "user_requested"]
+                    return !normalReasons.contains(record.payload?.reason ?? "")
+                case "task_started":
+                    // A new turn clears a prior error while it is in progress.
+                    return false
+                default:
+                    continue
+                }
+            }
+            return false
+        }
+    }
+
+    private func cachedTurnOutcome(path: String, scan: (Data) -> Bool) -> Bool {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date,
+              let size = (attrs[.size] as? NSNumber)?.uint64Value else { return false }
+        if let cached = turnOutcomeCache[path], cached.mtime == mtime, cached.size == size {
+            return cached.errored
+        }
+
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return false
+        }
+        defer { try? handle.close() }
+        let tailSize: UInt64 = 64 * 1024
+        try? handle.seek(toOffset: size > tailSize ? size - tailSize : 0)
+        let data = (try? handle.readToEnd()) ?? Data()
+        let errored = scan(data)
+        turnOutcomeCache[path] = TurnOutcomeCacheEntry(mtime: mtime, size: size, errored: errored)
+        return errored
+    }
+
     // MARK: - state machine (signal files are keyed by CC session id)
 
     private func computeState(sid: String, status: String,
+                              statusUpdatedAt: Int64?,
+                              turnErrored: Bool,
                               located: Bool, focused: Bool) -> String {
         let fm = FileManager.default
         let sigPath = stateDir + "/sig-" + sid
         let attPath = stateDir + "/attended-" + sid
-        let sig = (try? String(contentsOfFile: sigPath, encoding: .utf8))?
+        var sig = (try? String(contentsOfFile: sigPath, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // PermissionRequest can write its hook signal just before the session
+        // file reaches `waiting`. Conversely, once an answer is accepted the
+        // authoritative status returns to `busy`; discard the now-stale signal
+        // rather than showing a request while the approved tool is running.
+        if status == "busy" && sig == "needs_permission" {
+            try? fm.removeItem(atPath: sigPath)
+            sig = ""
+        }
+
+        // A failed/stalled API stream may return the authoritative session
+        // status to idle without firing Claude's Stop hook. In that case the
+        // old UserPromptSubmit signal remains "thinking" forever and masks the
+        // completed turn. Compare timestamps so idle only wins when it is at
+        // least as new as the signal; a freshly-written thinking hook may race
+        // briefly with the previous idle status at the start of a new turn.
+        if status == "idle" && sig == "thinking" {
+            let sigAttributes = try? fm.attributesOfItem(atPath: sigPath)
+            let sigUpdatedAt = sigAttributes?[.modificationDate] as? Date
+            let statusIsNewer: Bool
+            if let statusUpdatedAt, let sigUpdatedAt {
+                statusIsNewer = TimeInterval(statusUpdatedAt) / 1000
+                    >= sigUpdatedAt.timeIntervalSince1970
+            } else {
+                // Older Claude versions may omit statusUpdatedAt. Their idle
+                // status is still a stronger source than a thinking hook that
+                // has no matching Stop event.
+                statusIsNewer = true
+            }
+            if statusIsNewer {
+                try? fm.removeItem(atPath: sigPath)
+                sig = ""
+            }
+        }
+
+        // A terminal API/stream failure is an outcome, not an attention state:
+        // keep it visible in the table, but do not create an attended marker or
+        // turn it into Finished merely because its host is focused.
+        if status != "waiting" && status != "busy" && turnErrored {
+            return "error"
+        }
 
         if !located {
             // No focus signal exists for this session, so the attended
@@ -849,16 +1062,10 @@ final class TerminalTracker: NSObject {
         }
 
         var state: String
-        if sig == "needs_permission" {
+        if status == "waiting" || sig == "needs_permission" {
             state = "needs_permission"
         } else if sig == "thinking" || sig == "done" {
             state = sig
-        } else if status == "waiting" && !fm.fileExists(atPath: attPath) {
-            // No hooks installed — CC still records the permission pause
-            // in sessions/*.json. The attended mark stands in for the
-            // sig wipe hook users get: focused once → stop nagging,
-            // even though `status` stays "waiting" until answered.
-            state = "needs_permission"
         } else if status == "busy" {
             state = "thinking"
         } else if status == "idle" && !fm.fileExists(atPath: attPath) {
@@ -867,13 +1074,13 @@ final class TerminalTracker: NSObject {
             state = "idle"
         }
 
-        if focused {
-            // Acknowledge: wipe the hook signal AND record that the user
-            // has visited this session since its last busy→idle transition.
-            if sig == "needs_permission" || sig == "done" {
+        if focused && state != "needs_permission" && state != "error" {
+            // Acknowledge only a completed step. Looking at a permission or
+            // question request is not the same as answering it.
+            if sig == "done" {
                 try? fm.removeItem(atPath: sigPath)
             }
-            fm.createFile(atPath: attPath, contents: nil)
+            Self.createOwnFile(atPath: attPath, contents: nil)
             state = "idle"
         }
         return state
@@ -881,27 +1088,66 @@ final class TerminalTracker: NSObject {
 
     // The index knows each session's ai-title (which Claude uses as the Ghostty
     // tab title); AppDelegate pushes it here so assignGhostty can bind by title.
-    func updateSessionTitles(_ titles: [String: String]) {
-        queue.async { [weak self] in self?.sessionTitles = titles }
+    func updateSessionMetadata(titles: [String: String],
+                               descriptions: [String: String]) {
+        queue.async { [weak self] in
+            self?.sessionTitles = titles
+            self?.sessionDescriptions = descriptions
+        }
+    }
+
+    // Codex approval detection belongs to SessionMonitor, which already tails
+    // the rollout files for the menu bar/table. Reuse those ids for native
+    // notifications rather than reading every live rollout twice.
+    func updateCodexWaitingSessionIds(_ ids: Set<String>) {
+        queue.async { [weak self] in
+            self?.codexWaitingSessionIds = ids
+        }
     }
 
     // The user opened this session's home via EpiScope. Window focus can't
     // always be detected (notably the Claude desktop app), so acknowledge
-    // explicitly: record the attended mark and wipe a pending done /
-    // needs-permission signal, so the "Finished" state clears on the next tick
-    // instead of lingering.
+    // explicitly: record the attended mark and wipe a pending `done` signal so
+    // "Finished" clears on the next tick. Permission/question requests are not
+    // acknowledged by navigation; they remain active until CC leaves waiting.
     func acknowledge(sessionId sid: String) {
+        // The id names two files here, one of which we delete. It reaches us
+        // from the session index (a transcript filename) as well as from a
+        // session file, so re-check it at the entry point.
+        guard SessionID.isValid(sid) else { return }
         queue.async { [weak self] in
             guard let self else { return }
             let fm = FileManager.default
             let sigPath = self.stateDir + "/sig-" + sid
             let sig = (try? String(contentsOfFile: sigPath, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if sig == "done" || sig == "needs_permission" {
+            let waiting = self.lastStates[sid] == "needs_permission"
+                || SessionStore.shared.sessions().contains {
+                    $0.sessionId == sid && $0.isWaiting
+                }
+            // Navigation never acknowledges a permission or question request,
+            // and must not pre-acknowledge the `Finished` state that may follow
+            // it if waiting transitions straight to idle between tracker ticks.
+            if sig == "needs_permission" || waiting { return }
+            if sig == "done" {
                 try? fm.removeItem(atPath: sigPath)
             }
-            fm.createFile(atPath: self.stateDir + "/attended-" + sid, contents: nil)
+            Self.createOwnFile(atPath: self.stateDir + "/attended-" + sid, contents: nil)
         }
+    }
+
+    // createFile follows a symlink at the final component, so a link planted in
+    // ~/.claude/state — a directory other tools also write to — would let these
+    // markers truncate a file anywhere in the home dir. Everything we create
+    // here is a zero-byte marker or our own tmp file; a symlink is never ours.
+    @discardableResult
+    private static func createOwnFile(atPath path: String, contents: Data?) -> Bool {
+        let fm = FileManager.default
+        if (try? fm.attributesOfItem(atPath: path))?[.type] as? FileAttributeType
+            == .typeSymbolicLink {
+            try? fm.removeItem(atPath: path)
+        }
+        return fm.createFile(atPath: path, contents: contents)
     }
 
     private func cleanupSignals(liveSids: Set<String>) {
@@ -928,6 +1174,7 @@ final class TerminalTracker: NSObject {
         let session_id: String
         let term: String?
         let ref: String?
+        let bundle_id: String?  // optional v1 extension: exact hosting app
         let sock: String?  // kitty: @-control socket owning `ref`
         let tty: String?
         let cwd: String
@@ -946,12 +1193,33 @@ final class TerminalTracker: NSObject {
         else { return }
         let tmp = stateDir + "/.cc-states.tmp"
         let dst = stateDir + "/cc-states.json"
-        guard FileManager.default.createFile(atPath: tmp, contents: data)
+        guard Self.createOwnFile(atPath: tmp, contents: data)
         else { return }
         rename(tmp, dst)  // atomic — readers never see a half-written file
     }
 
     // MARK: - notifications
+
+    // The system owns the banner width and may still clip for accessibility
+    // sizes. A conservative grapheme limit keeps ordinary notification text to
+    // one visual line without splitting emoji or composed Unicode characters.
+    private static func compactNotificationDescription(_ raw: String) -> String? {
+        let oneLine = raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !oneLine.isEmpty else { return nil }
+        let limit = 36
+        guard oneLine.count > limit else { return oneLine }
+        return String(oneLine.prefix(limit - 1))
+            .trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    private func notificationDisplayPath(_ cwd: String) -> String {
+        if cwd == home { return "~" }
+        if cwd.hasPrefix(home + "/") { return "~" + cwd.dropFirst(home.count) }
+        return cwd.isEmpty ? "Claude Code" : cwd
+    }
 
     private func notifyTransitions(_ bySid: [String: Entry]) {
         let center = UNUserNotificationCenter.current()
@@ -972,12 +1240,20 @@ final class TerminalTracker: NSObject {
                 // earlier state, not on whatever existed at startup.
                 guard hadPriorState else { continue }
                 let content = UNMutableNotificationContent()
-                let folder = URL(fileURLWithPath: entry.cwd).lastPathComponent
-                content.title = folder.isEmpty ? "Claude Code" : folder
-                content.body = state == "done"
-                    ? "Finished · waiting for your input"
-                    : "Needs permission"
+                let path = notificationDisplayPath(entry.cwd)
+                content.title = state == "done" ? path + " · Finished" : path
+                let status = state == "needs_permission" ? "Needs permission" : nil
+                if let raw = sessionDescriptions[sid],
+                   let description = Self.compactNotificationDescription(raw) {
+                    content.body = "✨ " + description
+                    if let status { content.body += "\n" + status }
+                } else if let status {
+                    content.body = status
+                }
                 content.sound = .default
+                content.interruptionLevel = state == "needs_permission"
+                    ? .timeSensitive
+                    : .active
                 content.userInfo = ["sessionId": sid]
                 center.add(UNNotificationRequest(
                     identifier: "cc-" + sid, content: content, trigger: nil))
@@ -1010,7 +1286,7 @@ final class TerminalTracker: NSObject {
 }
 
 extension TerminalTracker: UNUserNotificationCenterDelegate {
-    // Clicking a banner brings the user to the session's terminal window.
+    // Clicking a banner brings the user to the session's terminal/app.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {

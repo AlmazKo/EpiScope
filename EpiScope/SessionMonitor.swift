@@ -2,8 +2,11 @@ import Foundation
 
 // Polls ~/.claude/sessions/<pid>.json — Claude Code rewrites these
 // every time a session changes state. Files where status == "waiting"
-// have the agent paused on a permission prompt; `waitingFor` carries
-// the human-readable tool name (e.g. "approve Bash").
+// normally have the agent paused on a permission prompt; `waitingFor` carries
+// the human-readable tool name (e.g. "approve Bash"). The user-opened `/btw`
+// overlay is the exception: it reports `waitingFor == "dialog open"` while the
+// main turn continues, so it is ignored unless a real hook state independently
+// says `needs_permission`.
 //
 // SDK-CLI sessions (entrypoint == "sdk-cli", spawned with
 // --permission-prompt-tool stdio) never write status/waitingFor —
@@ -18,14 +21,6 @@ import Foundation
 @MainActor
 final class SessionMonitor {
     private(set) var waiting: [SessionInfo] = []
-    // The subset of `waiting` that still drives the menu-bar alarm: sessions
-    // the user hasn't acknowledged for their current wait episode. Tapping the
-    // notification / opening the session writes an attended-<sid> mark, which
-    // silences a prompt that can't be answered in place — e.g. a detached
-    // headless bg job parked on permission — without hiding it from the
-    // Needs-attention list. A fresh prompt bumps statusUpdatedAt past the mark
-    // and re-arms the alarm. (`waiting` itself stays the full list.)
-    private(set) var unattendedWaiting: [SessionInfo] = []
     // Every alive session keyed by sessionId, regardless of status.
     // Consumers that need to colour rows by live state (the terminal column
     // in MainWindowController) read this; the menu bar icon still only
@@ -37,7 +32,8 @@ final class SessionMonitor {
     // window controller so rows repaint as soon as status flips.
     var onLiveStateChange: (() -> Void)?
 
-    private var timer: Timer?
+    private var started = false
+    static let jobId = "session-monitor"
     private static let interval: TimeInterval = 1.0
 
     // Codex live sessions are read off the main thread (rollout tails are
@@ -60,11 +56,12 @@ final class SessionMonitor {
     private static var sdkCache: [String: SdkCacheEntry] = [:]
 
     // Verdicts published by ~/dotfiles/kitty/state-daemon.sh
-    // (cc-states.json, rewritten every daemon tick): thinking /
-    // needs_permission / done / idle. "done" = the turn finished and
+    // (cc-states.json, rewritten every tracker tick): thinking /
+    // needs_permission / done / error / idle. "done" = the turn finished and
     // the user hasn't focused that kitty window since — the table
-    // renders it as a yellow "Finished". All the focus / attended
-    // bookkeeping lives in the daemon; we only read its output.
+    // renders it as a yellow "Finished"; "error" is table-only and neutral.
+    // All the focus / attended bookkeeping lives in the publisher; we only
+    // read its output.
     // Keyed by sessionId (stable across pid reuse); the daemon keys
     // its file by pid but ships session_id in every entry.
     private(set) var kittyStates: [String: String] = [:]
@@ -72,28 +69,14 @@ final class SessionMonitor {
     // / "ghostty" / "xterm"); absent = no known terminal. Drives the
     // per-terminal icon in the sessions table.
     private(set) var terminalKinds: [String: String] = [:]
+    // Exact installed application hosting the process. Unlike `term`, this is
+    // intentionally open-ended: unknown terminals and desktop apps work without
+    // adding another hard-coded kind to EpiScope.
+    private(set) var hostBundleIds: [String: String] = [:]
     private var kittyStatesMtime: Date = .distantPast
     private static let kittyStatesURL: URL = FileManager.default
         .homeDirectoryForCurrentUser
         .appending(path: ".claude/state/cc-states.json")
-    private static let stateDir: URL = FileManager.default
-        .homeDirectoryForCurrentUser
-        .appending(path: ".claude/state", directoryHint: .isDirectory)
-
-    // True when the user has acknowledged this session's *current* wait
-    // episode. acknowledge() (tap / open) and the tracker's focus dance both
-    // drop an attended-<sid> mark; if it postdates the episode's statusUpdatedAt
-    // the alarm stays quiet until a fresh prompt bumps the timestamp past it.
-    // Works for detached sessions too, where the tracker's own attended logic
-    // (gated on a locatable window) never fires.
-    private func isAttended(_ info: SessionInfo) -> Bool {
-        let path = Self.stateDir.appending(path: "attended-" + info.sessionId).path
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-              let markedAt = attrs[.modificationDate] as? Date else { return false }
-        let episodeMs = info.statusUpdatedAt ?? info.updatedAt ?? 0
-        return markedAt >= Date(timeIntervalSince1970: TimeInterval(episodeMs) / 1000)
-    }
-
     // v1 envelope: {"v": 1, "states": {"<pid>": {"state": "done",
     // "session_id": "…", "term": "kitty", …}}}. Unknown v → ignore the
     // file (the publisher bumps v on any change a v1 reader would
@@ -105,6 +88,7 @@ final class SessionMonitor {
             let state: String
             let sessionId: String?
             let term: String?
+            let bundleId: String?
         }
     }
 
@@ -112,6 +96,7 @@ final class SessionMonitor {
     private func refreshKittyStates() -> Bool {
         var fresh: [String: String] = [:]
         var freshTerms: [String: String] = [:]
+        var freshBundleIds: [String: String] = [:]
         if let attrs = try? FileManager.default.attributesOfItem(atPath: Self.kittyStatesURL.path),
            let mtime = attrs[.modificationDate] as? Date,
            // A stale file means the tracker died — don't trust it.
@@ -127,12 +112,15 @@ final class SessionMonitor {
                     guard let sid = entry.sessionId else { continue }
                     fresh[sid] = entry.state
                     if let term = entry.term { freshTerms[sid] = term }
+                    if let bundleId = entry.bundleId { freshBundleIds[sid] = bundleId }
                 }
             }
         }
-        guard fresh != kittyStates || freshTerms != terminalKinds else { return false }
+        guard fresh != kittyStates || freshTerms != terminalKinds
+                || freshBundleIds != hostBundleIds else { return false }
         kittyStates = fresh
         terminalKinds = freshTerms
+        hostBundleIds = freshBundleIds
         return true
     }
 
@@ -235,17 +223,19 @@ final class SessionMonitor {
     }
 
     func start() {
-        guard timer == nil else { return }
+        guard !started else { return }
+        started = true
         loadWaitClocks()
         sample()
-        let t = Timer(timeInterval: Self.interval, repeats: true) { [weak self] _ in
+        // Sampling touches @MainActor state, so the job runs on main; the
+        // scheduler's heartbeat carries the same 1 s cadence (and the same
+        // let-the-OS-coalesce leeway) the private Timer used to.
+        WorkScheduler.shared.register(.init(
+            id: Self.jobId, interval: Self.interval, target: .main,
+            initialDelay: Self.interval
+        ) { [weak self] in
             MainActor.assumeIsolated { self?.sample() }
-        }
-        // Let the OS coalesce wakeups — a permission prompt showing up
-        // 200 ms late is invisible to the user.
-        t.tolerance = 0.2
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        })
     }
 
     private func sample() {
@@ -254,7 +244,7 @@ final class SessionMonitor {
         // Decoded session files come from the shared store (mtime-gated).
         for var info in SessionStore.shared.sessions()
         where Self.isProcessAlive(pid: info.pid) {
-            if info.isWaiting {
+            if info.isWaiting || kittyStates[info.sessionId] == "needs_permission" {
                 found.append(info)
             } else if info.isSdkCli,
                       let pending = Self.detectSdkCliPending(sessionId: info.sessionId, cwd: info.cwd) {
@@ -280,15 +270,10 @@ final class SessionMonitor {
         let liveChanged = !sameLiveStatus(live, liveSessions)
         let kittyChanged = refreshKittyStates()
         let waitingChanged = found != waiting
-        // The menu-bar alarm follows the unattended subset, so acknowledging a
-        // session quiets it even while `waiting` (the list) still holds it.
-        let unattended = found.filter { !isAttended($0) }
-        let unattendedChanged = unattended != unattendedWaiting
         if liveChanged { liveSessions = live }
         updateBusyClocks(live: live)
         if waitingChanged { waiting = found }
-        if unattendedChanged { unattendedWaiting = unattended }
-        if waitingChanged || unattendedChanged { onUpdate?() }
+        if waitingChanged { onUpdate?() }
         if liveChanged || kittyChanged { onLiveStateChange?() }
     }
 
@@ -307,7 +292,7 @@ final class SessionMonitor {
     private func updateBusyClocks(live: [String: SessionInfo]) {
         let now = Date()
         var nowBusy = Set<String>()
-        for (sid, info) in live where info.status != "waiting" {
+        for (sid, info) in live where !info.isWaiting {
             if info.status == "busy" || kittyStates[sid] == "thinking" { nowBusy.insert(sid) }
         }
         for sid in nowBusy where busySince[sid] == nil {
@@ -331,11 +316,7 @@ final class SessionMonitor {
     }
 
     private static func detectSdkCliPending(sessionId: String, cwd: String) -> (toolName: String, mtimeMs: Int64)? {
-        // Claude encodes the cwd path as filename: every "/" becomes "-"
-        let encoded = cwd.replacingOccurrences(of: "/", with: "-")
-        let url = projectsDir
-            .appending(path: encoded, directoryHint: .isDirectory)
-            .appending(path: "\(sessionId).jsonl")
+        let url = ClaudeProjectPath.transcript(sessionId: sessionId, cwd: cwd, in: projectsDir)
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let mtime = attrs[.modificationDate] as? Date else { return nil }
         let mtimeMs = Int64(mtime.timeIntervalSince1970 * 1000)
@@ -514,7 +495,4 @@ final class SessionMonitor {
         return ""
     }
 
-    deinit {
-        timer?.invalidate()
-    }
 }

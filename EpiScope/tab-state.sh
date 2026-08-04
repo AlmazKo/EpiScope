@@ -17,6 +17,9 @@ SID=$(/usr/bin/env python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("session_id",""))
 except Exception: pass' 2>/dev/null)
 [ -z "$SID" ] && exit 0
+# The id becomes a filename we write and delete — a real one is a uuid, so
+# anything with a separator in it is not a session we should act on.
+case "$SID" in *[!A-Za-z0-9._-]*) exit 0 ;; esac
 
 STATE_DIR="$HOME/.claude/state"
 mkdir -p "$STATE_DIR" 2>/dev/null

@@ -12,17 +12,111 @@ import Foundation
 nonisolated struct ModelPricing: Sendable {
     let input: Double   // USD per 1M tokens
     let output: Double
-    var cacheWrite: Double { input * 1.25 }
-    var cacheRead: Double { input * 0.1 }
+    let cacheWriteMultiplier: Double
+    let cacheReadMultiplier: Double
+
+    init(input: Double, output: Double,
+         cacheWriteMultiplier: Double = 1.25,
+         cacheReadMultiplier: Double = 0.1) {
+        self.input = input
+        self.output = output
+        self.cacheWriteMultiplier = cacheWriteMultiplier
+        self.cacheReadMultiplier = cacheReadMultiplier
+    }
+
+    var cacheWrite: Double { input * cacheWriteMultiplier }
+    var cacheRead: Double { input * cacheReadMultiplier }
 }
 
-nonisolated enum SessionProvider: String, Codable, Sendable {
+// Codex reports cumulative input with cache reads and cache writes included.
+// Keep the wire shape and the normalization in one place so the index, details
+// chart and aggregate chart cannot drift apart.
+nonisolated struct CodexTokenUsage: Decodable, Sendable {
+    let inputTokens: Int64?
+    let cachedInputTokens: Int64?
+    let cacheWriteInputTokens: Int64?
+    let outputTokens: Int64?
+    let reasoningOutputTokens: Int64?
+    let totalTokens: Int64?
+
+    var breakdown: TokenBreakdown {
+        let totalInput = max(0, inputTokens ?? 0)
+        let cacheRead = min(totalInput, max(0, cachedInputTokens ?? 0))
+        let inputAfterReads = totalInput - cacheRead
+        let cacheWrite = min(inputAfterReads, max(0, cacheWriteInputTokens ?? 0))
+        return TokenBreakdown(
+            input: inputAfterReads - cacheWrite,
+            cacheWrite: cacheWrite,
+            cacheRead: cacheRead,
+            output: max(0, outputTokens ?? 0)
+        )
+    }
+}
+
+nonisolated struct TokenBreakdown: Sendable {
+    let input: Int64
+    let cacheWrite: Int64
+    let cacheRead: Int64
+    let output: Int64
+
+    static let zero = TokenBreakdown(input: 0, cacheWrite: 0, cacheRead: 0, output: 0)
+    var total: Int64 { input + cacheWrite + cacheRead + output }
+
+    func subtractingClamped(_ previous: TokenBreakdown) -> TokenBreakdown {
+        TokenBreakdown(
+            input: max(0, input - previous.input),
+            cacheWrite: max(0, cacheWrite - previous.cacheWrite),
+            cacheRead: max(0, cacheRead - previous.cacheRead),
+            output: max(0, output - previous.output)
+        )
+    }
+}
+
+nonisolated enum SessionProvider: String, Codable, Sendable, CaseIterable {
     case claude
     case codex
     // Claude Code running inside the Claude desktop app ("local agent
     // mode" / cowork) — a separate sandbox under ~/Library/Application
     // Support/Claude, not ~/.claude.
     case claudeDesktop
+
+    // Whether an interval fold of this provider's transcript is implemented
+    // (TranscriptExtractor.windowedStats). Today only Claude's is. This is a
+    // gap, not a limit of the data: Claude Desktop's audit.jsonl carries
+    // per-message usage beside its timestamp, and Codex timestamps every
+    // record but reports usage cumulatively, so it needs a delta the way
+    // TokenChartView.parseCodexPoints already computes one. Until those folds
+    // exist, a report covering a day can quote their lifetime totals or nothing.
+    //
+    // Deliberately a switch rather than `provider == .claude` at the call site:
+    // a new provider must fail to compile here instead of inheriting "yes" by
+    // omission. Answering this question by path substring is exactly how Codex
+    // and Claude Desktop went missing from every daily and weekly report.
+    // The tree this provider's transcripts live under. The shapes inside are
+    // nothing alike — one flat dir of project dirs, one date-nested tree, one
+    // account/workspace pair — but the root is uniform, and that is enough for
+    // the one thing worth deriving: the FSEvents watch list. A provider added
+    // without a watch entry is not broken loudly; it just misses every change
+    // and turns up on the 30-tick safety scan, which reads as a flaky app.
+    var watchRoot: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        switch self {
+        case .claude:
+            return home.appending(path: ".claude/projects", directoryHint: .isDirectory)
+        case .codex:
+            return home.appending(path: ".codex/sessions", directoryHint: .isDirectory)
+        case .claudeDesktop:
+            return home.appending(path: "Library/Application Support/Claude/local-agent-mode-sessions",
+                                  directoryHint: .isDirectory)
+        }
+    }
+
+    var supportsWindowedStats: Bool {
+        switch self {
+        case .claude: return true
+        case .codex, .claudeDesktop: return false
+        }
+    }
 }
 
 nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
@@ -45,6 +139,10 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // "claude-desktop" (the Claude app's Code tab). nil for Codex / unknown.
     // Same ~/.claude storage either way — this is the only distinguisher.
     var entrypoint: String?
+    // Provider-owned id used to address this session inside its desktop app.
+    // Claude's local-agent metadata is indexed by local_<uuid>, while the
+    // claude://code route expects its sibling cliSessionId.
+    var appSessionId: String?
     // True when this session is running in / belongs to the Claude desktop
     // app (its Code tab, or the local-agent-mode/Cowork sandbox).
     var isClaudeDesktop: Bool { provider == .claudeDesktop || entrypoint == "claude-desktop" }
@@ -86,10 +184,6 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // and add to the existing token / branch counters instead of
     // re-parsing the whole megabyte stream.
     var lastParsedSize: Int64 = 0
-    // Compact tool-activity summary (top tools / bash verbs / repeated files),
-    // computed once at index time so reports read it here instead of re-parsing
-    // the transcript. nil until the first deep scan.
-    var toolSummary: String?
 
     var folderName: String { URL(fileURLWithPath: cwd).lastPathComponent }
     var displayTitle: String {
@@ -125,10 +219,9 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
 }
 
 nonisolated struct SessionIndex: Codable, Sendable {
-    // Bump when SessionIndexEntry changes shape so we discard caches
-    // built by older EpiScope versions instead of decoding them with
-    // zero-filled new fields.
-    static let currentVersion = 13
+    // Bump when SessionIndexEntry changes shape or accounting semantics so we
+    // discard caches built by older EpiScope versions.
+    static let currentVersion = 15
 
     var version: Int = SessionIndex.currentVersion
     var entries: [SessionIndexEntry] = []
@@ -149,18 +242,28 @@ nonisolated struct SessionIndex: Codable, Sendable {
         "claude-sonnet-4-6": ModelPricing(input: 3,  output: 15),
         "claude-sonnet-4-5": ModelPricing(input: 3,  output: 15),
         "claude-haiku-4-5":  ModelPricing(input: 1,  output: 5),
-        // OpenAI / Codex. Cached input lands in cacheRead bucket
-        // (12.5% of input price); no explicit cache-write tier.
-        "openai-gpt-5":          ModelPricing(input: 5,    output: 10),
-        "openai-gpt-5-codex":    ModelPricing(input: 5,    output: 10),
-        "openai-gpt-5-mini":     ModelPricing(input: 0.25, output: 2),
-        "openai-gpt-5-nano":     ModelPricing(input: 0.05, output: 0.4),
+        // OpenAI / Codex. Before GPT-5.6 cache writes were billed as ordinary
+        // input (1×); GPT-5.6+ exposes a 1.25× cache-write tier. Cached reads
+        // are 10% of input. Reasoning tokens are already included in output.
+        "openai-gpt-5":          ModelPricing(input: 1.25, output: 10, cacheWriteMultiplier: 1),
+        "openai-gpt-5-codex":    ModelPricing(input: 1.25, output: 10, cacheWriteMultiplier: 1),
+        "openai-gpt-5-mini":     ModelPricing(input: 0.25, output: 2,  cacheWriteMultiplier: 1),
+        "openai-gpt-5-nano":     ModelPricing(input: 0.05, output: 0.4, cacheWriteMultiplier: 1),
+        "openai-gpt-5.5":        ModelPricing(input: 5,    output: 30, cacheWriteMultiplier: 1),
+        "openai-gpt-5.6-sol":    ModelPricing(input: 5,    output: 30),
+        "openai-gpt-5.6-terra":  ModelPricing(input: 2.5,  output: 15),
+        "openai-gpt-5.6-luna":   ModelPricing(input: 1,    output: 6),
     ]
     static let defaultPricing = ModelPricing(input: 3, output: 15)
 
     static func pricing(for model: String?) -> ModelPricing {
         guard let m = model else { return defaultPricing }
-        return pricingTable[m] ?? defaultPricing
+        if let exact = pricingTable[m] { return exact }
+        // A future Codex model should not silently inherit Claude Sonnet rates.
+        // Use the current flagship Codex tier as an explicit estimate until its
+        // exact model price is added.
+        if m.hasPrefix("openai-") { return pricingTable["openai-gpt-5.6-sol"]! }
+        return defaultPricing
     }
 }
 
@@ -179,28 +282,23 @@ final class SessionIndexer {
     private(set) var totalDeepScan: Int = 0
     var onProgress: (() -> Void)?
 
-    nonisolated private static let workQueue = DispatchQueue(label: "episcope.session-indexer", qos: .utility)
     // Per-project-dir memo for the shallow walk. The decoded cwd + temp flag
     // is a pure function of the (stable) directory name; the jsonl listing is
     // reused until the directory's mtime changes. Both are only ever touched
-    // from rebuildShallow on the serial workQueue, so no locking is needed.
+    // from rebuildShallow on the serial index group, so no locking is needed.
     nonisolated(unsafe) private static var cwdDecodeCache: [String: (cwd: String, isTemp: Bool)] = [:]
     nonisolated(unsafe) private static var dirListCache: [String: (mtime: Date, jsonls: [URL])] = [:]
-    nonisolated private static let projectsDir: URL = FileManager.default
-        .homeDirectoryForCurrentUser
-        .appending(path: ".claude/projects", directoryHint: .isDirectory)
+    // Stored, not computed through SessionProvider.watchRoot on each access:
+    // jsonlPath and insideProjects run per entry, and watchRoot rebuilds the
+    // home URL every time.
+    nonisolated private static let projectsDir: URL = SessionProvider.claude.watchRoot
 
-    nonisolated private static let codexSessionsDir: URL = FileManager.default
-        .homeDirectoryForCurrentUser
-        .appending(path: ".codex/sessions", directoryHint: .isDirectory)
+    nonisolated private static let codexSessionsDir: URL = SessionProvider.codex.watchRoot
 
     // Claude desktop ("local agent mode") sessions live two levels deep:
     // <root>/<account>/<workspace>/local_<uuid>.json (metadata) alongside
     // local_<uuid>/audit.jsonl (the transcript).
-    nonisolated private static let claudeDesktopRoot: URL = FileManager.default
-        .homeDirectoryForCurrentUser
-        .appending(path: "Library/Application Support/Claude/local-agent-mode-sessions",
-                   directoryHint: .isDirectory)
+    nonisolated private static let claudeDesktopRoot: URL = SessionProvider.claudeDesktop.watchRoot
 
     nonisolated private static let indexURL: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -209,7 +307,7 @@ final class SessionIndexer {
         return dir.appending(path: "sessions.json")
     }()
 
-    private var timer: Timer?
+    static let jobId = "session-indexer"
     // FSEvents doorbell: set when the watched transcript trees change, so the
     // 1 s heartbeat can skip its file walk entirely when nothing moved.
     // Starts true for the initial scan; a safety-net forces a scan periodically
@@ -239,7 +337,9 @@ final class SessionIndexer {
     }
 
     private func startWatcher() {
-        let paths = [Self.projectsDir.path, Self.codexSessionsDir.path, Self.claudeDesktopRoot.path]
+        // Derived, so a provider added later is watched without anyone
+        // remembering to extend this list.
+        let paths = SessionProvider.allCases.map { $0.watchRoot.path }
         watcher = DirWatcher(paths: paths) { [weak self] in
             DispatchQueue.main.async { self?.projectsDirty = true }
         }
@@ -247,14 +347,15 @@ final class SessionIndexer {
 
     func pause() {
         paused = true
-        timer?.invalidate()
-        timer = nil
+        // A disabled job is skipped on the scheduler's own queue, so a paused
+        // indexer costs nothing per tick — not even a hop to main.
+        WorkScheduler.shared.setEnabled(false, id: Self.jobId)
         flushIndexToDisk()
     }
 
     func resume() {
         paused = false
-        if timer == nil { startTimer() }
+        WorkScheduler.shared.setEnabled(true, id: Self.jobId)
         kickReindex()
     }
 
@@ -264,12 +365,11 @@ final class SessionIndexer {
         // jsonls and incrementally deep-scans just the files that grew (their
         // appended tail). Idle ticks cost nothing. A safety-net forces a scan
         // every safetyScanTicks in case an event is missed.
-        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+        WorkScheduler.shared.register(.init(
+            id: Self.jobId, interval: 1, target: .main, initialDelay: 1
+        ) { [weak self] in
             MainActor.assumeIsolated { self?.heartbeat() }
-        }
-        t.tolerance = 0.3
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        })
     }
 
     private func heartbeat() {
@@ -290,7 +390,8 @@ final class SessionIndexer {
         indexDirty = false
         lastIndexSave = Date()
         let snapshot = SessionIndex(entries: entries)
-        Self.workQueue.async { Self.saveToDisk(snapshot) }
+        WorkScheduler.shared.run(.init(id: "index-save", group: WorkScheduler.Group.index,
+                                      deferrable: false)) { Self.saveToDisk(snapshot) }
     }
 
     // Publish an entries change to both consumers: the main-window table
@@ -300,11 +401,19 @@ final class SessionIndexer {
         onEntriesUpdated?(entries)
     }
 
+    // A pass over the transcripts is done. That also releases the background
+    // scans held while it ran (the full-text backfill, the limit estimate) —
+    // they were what turned launch into a four-way race for the same files.
+    private func passFinished() {
+        reindexing = false
+        WorkScheduler.shared.admitDeferred()
+    }
+
     func kickReindex() {
         guard !paused, !reindexing else { return }
         reindexing = true
         let cached = entries
-        Self.workQueue.async {
+        WorkScheduler.shared.run(.init(id: "index-pass", group: WorkScheduler.Group.index, deferrable: false)) {
             // Phase 1 — cheap shallow pass. Returns one entry per
             // jsonl on disk: cache hits are full entries, misses are
             // stubs with only filesystem metadata populated.
@@ -321,7 +430,7 @@ final class SessionIndexer {
             }
             guard !stubIds.isEmpty else {
                 DispatchQueue.main.async { [weak self] in
-                    self?.reindexing = false
+                    self?.passFinished()
                 }
                 return
             }
@@ -360,7 +469,7 @@ final class SessionIndexer {
                 self.entries = final
                 self.pendingDeepScan = 0
                 self.totalDeepScan = 0
-                self.reindexing = false
+                self.passFinished()
                 self.indexDirty = true
                 self.maybeSaveIndex()
                 self.onProgress?()
@@ -377,7 +486,7 @@ final class SessionIndexer {
     func fullReindex() {
         guard !paused, !reindexing else { return }
         reindexing = true
-        Self.workQueue.async {
+        WorkScheduler.shared.run(.init(id: "index-full", group: WorkScheduler.Group.index, priority: .interactive, deferrable: false)) {
             // Empty cache → every file is a fresh stub → deep-scanned in full.
             let (stubs, stubIds, codexPaths) = Self.rebuildShallow(cache: [])
             DispatchQueue.main.async { [weak self] in
@@ -399,7 +508,7 @@ final class SessionIndexer {
                 self.entries = final
                 self.pendingDeepScan = 0
                 self.totalDeepScan = 0
-                self.reindexing = false
+                self.passFinished()
                 self.indexDirty = true
                 self.maybeSaveIndex()
                 self.onProgress?()
@@ -470,7 +579,7 @@ final class SessionIndexer {
                 if let c = cwdDecodeCache[encodedCwd] {
                     decoded = c
                 } else {
-                    let cwd = "/" + encodedCwd.split(separator: "-").joined(separator: "/")
+                    let cwd = ClaudeProjectPath.decode(encodedCwd)
                     // Drop /private/tmp/* and /private/var/* projects at the
                     // earliest possible step when the user has the toggle
                     // off — saves a stat()+open of every short-lived
@@ -563,6 +672,21 @@ final class SessionIndexer {
                     found.append(cached)
                     continue
                 }
+                if var c = cacheBySessionId[sessionId],
+                   c.fileSize <= size, c.lastParsedSize == c.fileSize {
+                    // Partial hit: the file only grew and the cursor sits at
+                    // the previous EOF, so the deep scan can fold just the tail
+                    // onto these numbers. Carrying them also keeps the row
+                    // steady — a live session used to fall through to a zeroed
+                    // stub every pass, and since the table sorts by activity it
+                    // was always the top row blanking once a second.
+                    c.fileSize = size
+                    c.lastActivity = mtime
+                    found.append(c)
+                    stubIds.insert(sessionId)
+                    codexPaths[sessionId] = jsonl
+                    continue
+                }
                 found.append(SessionIndexEntry(
                     sessionId: sessionId,
                     cwd: "",
@@ -604,6 +728,17 @@ final class SessionIndexer {
                            sameTimestamp(cached.lastActivity, mtime),
                            cached.fileSize == size {
                             found.append(cached)
+                            continue
+                        }
+                        if var c = cacheBySessionId[sessionId],
+                           c.fileSize <= size, c.lastParsedSize == c.fileSize {
+                            // Same partial hit as Codex above; the cursor here
+                            // counts audit.jsonl bytes.
+                            c.fileSize = size
+                            c.lastActivity = mtime
+                            found.append(c)
+                            stubIds.insert(sessionId)
+                            codexPaths[sessionId] = meta
                             continue
                         }
                         found.append(SessionIndexEntry(
@@ -675,12 +810,17 @@ final class SessionIndexer {
             out.entrypoint = stats.entrypoint
             out.effort = stats.effort
             if let c = stats.cwd, !c.isEmpty { out.cwd = c }
-            out.toolSummary = computeToolSummary(claudeJsonl: jsonl)
             out.lastParsedSize = entry.fileSize
             return out
         case .codex:
-            guard let jsonl = fileURL ?? locateCodexJsonl(sessionId: entry.sessionId),
-                  let codex = scanCodexSession(at: jsonl)
+            guard let jsonl = fileURL ?? locateCodexJsonl(sessionId: entry.sessionId)
+            else { return nil }
+            // cwd and startedAt come from the session_meta line at the head of
+            // the file; without them there is nothing to fold onto.
+            let seed = codexSeed(from: entry)
+            let offset = (seed.cwd == nil || seed.startedAt == nil) ? 0 : entry.lastParsedSize
+            guard let (codex, consumed) = scanCodexSession(
+                seed: offset == 0 ? CodexFileStats() : seed, at: jsonl, fromOffset: offset)
             else { return nil }
             var out = entry
             out.cwd = codex.cwd ?? entry.cwd
@@ -688,17 +828,28 @@ final class SessionIndexer {
             out.model = codex.model
             out.effort = codex.effort
             out.inputTokens = codex.inputTokens
-            out.cacheCreationTokens = 0
+            out.cacheCreationTokens = codex.cacheCreationTokens
             out.cacheReadTokens = codex.cacheReadTokens
             out.outputTokens = codex.outputTokens
             out.userMessageCount = codex.userMessageCount
             out.turns = codex.turns
             out.startedAt = codex.startedAt
-            out.lastParsedSize = entry.fileSize
+            // The offset the fold actually reached, not the size the shallow
+            // pass saw: a file that grew mid-scan would otherwise have its
+            // overlap re-counted on the next pass.
+            out.lastParsedSize = consumed
             return out
         case .claudeDesktop:
-            guard let meta = fileURL ?? locateClaudeDesktopMeta(sessionId: entry.sessionId),
-                  let d = scanClaudeDesktop(meta: meta)
+            guard let meta = fileURL ?? locateClaudeDesktopMeta(sessionId: entry.sessionId)
+            else { return nil }
+            // The cursor counts audit.jsonl bytes. With no audit yet the
+            // shallow pass sized the metadata instead, so it cannot be one.
+            let audit = meta.deletingPathExtension().appendingPathComponent("audit.jsonl")
+            let offset = FileManager.default.fileExists(atPath: audit.path)
+                ? entry.lastParsedSize : 0
+            guard let (d, consumed) = scanClaudeDesktop(
+                meta: meta, seed: offset == 0 ? DesktopStats() : desktopSeed(from: entry),
+                fromOffset: offset)
             else { return nil }
             var out = entry
             if let c = d.cwd, !c.isEmpty { out.cwd = c }
@@ -711,9 +862,10 @@ final class SessionIndexer {
             out.userMessageCount = d.userMessageCount
             out.turns = d.turns
             out.startedAt = d.startedAt ?? entry.startedAt
+            out.appSessionId = d.appSessionId
             // lastActivity stays the transcript mtime set in the shallow pass,
             // so the next shallow comparison still hits the cache.
-            out.lastParsedSize = entry.fileSize
+            out.lastParsedSize = consumed
             return out
         }
     }
@@ -727,6 +879,7 @@ final class SessionIndexer {
         var effort: String?
         var startedAt: Date?
         var inputTokens: Int64 = 0
+        var cacheCreationTokens: Int64 = 0
         var cacheReadTokens: Int64 = 0
         var outputTokens: Int64 = 0
         var userMessageCount: Int = 0
@@ -752,20 +905,24 @@ final class SessionIndexer {
             // For type == "user_message":
             let message: String?
             struct TokenInfo: Decodable {
-                let totalTokenUsage: TotalTokenUsage?
-                struct TotalTokenUsage: Decodable {
-                    let inputTokens: Int64?
-                    let cachedInputTokens: Int64?
-                    let outputTokens: Int64?
-                    let reasoningOutputTokens: Int64?
-                }
+                let totalTokenUsage: CodexTokenUsage?
             }
         }
     }
 
-    nonisolated private static func scanCodexSession(at url: URL) -> CodexFileStats? {
+    // Folds the appended tail onto `seed` and reports the offset it read up to.
+    //
+    // Codex reports usage cumulatively, so the tail's last token_count replaces
+    // the totals instead of adding to them — a tail fold here cannot
+    // double-count tokens the way an accumulating one could. Only turns and
+    // userMessageCount accumulate. cwd and startedAt live in the session_meta
+    // line at the head of the file, so a seed without them forces offset 0;
+    // deepScan makes that call.
+    nonisolated private static func scanCodexSession(
+        seed: CodexFileStats, at url: URL, fromOffset offset: Int64
+    ) -> (stats: CodexFileStats, consumed: Int64)? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        var stats = CodexFileStats()
+        var stats = seed
 
         let metaSig = "\"type\":\"session_meta\"".data(using: .utf8)!
         let turnCtxSig = "\"type\":\"turn_context\"".data(using: .utf8)!
@@ -778,9 +935,9 @@ final class SessionIndexer {
         let isoParser = ISO8601DateFormatter()
         isoParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
-        var lastTotalUsage: CodexEventMessage.Payload.TokenInfo.TotalTokenUsage?
+        var lastTotalUsage: CodexTokenUsage?
 
-        _ = JSONLReader.stream(at: url) { lineData in
+        let consumed = JSONLReader.stream(at: url, from: offset) { lineData in
             if stats.cwd == nil, lineData.range(of: metaSig) != nil {
                 // First-line session_meta. payload.cwd is the working
                 // directory the codex session was started in;
@@ -825,10 +982,11 @@ final class SessionIndexer {
                     }
                 }
             } else if lineData.range(of: tokenCountSig) != nil {
-                // One token_count event per model response → one turn.
-                stats.turns += 1
                 if let rec = try? decoder.decode(CodexEventMessage.self, from: lineData),
                    let usage = rec.payload?.info?.totalTokenUsage {
+                    // A token_count without usage only carries rate-limit
+                    // metadata and is not a completed model response.
+                    stats.turns += 1
                     lastTotalUsage = usage
                 }
             }
@@ -836,24 +994,50 @@ final class SessionIndexer {
 
         // Use cumulative usage from the last token_count event.
         if let u = lastTotalUsage {
-            let input = u.inputTokens ?? 0
-            let cached = u.cachedInputTokens ?? 0
-            // "Fresh" input is what wasn't served from cache.
-            stats.inputTokens = max(0, input - cached)
-            stats.cacheReadTokens = cached
-            stats.outputTokens = (u.outputTokens ?? 0) + (u.reasoningOutputTokens ?? 0)
+            let b = u.breakdown
+            stats.inputTokens = b.input
+            stats.cacheCreationTokens = b.cacheWrite
+            stats.cacheReadTokens = b.cacheRead
+            // reasoning_output_tokens is a detail of output_tokens, not an
+            // additional billing category.
+            stats.outputTokens = b.output
         }
         // Default to gpt-5 pricing if no turn_context yielded a model.
         if stats.model == nil { stats.model = "openai-gpt-5" }
-        return stats
+        return (stats, consumed)
+    }
+
+    // Entry → fold seed. cwd is "" on a stub, which is the signal that the
+    // head of the file has not been read yet.
+    nonisolated private static func codexSeed(from e: SessionIndexEntry) -> CodexFileStats {
+        CodexFileStats(
+            cwd: e.cwd.isEmpty ? nil : e.cwd,
+            title: e.title,
+            model: e.model,
+            effort: e.effort,
+            startedAt: e.startedAt,
+            inputTokens: e.inputTokens,
+            cacheCreationTokens: e.cacheCreationTokens,
+            cacheReadTokens: e.cacheReadTokens,
+            outputTokens: e.outputTokens,
+            userMessageCount: e.userMessageCount,
+            turns: e.turns)
     }
 
     nonisolated private static func jsonlPath(for entry: SessionIndexEntry) -> String {
-        let encoded = entry.cwd.replacingOccurrences(of: "/", with: "-")
-        return projectsDir
-            .appending(path: encoded, directoryHint: .isDirectory)
-            .appending(path: "\(entry.sessionId).jsonl")
-            .path
+        ClaudeProjectPath.transcript(sessionId: entry.sessionId, cwd: entry.cwd,
+                                     in: projectsDir).path
+    }
+
+    // The Claude transcript path is rebuilt from the entry's cwd, and deepScan
+    // takes that cwd from the transcript's own records — it is file content,
+    // not a location we observed. "Delete session" moves whatever we return to
+    // the Trash, so a cwd with no slashes ("..") must not be able to walk the
+    // target out of the projects tree.
+    nonisolated private static func insideProjects(_ url: URL) -> URL? {
+        let root = projectsDir.resolvingSymlinksInPath().standardizedFileURL.path
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        return path.hasPrefix(root + "/") ? url : nil
     }
 
     // MARK: - jsonl parsers
@@ -1060,6 +1244,20 @@ final class SessionIndexer {
     // count, top bash verbs, files touched repeatedly. Cached on the entry so
     // reports read it from the index instead of re-parsing the transcript.
     // A full pass (not incremental) — runs only when deepScan sees a change.
+    // Tool activity for one session, folded on demand.
+    //
+    // This used to be a field on the entry, written by every deep scan. But the
+    // fold needs the whole transcript from byte zero while the scan around it
+    // is incremental, so a live session re-decoded its entire jsonl once a
+    // second — for a line that one report prints, roughly once a day. Measured
+    // here: a week of Claude sessions is 18 files / 68 MB read once when the
+    // report is built, on the analysis queue, ahead of a CLI run that takes
+    // minutes. That is the right place to pay it.
+    nonisolated static func toolActivity(for entry: SessionIndexEntry) -> String? {
+        guard entry.provider == .claude, let url = transcriptURL(for: entry) else { return nil }
+        return computeToolSummary(claudeJsonl: url)
+    }
+
     nonisolated private static func computeToolSummary(claudeJsonl url: URL) -> String? {
         struct Rec: Decodable {
             let message: Msg?
@@ -1115,6 +1313,7 @@ final class SessionIndexer {
         var cwd: String?
         var title: String?
         var model: String?
+        var appSessionId: String?
         var inputTokens: Int64 = 0
         var cacheCreationTokens: Int64 = 0
         var cacheReadTokens: Int64 = 0
@@ -1171,20 +1370,33 @@ final class SessionIndexer {
     // Metadata (title / real folder / created) + token usage folded from the
     // sibling audit.jsonl. No structuredPatch in the audit, so line churn is
     // left at 0 (like Codex).
-    nonisolated private static func scanClaudeDesktop(meta metaURL: URL) -> DesktopStats? {
-        var stats = DesktopStats()
+    // Folds the appended tail of audit.jsonl onto `seed` and reports the offset
+    // it read up to. Unlike Codex, everything here accumulates — the audit
+    // carries per-message usage — so this is the same shape as foldUsage.
+    //
+    // The cursor counts audit.jsonl bytes only. The metadata file beside it is
+    // a few KB and is re-read whole every pass; making that incremental too
+    // would buy nothing.
+    nonisolated private static func scanClaudeDesktop(
+        meta metaURL: URL, seed: DesktopStats, fromOffset offset: Int64
+    ) -> (stats: DesktopStats, consumed: Int64)? {
+        var stats = seed
         if let mdata = try? Data(contentsOf: metaURL),
            let obj = (try? JSONSerialization.jsonObject(with: mdata)) as? [String: Any] {
             stats.title = (obj["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             stats.cwd = (obj["userSelectedFolders"] as? [String])?.first ?? (obj["cwd"] as? String)
+            stats.appSessionId = (obj["cliSessionId"] as? String)
+                .flatMap { $0.isEmpty ? nil : $0 }
             if let created = obj["createdAt"] as? Double {
                 stats.startedAt = Date(timeIntervalSince1970: created / 1000)
             }
         }
         let audit = metaURL.deletingPathExtension().appendingPathComponent("audit.jsonl")
         let decoder = JSONDecoder()
+        // Reset per fold, like foldUsage: a requestId straddling the cursor
+        // costs one extra count, which is cheap next to re-reading the file.
         var counted = Set<String>()
-        _ = JSONLReader.stream(at: audit) { line in
+        let consumed = JSONLReader.stream(at: audit, from: offset) { line in
             guard let rec = try? decoder.decode(AuditRec.self, from: line) else { return }
             switch rec.type {
             case "user":
@@ -1206,7 +1418,22 @@ final class SessionIndexer {
                 break
             }
         }
-        return stats
+        return (stats, consumed)
+    }
+
+    nonisolated private static func desktopSeed(from e: SessionIndexEntry) -> DesktopStats {
+        DesktopStats(
+            cwd: e.cwd.isEmpty ? nil : e.cwd,
+            title: e.title,
+            model: e.model,
+            appSessionId: e.appSessionId,
+            inputTokens: e.inputTokens,
+            cacheCreationTokens: e.cacheCreationTokens,
+            cacheReadTokens: e.cacheReadTokens,
+            outputTokens: e.outputTokens,
+            userMessageCount: e.userMessageCount,
+            turns: e.turns,
+            startedAt: e.startedAt)
     }
 
     nonisolated private static func locateClaudeDesktopMeta(sessionId: String) -> URL? {
@@ -1231,7 +1458,8 @@ final class SessionIndexer {
         func parse(_ s: String?) -> Date? { s.flatMap { isoF.date(from: $0) ?? isoP.date(from: $0) } }
 
         var events: [TranscriptEvent] = []
-        var cumIn: Int64 = 0, cumCache: Int64 = 0, cumOut: Int64 = 0
+        var cumIn: Int64 = 0, cumCacheWrite: Int64 = 0
+        var cumCache: Int64 = 0, cumOut: Int64 = 0
         var counted = Set<String>()
         for line in data.split(separator: 0x0a, omittingEmptySubsequences: true) {
             guard let rec = try? decoder.decode(AuditRec.self, from: Data(line)) else { continue }
@@ -1241,13 +1469,15 @@ final class SessionIndexer {
                 if case .text(let s)? = rec.message?.content {
                     let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    events.append(TranscriptEvent(kind: .user, timestamp: ts, text: trimmed,
-                                                  cumInput: nil, cumCacheRead: nil, cumOutput: nil))
+                events.append(TranscriptEvent(kind: .user, timestamp: ts, text: trimmed,
+                                              cumInput: nil, cumCacheWrite: nil,
+                                              cumCacheRead: nil, cumOutput: nil))
                 }
             case "assistant":
                 let fresh = rec.requestId.map { counted.insert($0).inserted } ?? true
                 if fresh, let u = rec.message?.usage {
                     cumIn += u.inputTokens ?? 0
+                    cumCacheWrite += u.cacheCreationInputTokens ?? 0
                     cumCache += u.cacheReadInputTokens ?? 0
                     cumOut += u.outputTokens ?? 0
                 }
@@ -1259,7 +1489,8 @@ final class SessionIndexer {
                 }
                 events.append(TranscriptEvent(kind: .assistant, timestamp: ts,
                                               text: text.trimmingCharacters(in: .whitespacesAndNewlines),
-                                              cumInput: cumIn, cumCacheRead: cumCache, cumOutput: cumOut))
+                                              cumInput: cumIn, cumCacheWrite: cumCacheWrite,
+                                              cumCacheRead: cumCache, cumOutput: cumOut))
             default:
                 break
             }
@@ -1270,13 +1501,17 @@ final class SessionIndexer {
     // MARK: - Transcript loader
 
     nonisolated struct TranscriptEvent: Sendable {
-        enum Kind: Sendable { case user, assistant }
+        // Usage snapshots drive the chart but are omitted from the visible
+        // transcript. Codex emits token_count after agent_message, so attaching
+        // usage to the assistant message would shift every point backwards.
+        enum Kind: Sendable { case user, assistant, usage }
         let kind: Kind
         let timestamp: Date?
         let text: String
         // Cumulative tokens at this point in the session (or nil if
         // the event itself carries no usage data).
         let cumInput: Int64?
+        let cumCacheWrite: Int64?
         let cumCacheRead: Int64?
         let cumOutput: Int64?
     }
@@ -1287,7 +1522,7 @@ final class SessionIndexer {
     nonisolated static func transcriptURL(for entry: SessionIndexEntry) -> URL? {
         switch entry.provider {
         case .claude:
-            return URL(fileURLWithPath: jsonlPath(for: entry))
+            return insideProjects(URL(fileURLWithPath: jsonlPath(for: entry)))
         case .codex:
             return locateCodexJsonl(sessionId: entry.sessionId)
         case .claudeDesktop:
@@ -1303,10 +1538,8 @@ final class SessionIndexer {
                                           sessionId: String, cwd: String) -> URL? {
         switch provider {
         case .claude:
-            let encoded = cwd.replacingOccurrences(of: "/", with: "-")
-            return projectsDir
-                .appending(path: encoded, directoryHint: .isDirectory)
-                .appending(path: "\(sessionId).jsonl")
+            return insideProjects(ClaudeProjectPath.transcript(
+                sessionId: sessionId, cwd: cwd, in: projectsDir))
         case .codex:
             return locateCodexJsonl(sessionId: sessionId)
         case .claudeDesktop:
@@ -1402,6 +1635,7 @@ final class SessionIndexer {
 
         var events: [TranscriptEvent] = []
         var cumIn: Int64 = 0
+        var cumCacheWrite: Int64 = 0
         var cumCache: Int64 = 0
         var cumOut: Int64 = 0
 
@@ -1419,12 +1653,14 @@ final class SessionIndexer {
                     guard !trimmed.isEmpty else { continue }
                     events.append(TranscriptEvent(
                         kind: .user, timestamp: ts, text: trimmed,
-                        cumInput: nil, cumCacheRead: nil, cumOutput: nil
+                        cumInput: nil, cumCacheWrite: nil,
+                        cumCacheRead: nil, cumOutput: nil
                     ))
                 }
             case "assistant":
                 if let usage = rec.message?.usage {
                     cumIn += usage.inputTokens ?? 0
+                    cumCacheWrite += usage.cacheCreationInputTokens ?? 0
                     cumCache += usage.cacheReadInputTokens ?? 0
                     cumOut += usage.outputTokens ?? 0
                 }
@@ -1439,7 +1675,8 @@ final class SessionIndexer {
                     if !text.isEmpty {
                         events.append(TranscriptEvent(
                             kind: .assistant, timestamp: ts, text: text,
-                            cumInput: cumIn, cumCacheRead: cumCache, cumOutput: cumOut
+                            cumInput: cumIn, cumCacheWrite: cumCacheWrite,
+                            cumCacheRead: cumCache, cumOutput: cumOut
                         ))
                     }
                 }
@@ -1458,13 +1695,7 @@ final class SessionIndexer {
             let message: String?
             let info: TokenInfo?
             struct TokenInfo: Decodable {
-                let totalTokenUsage: Total?
-                struct Total: Decodable {
-                    let inputTokens: Int64?
-                    let cachedInputTokens: Int64?
-                    let outputTokens: Int64?
-                    let reasoningOutputTokens: Int64?
-                }
+                let totalTokenUsage: CodexTokenUsage?
             }
         }
     }
@@ -1476,10 +1707,6 @@ final class SessionIndexer {
         isoParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
         var events: [TranscriptEvent] = []
-        var cumIn: Int64 = 0
-        var cumCache: Int64 = 0
-        var cumOut: Int64 = 0
-
         for line in data.split(separator: 0x0a, omittingEmptySubsequences: true) {
             let lineData = Data(line)
             guard let rec = try? decoder.decode(CodexTranscriptRecord.self, from: lineData),
@@ -1490,18 +1717,20 @@ final class SessionIndexer {
             switch pt {
             case "token_count":
                 if let u = rec.payload?.info?.totalTokenUsage {
-                    let totalIn = u.inputTokens ?? 0
-                    let cached = u.cachedInputTokens ?? 0
-                    cumIn = max(0, totalIn - cached)
-                    cumCache = cached
-                    cumOut = (u.outputTokens ?? 0) + (u.reasoningOutputTokens ?? 0)
+                    let b = u.breakdown
+                    events.append(TranscriptEvent(
+                        kind: .usage, timestamp: ts, text: "",
+                        cumInput: b.input, cumCacheWrite: b.cacheWrite,
+                        cumCacheRead: b.cacheRead, cumOutput: b.output
+                    ))
                 }
             case "user_message":
                 if let m = rec.payload?.message?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !m.isEmpty {
                     events.append(TranscriptEvent(
                         kind: .user, timestamp: ts, text: m,
-                        cumInput: nil, cumCacheRead: nil, cumOutput: nil
+                        cumInput: nil, cumCacheWrite: nil,
+                        cumCacheRead: nil, cumOutput: nil
                     ))
                 }
             case "agent_message":
@@ -1509,7 +1738,8 @@ final class SessionIndexer {
                    !m.isEmpty {
                     events.append(TranscriptEvent(
                         kind: .assistant, timestamp: ts, text: m,
-                        cumInput: cumIn, cumCacheRead: cumCache, cumOutput: cumOut
+                        cumInput: nil, cumCacheWrite: nil,
+                        cumCacheRead: nil, cumOutput: nil
                     ))
                 }
             default: break

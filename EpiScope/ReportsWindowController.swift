@@ -46,9 +46,6 @@ final class ReportsWindowController: NSWindowController {
     // host Insights inline instead of as a separate window.
     private(set) var rootView: NSView!
 
-    nonisolated private static let prepQueue =
-        DispatchQueue(label: "episcope.analysis-prep", qos: .userInitiated)
-
     init(indexer: SessionIndexer, searchIndex: SearchIndex,
          store: ReportStore, runner: AnalysisRunner) {
         self.indexer = indexer
@@ -182,10 +179,13 @@ final class ReportsWindowController: NSWindowController {
     // Scheduled by AppDelegate once per day: a management overview of
     // the last 24h, delivered as a notification banner. Quietly skips
     // days with nothing worth reporting.
-    func runDailyInsights() {
-        guard !runner.isRunning, runningTitle == nil else { return }
+    // Returns whether a run actually started. The scheduler must not mark the
+    // day done on a refusal — see AppDelegate.maybeRunDailyInsights.
+    @discardableResult
+    func runDailyInsights() -> Bool {
+        guard !runner.isRunning, runningTitle == nil else { return false }
         let scope = visibleEntries(within: 86_400)
-        guard scope.count >= 2 else { return }
+        guard scope.count >= 2 else { return false }
         let day = DateFormatter()
         day.setLocalizedDateFormatFromTemplate("MMMd")
         var config = AnalysisJobConfig(
@@ -194,15 +194,16 @@ final class ReportsWindowController: NSWindowController {
         config.titleOverride = "Daily insights — \(day.string(from: Date()))"
         config.window = 86_400
         config.notify = true
-        startAnalysis(config)
+        return startAnalysis(config)
     }
 
     // Scheduled by AppDelegate on Monday morning: the same overview over the
     // past 7 days, delivered as a separate report alongside that day's daily one.
-    func runWeeklyInsights() {
-        guard !runner.isRunning, runningTitle == nil else { return }
+    @discardableResult
+    func runWeeklyInsights() -> Bool {
+        guard !runner.isRunning, runningTitle == nil else { return false }
         let scope = visibleEntries(within: 7 * 86_400)
-        guard scope.count >= 2 else { return }
+        guard scope.count >= 2 else { return false }
         let day = DateFormatter()
         day.setLocalizedDateFormatFromTemplate("MMMd")
         var config = AnalysisJobConfig(
@@ -211,7 +212,7 @@ final class ReportsWindowController: NSWindowController {
         config.titleOverride = "Weekly insights — \(day.string(from: Date()))"
         config.window = 7 * 86_400
         config.notify = true
-        startAnalysis(config)
+        return startAnalysis(config)
     }
 
     // "Analyze Session…" on a row — straight to a retro of that session.
@@ -222,8 +223,9 @@ final class ReportsWindowController: NSWindowController {
             model: Self.defaultModel, scopeCwd: entry.cwd))
     }
 
-    private func startAnalysis(_ config: AnalysisJobConfig) {
-        guard !runner.isRunning, runningTitle == nil else { NSSound.beep(); return }
+    @discardableResult
+    private func startAnalysis(_ config: AnalysisJobConfig) -> Bool {
+        guard !runner.isRunning, runningTitle == nil else { NSSound.beep(); return false }
         let workDir = AnalysisRunner.makeWorkDir()
         let packetsDir = workDir.appendingPathComponent("packets", isDirectory: true)
         try? FileManager.default.createDirectory(at: packetsDir, withIntermediateDirectories: true)
@@ -231,6 +233,7 @@ final class ReportsWindowController: NSWindowController {
         runningTitle = reportTitle(for: config)
         runStartedAt = Date()
         startElapsedTimer()
+        NotificationCenter.default.post(name: .insightsRunStateChanged, object: nil)
         tableView.reloadData()
         tableView.selectRowIndexes([0], byExtendingSelection: false)
 
@@ -242,13 +245,15 @@ final class ReportsWindowController: NSWindowController {
         default:
             prepareRetro(config, workDir: workDir, packetsDir: packetsDir)
         }
+        return true
     }
 
     private func prepareRetro(_ config: AnalysisJobConfig, workDir: URL, packetsDir: URL) {
         guard let entry = config.entries.first else { return }
         let raw = SessionIndexer.transcriptURL(for: entry)
         let packet = packetsDir.appendingPathComponent("session-\(entry.sessionId).md")
-        Self.prepQueue.async { [weak self] in
+        WorkScheduler.shared.run(.init(id: "analysis-prep", group: WorkScheduler.Group.analysis,
+                                      priority: .background, coalesce: false)) { [weak self] in
             let ok = TranscriptExtractor.buildPacket(for: entry, to: packet)
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -284,7 +289,8 @@ final class ReportsWindowController: NSWindowController {
             .prefix(8))
         let catalog = workDir.appendingPathComponent("catalog.md")
         let allEntries = config.entries
-        Self.prepQueue.async { [weak self] in
+        WorkScheduler.shared.run(.init(id: "analysis-prep", group: WorkScheduler.Group.analysis,
+                                      priority: .background, coalesce: false)) { [weak self] in
             let since = config.window.map { Date().addingTimeInterval(-$0) }
             TranscriptExtractor.buildCatalog(entries: allEntries, to: catalog, since: since)
             for e in topByCost {
@@ -352,7 +358,8 @@ final class ReportsWindowController: NSWindowController {
 
         let catalog = workDir.appendingPathComponent("catalog.md")
         let allEntries = config.entries
-        Self.prepQueue.async { [weak self] in
+        WorkScheduler.shared.run(.init(id: "analysis-prep", group: WorkScheduler.Group.analysis,
+                                      priority: .background, coalesce: false)) { [weak self] in
             TranscriptExtractor.buildCatalog(entries: allEntries, to: catalog)
             for e in packetEntries {
                 TranscriptExtractor.buildPacket(
@@ -473,7 +480,11 @@ final class ReportsWindowController: NSWindowController {
         elapsedTimer?.invalidate()
         elapsedTimer = nil
         cancelButton.isHidden = true
+        NotificationCenter.default.post(name: .insightsRunStateChanged, object: nil)
     }
+
+    // Is an analysis in flight? Drives the toolbar's pulsing ✦.
+    var isAnalysisRunning: Bool { runningTitle != nil }
 
     private func startElapsedTimer() {
         let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in

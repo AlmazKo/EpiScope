@@ -11,9 +11,9 @@ import Foundation
 // from bottom up, sorted by per-session contribution descending — the
 // largest contributor in a bucket sits at the bottom.
 //
-// Computation walks ~/.claude/projects/*/*.jsonl line-by-line, picks
-// every assistant record, and adds (input + cache_creation +
-// cache_read + output) tokens to the right bucket / session pair.
+// Computation walks Claude transcripts and Codex rollout files line-by-line,
+// then adds (input + cache_creation + cache_read + output) tokens to the right
+// bucket / session pair.
 // The walk runs on a utility queue, kicked once per window-open;
 // the result is held in the view until the window closes (or the
 // user hits the reindex button).
@@ -596,6 +596,12 @@ final class TokenChartView: NSView {
         // dedupe SessionIndexer.foldUsage does, so the chart totals
         // line up with the table.
         let requestId: String?
+        // Claude writes the session's real working directory into every
+        // assistant record. It is the same field deepScan trusts, and it is
+        // the only exact answer available here: the project directory name it
+        // came from is ambiguous (see ClaudeProjectPath), so grouping by the
+        // decoded name splits or merges the projects whose own name has a dash.
+        let cwd: String?
         let message: Message?
         struct Message: Decodable {
             let model: String?
@@ -627,6 +633,22 @@ final class TokenChartView: NSView {
         }
     }
 
+    nonisolated private struct CodexChartRecord: Decodable {
+        let type: String?
+        let timestamp: String?
+        let payload: Payload?
+        struct Payload: Decodable {
+            let type: String?
+            let id: String?
+            let cwd: String?
+            let model: String?
+            let info: TokenInfo?
+            struct TokenInfo: Decodable {
+                let totalTokenUsage: CodexTokenUsage?
+            }
+        }
+    }
+
     // One parsed point per record. Cached per file so a window
     // re-open only reads bytes appended since last time instead of
     // re-reading every recent jsonl wholesale. Cost is priced per
@@ -640,6 +662,9 @@ final class TokenChartView: NSView {
         let cost: Double       // USD
         let linesAdded: Int64
         let linesRemoved: Int64
+        // Codex records its real cwd in session_meta. Claude points leave this
+        // nil because their project directory already supplies it.
+        let cwd: String?
     }
 
     nonisolated private struct CachedFile {
@@ -649,18 +674,25 @@ final class TokenChartView: NSView {
         var mtime: Date
         var points: [ChartPoint]
         var seenRequestIds: Set<String>
+        // Codex usage is cumulative. Preserve the last snapshot and context at
+        // the byte cursor so an appended tail can be converted to exact deltas.
+        var codexLastUsage: TokenBreakdown?
+        var codexModel: String?
+        var codexCwd: String?
+        var codexSessionId: String?
     }
 
-    nonisolated private static let chartQueue = DispatchQueue(label: "episcope.chart-buckets", qos: .utility)
-    // Confined to chartQueue (serial) — every read and write happens
-    // inside a chartQueue.async block.
+    // Bucket folding runs on the shared scan queue (WorkScheduler.scanQueue),
+    // so it can't walk the transcripts alongside the other background readers.
+    // Confined to that serial queue — every read and write happens
+    // inside a scanQueue.async block.
     nonisolated(unsafe) private static var fileCache: [String: CachedFile] = [:]
 
     // Call when the chart-window setting changes: cached cursors have
     // already pruned points older than the previous window, so a
     // longer window has to re-read the files from scratch.
     nonisolated static func flushCache() {
-        chartQueue.async { fileCache.removeAll() }
+        WorkScheduler.shared.run(.init(id: "chart-flush", priority: .interactive, deferrable: false)) { fileCache.removeAll() }
     }
 
     // Transform per-bucket (incremental) token data into a running
@@ -707,8 +739,11 @@ final class TokenChartView: NSView {
     }
 
     static func computeBuckets(completion: @escaping ([BucketData], Date) -> Void) {
-        let projectsDir = FileManager.default.homeDirectoryForCurrentUser
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let projectsDir = home
             .appending(path: ".claude/projects", directoryHint: .isDirectory)
+        let codexSessionsDir = home
+            .appending(path: ".codex/sessions", directoryHint: .isDirectory)
         let cfg = currentConfig()
         let bucketSize = cfg.bucketSeconds
         // Anchor the bucket grid to fixed clock boundaries. With windowEnd =
@@ -724,14 +759,12 @@ final class TokenChartView: NSView {
         let windowStart = windowEnd.addingTimeInterval(-cfg.windowSeconds)
         let bucketCount = cfg.bucketCount
 
-        chartQueue.async {
+        WorkScheduler.shared.run(.init(id: "chart-buckets", priority: .interactive, deferrable: false)) {
             let fm = FileManager.default
             var counts = Array(repeating: BucketData(), count: bucketCount)
-            guard let projectDirs = try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil)
-            else {
-                DispatchQueue.main.async { completion(counts, windowEnd) }
-                return
-            }
+            let projectDirs = (try? fm.contentsOfDirectory(
+                at: projectsDir, includingPropertiesForKeys: nil
+            )) ?? []
 
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -750,7 +783,10 @@ final class TokenChartView: NSView {
             let groupByDir = UserDefaults.standard.bool(forKey: "groupByDirectory")
 
             for projectDir in projectDirs {
-                let cwd = "/" + projectDir.lastPathComponent.split(separator: "-").joined(separator: "/")
+                // Only for classifying the directory as temporary, and as the
+                // fallback group key; the exact cwd comes per-point from the
+                // record itself (see AssistantRecord.cwd).
+                let cwd = ClaudeProjectPath.decode(projectDir.lastPathComponent)
                 let foldTemporary = !includeTemporary
                     && (cwd.hasPrefix("/private/tmp/") || cwd.hasPrefix("/private/var/"))
                 guard let files = try? fm.contentsOfDirectory(at: projectDir, includingPropertiesForKeys: nil)
@@ -783,7 +819,7 @@ final class TokenChartView: NSView {
                     } else if var c = fileCache[path], size > c.parsedSize {
                         // File grew — parse only the appended tail. parsePoints
                         // returns the absolute offset it parsed up to.
-                        c.parsedSize = parsePoints(
+                        c.parsedSize = parseClaudePoints(
                             at: jsonl, fromOffset: c.parsedSize,
                             decoder: decoder, fallbackSessionId: fallbackSessionId,
                             notBefore: windowStartEpoch,
@@ -793,9 +829,12 @@ final class TokenChartView: NSView {
                         cached = c
                     } else {
                         // New file, or rewritten/truncated → full parse.
-                        var c = CachedFile(parsedSize: 0, mtime: mtime,
-                                           points: [], seenRequestIds: [])
-                        let consumed = parsePoints(
+                        var c = CachedFile(
+                            parsedSize: 0, mtime: mtime, points: [],
+                            seenRequestIds: [], codexLastUsage: nil,
+                            codexModel: nil, codexCwd: nil, codexSessionId: nil
+                        )
+                        let consumed = parseClaudePoints(
                             at: jsonl, fromOffset: 0,
                             decoder: decoder, fallbackSessionId: fallbackSessionId,
                             notBefore: windowStartEpoch,
@@ -815,8 +854,11 @@ final class TokenChartView: NSView {
                         var idx = Int((point.ts - windowStartEpoch) / bucketSize)
                         if idx < 0 { idx = 0 }
                         if idx >= bucketCount { idx = bucketCount - 1 }
+                        // Group by the cwd the record itself carried; the
+                        // directory-derived one is only the fallback for a
+                        // record that predates the field.
                         let key = foldTemporary ? Self.temporaryKey
-                            : (groupByDir ? cwd : point.sessionId)
+                            : (groupByDir ? (point.cwd ?? cwd) : point.sessionId)
                         counts[idx].add(sessionId: key,
                                         tokens: point.tokens,
                                         cost: point.cost,
@@ -824,6 +866,75 @@ final class TokenChartView: NSView {
                                         linesRemoved: point.linesRemoved)
                     }
                   }
+                }
+            }
+
+            // Codex stores rollouts by date rather than project directory. Its
+            // token_count records are cumulative, so parseCodexPoints turns
+            // each new snapshot into a per-response delta before bucketing it.
+            if let enumerator = fm.enumerator(
+                at: codexSessionsDir,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
+            ) {
+                while let jsonl = enumerator.nextObject() as? URL {
+                    guard jsonl.pathExtension == "jsonl",
+                          jsonl.lastPathComponent.hasPrefix("rollout-")
+                    else { continue }
+                    autoreleasepool {
+                        guard let attrs = try? fm.attributesOfItem(atPath: jsonl.path),
+                              let mtime = attrs[.modificationDate] as? Date,
+                              let size = (attrs[.size] as? NSNumber)?.int64Value,
+                              mtime >= windowStart
+                        else { return }
+
+                        let path = jsonl.path
+                        visited.insert(path)
+                        let basename = jsonl.deletingPathExtension().lastPathComponent
+                        let fallbackSessionId = basename.count >= 36
+                            ? String(basename.suffix(36)) : basename
+
+                        var cached: CachedFile
+                        if let c = fileCache[path], c.parsedSize == size, c.mtime == mtime {
+                            cached = c
+                        } else if var c = fileCache[path], size > c.parsedSize {
+                            c.parsedSize = parseCodexPoints(
+                                at: jsonl, fromOffset: c.parsedSize,
+                                decoder: decoder, fallbackSessionId: fallbackSessionId,
+                                notBefore: windowStartEpoch, cache: &c
+                            )
+                            c.mtime = mtime
+                            cached = c
+                        } else {
+                            var c = CachedFile(
+                                parsedSize: 0, mtime: mtime, points: [],
+                                seenRequestIds: [], codexLastUsage: nil,
+                                codexModel: nil, codexCwd: nil, codexSessionId: nil
+                            )
+                            c.parsedSize = parseCodexPoints(
+                                at: jsonl, fromOffset: 0,
+                                decoder: decoder, fallbackSessionId: fallbackSessionId,
+                                notBefore: windowStartEpoch, cache: &c
+                            )
+                            cached = c
+                        }
+
+                        cached.points.removeAll { $0.ts < windowStartEpoch }
+                        fileCache[path] = cached
+                        for point in cached.points where point.ts <= windowEndEpoch {
+                            var idx = Int((point.ts - windowStartEpoch) / bucketSize)
+                            if idx < 0 { idx = 0 }
+                            if idx >= bucketCount { idx = bucketCount - 1 }
+                            let cwd = point.cwd ?? cached.codexCwd ?? "Codex"
+                            let foldTemporary = !includeTemporary
+                                && (cwd.hasPrefix("/private/tmp/") || cwd.hasPrefix("/private/var/"))
+                            let key = foldTemporary ? Self.temporaryKey
+                                : (groupByDir ? cwd : point.sessionId)
+                            counts[idx].add(
+                                sessionId: key, tokens: point.tokens, cost: point.cost,
+                                linesAdded: point.linesAdded, linesRemoved: point.linesRemoved
+                            )
+                        }
+                    }
                 }
             }
 
@@ -837,7 +948,7 @@ final class TokenChartView: NSView {
     // Streams the jsonl from `offset` line-by-line into ChartPoints and
     // returns the absolute offset parsed up to (past the last complete line).
     // A trailing partial line is left for the next pass (the writer mid-append).
-    nonisolated private static func parsePoints(
+    nonisolated private static func parseClaudePoints(
         at url: URL, fromOffset offset: Int64,
         decoder: JSONDecoder, fallbackSessionId: String,
         notBefore windowStartEpoch: TimeInterval,
@@ -874,7 +985,8 @@ final class TokenChartView: NSView {
                 tokens: total,
                 cost: cost,
                 linesAdded: 0,
-                linesRemoved: 0
+                linesRemoved: 0,
+                cwd: rec.cwd
             ))
         }
 
@@ -912,7 +1024,8 @@ final class TokenChartView: NSView {
                 tokens: 0,
                 cost: 0,
                 linesAdded: added,
-                linesRemoved: removed
+                linesRemoved: removed,
+                cwd: nil
             ))
         }
 
@@ -928,5 +1041,68 @@ final class TokenChartView: NSView {
         // last full line) becomes the new cursor. A trailing partial line — the
         // writer mid-append — is left for the next pass.
         return JSONLReader.stream(at: url, from: offset) { fold($0) }
+    }
+
+    // Streams Codex records from the cached byte cursor. session_meta and
+    // turn_context are retained as parser state; cumulative token snapshots
+    // are converted to deltas so repeated snapshots are naturally ignored.
+    nonisolated private static func parseCodexPoints(
+        at url: URL, fromOffset offset: Int64,
+        decoder: JSONDecoder, fallbackSessionId: String,
+        notBefore windowStartEpoch: TimeInterval,
+        cache: inout CachedFile
+    ) -> Int64 {
+        let isoFractional = ISO8601DateFormatter()
+        isoFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+
+        return JSONLReader.stream(at: url, from: offset) { lineData in
+            guard let rec = try? decoder.decode(CodexChartRecord.self, from: lineData),
+                  let payload = rec.payload else { return }
+            switch rec.type {
+            case "session_meta":
+                if let id = payload.id, !id.isEmpty { cache.codexSessionId = id }
+                if let cwd = payload.cwd, !cwd.isEmpty { cache.codexCwd = cwd }
+            case "turn_context":
+                if let model = payload.model, !model.isEmpty {
+                    cache.codexModel = model.hasPrefix("openai-") ? model : "openai-\(model)"
+                }
+            case "event_msg":
+                guard payload.type == "token_count",
+                      let usage = payload.info?.totalTokenUsage else { return }
+                let current = usage.breakdown
+                let previous = cache.codexLastUsage ?? .zero
+                let didReset = current.input < previous.input
+                    || current.cacheWrite < previous.cacheWrite
+                    || current.cacheRead < previous.cacheRead
+                    || current.output < previous.output
+                let delta = didReset ? current : current.subtractingClamped(previous)
+                cache.codexLastUsage = current
+                guard delta.total > 0,
+                      let stamp = rec.timestamp,
+                      let date = isoFractional.date(from: stamp) ?? isoPlain.date(from: stamp)
+                else { return }
+                let epoch = date.timeIntervalSince1970
+                guard epoch >= windowStartEpoch else { return }
+
+                let p = SessionIndex.pricing(for: cache.codexModel)
+                let cost = (Double(delta.input) * p.input
+                    + Double(delta.cacheWrite) * p.cacheWrite
+                    + Double(delta.cacheRead) * p.cacheRead
+                    + Double(delta.output) * p.output) / 1_000_000
+                cache.points.append(ChartPoint(
+                    ts: epoch,
+                    sessionId: cache.codexSessionId ?? fallbackSessionId,
+                    tokens: delta.total,
+                    cost: cost,
+                    linesAdded: 0,
+                    linesRemoved: 0,
+                    cwd: cache.codexCwd
+                ))
+            default:
+                break
+            }
+        }
     }
 }

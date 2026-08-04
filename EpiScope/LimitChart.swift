@@ -109,10 +109,10 @@ enum LimitChart {
                           fiveHourReset: five.1, sevenDayReset: seven.1)
     }
 
-    // Codex reports its rolling limits straight in the rollout — the
-    // last `token_count.rate_limits` has primary (5h) and secondary
-    // (weekly) used_percent. Account-wide, so the newest rollout's
-    // value is current. nil if no recent Codex activity.
+    // Codex reports its rolling limits straight in the rollout. Primary and
+    // secondary are slots, not window roles: their durations vary by plan, so
+    // classify them by window_minutes instead of assuming a fixed order.
+    // Values are account-wide, so the newest rollout's value is current.
     private static let codexSessionsDir = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".codex/sessions", directoryHint: .isDirectory)
 
@@ -127,6 +127,7 @@ enum LimitChart {
                 let secondary: Win?
                 struct Win: Decodable {
                     let usedPercent: Double?
+                    let windowMinutes: Int?
                     let resetsAt: Double?
                 }
             }
@@ -164,18 +165,26 @@ enum LimitChart {
 
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        var latest: RealLimits?
+        var latest: CodexTokenRec.Payload.RL?
         for line in tail.split(separator: 0x0a, omittingEmptySubsequences: true) {
             guard let rec = try? decoder.decode(CodexTokenRec.self, from: Data(line)),
                   rec.type == "event_msg", rec.payload?.type == "token_count",
                   let rl = rec.payload?.rateLimits else { continue }
-            latest = RealLimits(
-                fiveHour: rl.primary?.usedPercent,
-                sevenDay: rl.secondary?.usedPercent,
-                fiveHourReset: rl.primary?.resetsAt.map { Date(timeIntervalSince1970: $0) },
-                sevenDayReset: rl.secondary?.resetsAt.map { Date(timeIntervalSince1970: $0) })
+            latest = rl
         }
-        guard let lim = latest else { return nil }
+        guard let latest else { return nil }
+
+        var fiveHour: CodexTokenRec.Payload.RL.Win?
+        var sevenDay: CodexTokenRec.Payload.RL.Win?
+        for window in [latest.primary, latest.secondary].compactMap({ $0 }) {
+            switch window.windowMinutes {
+            case 5 * 60: fiveHour = window
+            case 7 * 24 * 60: sevenDay = window
+            default: continue
+            }
+        }
+        guard fiveHour != nil || sevenDay != nil else { return nil }
+
         // The recorded %s are account-wide and stay valid until their window
         // resets. If a window's reset is already in the past, it has rolled
         // over since this rollout was written → show 0% (a fresh window), not
@@ -185,8 +194,12 @@ enum LimitChart {
             if let reset, reset <= now { return (0, nil) }
             return (pct, reset)
         }
-        let five = current(lim.fiveHour, lim.fiveHourReset)
-        let seven = current(lim.sevenDay, lim.sevenDayReset)
+        let five = current(
+            fiveHour?.usedPercent,
+            fiveHour?.resetsAt.map { Date(timeIntervalSince1970: $0) })
+        let seven = current(
+            sevenDay?.usedPercent,
+            sevenDay?.resetsAt.map { Date(timeIntervalSince1970: $0) })
         return RealLimits(fiveHour: five.0, sevenDay: seven.0,
                           fiveHourReset: five.1, sevenDayReset: seven.1)
     }
@@ -210,8 +223,10 @@ enum LimitChart {
     // status-line data) — the gauge marks them with a "~".
     static func cachedClaudeIsEstimate() -> Bool { cachedClaudeEstimate }
 
+    // Background refresh — nobody is looking at the result yet, so it waits for
+    // the index's first pass rather than walking transcripts alongside it.
     static func refreshLimitsCache() {
-        queue.async {
+        WorkScheduler.shared.run(.init(id: "limits-cache")) {
             let codex = codexLimits()
             let real = realLimits()
             // Refresh the token estimate (throttled — it walks transcripts) so
@@ -329,7 +344,7 @@ enum LimitChart {
 
     // MARK: - Compute
 
-    private static let queue = DispatchQueue(label: "episcope.limit-windows", qos: .utility)
+    // Window reconstruction shares the scan queue — see WorkScheduler.scanQueue.
 
     static func compute(completion: @escaping (LimitData) -> Void) {
         let projectsDir = FileManager.default.homeDirectoryForCurrentUser
@@ -341,7 +356,7 @@ enum LimitChart {
         // horizon (a weekly limit is always a 7-day span).
         let windowDays = TokenChartView.windowDays
 
-        queue.async {
+        WorkScheduler.shared.run(.init(id: "limits-compute", priority: .interactive, deferrable: false)) {
             let points = collectPoints(projectsDir: projectsDir, since: horizonStart)
                 .sorted { $0.ts < $1.ts }
             var data = LimitData()
@@ -402,7 +417,7 @@ enum LimitChart {
         let horizonStart = Date().addingTimeInterval(-Double(horizonDays) * 24 * 3600)
             .timeIntervalSince1970
 
-        queue.async {
+        WorkScheduler.shared.run(.init(id: "limit-window-markers", priority: .interactive, deferrable: false)) {
             let points = collectPoints(projectsDir: projectsDir, since: horizonStart)
                 .sorted { $0.ts < $1.ts }
             guard let anchor = points.first?.ts else {
@@ -457,6 +472,27 @@ enum LimitChart {
         }
     }
 
+    private struct CachedFile {
+        var parsedSize: Int64
+        var mtime: Date
+        var points: [(ts: TimeInterval, tokens: Int64)]
+        // Per file, like the token chart's cache: request ids are unique within
+        // a session, and keeping the set per file is what lets an appended tail
+        // be folded without re-reading what came before.
+        var seenRequestIds: Set<String>
+    }
+
+    // This walk was the most expensive thing in the app: every call streamed
+    // and JSON-decoded every transcript touched inside the horizon, from byte
+    // zero, with no cache at all — measured here at 1250 files / 563 MB — and
+    // three separate call sites do it (the gauge, the window markers and the
+    // 6-hourly cap estimate). Now it is incremental, like the token chart 200
+    // lines down in TokenChartView, which is where this shape is copied from.
+    //
+    // Confined to the scan queue: every caller runs inside a WorkScheduler
+    // scan-group body, and that group is one serial queue.
+    nonisolated(unsafe) private static var pointCache: [String: CachedFile] = [:]
+
     private static func collectPoints(projectsDir: URL,
                                       since: TimeInterval) -> [(ts: TimeInterval, tokens: Int64)] {
         let fm = FileManager.default
@@ -465,10 +501,8 @@ enum LimitChart {
 
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let sig = "\"type\":\"assistant\"".data(using: .utf8)!
 
         var points: [(ts: TimeInterval, tokens: Int64)] = []
-        var seenRequestIds = Set<String>()
 
         for dir in projectDirs {
             guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
@@ -476,37 +510,78 @@ enum LimitChart {
             for jsonl in files where jsonl.pathExtension == "jsonl" {
                 guard let attrs = try? fm.attributesOfItem(atPath: jsonl.path),
                       let mtime = attrs[.modificationDate] as? Date,
+                      let size = (attrs[.size] as? NSNumber)?.int64Value,
                       mtime.timeIntervalSince1970 >= since
                 else { continue }
 
-                // Stream line-by-line: these transcripts run to tens of MB, so
-                // reading the whole file (and split-ing it) would balloon memory
-                // for nothing — we only need the assistant usage lines.
-                _ = JSONLReader.stream(at: jsonl) { lineData in
-                    guard lineData.range(of: sig) != nil,
-                          let rec = try? decoder.decode(Rec.self, from: lineData),
-                          let tsString = rec.timestamp,
-                          let date = parseDate(tsString),
-                          let usage = rec.message?.usage
-                    else { return }
-                    let epoch = date.timeIntervalSince1970
-                    guard epoch >= since else { return }
-                    if let rid = rec.requestId, !seenRequestIds.insert(rid).inserted { return }
-                    // Exclude cache_read: Anthropic's rate limit weighs
-                    // cache hits almost to nothing, so counting them at
-                    // face value (they dwarf everything else) inflated
-                    // the fill far past the real limit. This is closer,
-                    // though still an estimate — the true cap is model-
-                    // weighted and account-specific.
-                    let total = (usage.inputTokens ?? 0)
-                        + (usage.cacheCreationInputTokens ?? 0)
-                        + (usage.outputTokens ?? 0)
-                    guard total > 0 else { return }
-                    points.append((epoch, total))
+                let path = jsonl.path
+                var cached: CachedFile
+                if let c = pointCache[path], c.parsedSize == size, c.mtime == mtime {
+                    cached = c                      // unchanged — no I/O at all
+                } else if var c = pointCache[path], size > c.parsedSize {
+                    c.parsedSize = parsePoints(at: jsonl, fromOffset: c.parsedSize,
+                                               decoder: decoder,
+                                               seenRequestIds: &c.seenRequestIds,
+                                               into: &c.points)
+                    c.mtime = mtime
+                    cached = c
+                } else {
+                    // New file, or rewritten / truncated → full parse.
+                    var c = CachedFile(parsedSize: 0, mtime: mtime, points: [], seenRequestIds: [])
+                    c.parsedSize = parsePoints(at: jsonl, fromOffset: 0,
+                                               decoder: decoder,
+                                               seenRequestIds: &c.seenRequestIds,
+                                               into: &c.points)
+                    cached = c
                 }
+                pointCache[path] = cached
+
+                // Filtering by time happens here, not while parsing: the three
+                // callers pass different horizons, and a cache keyed to one of
+                // them would be wrong for the others.
+                for p in cached.points where p.ts >= since { points.append(p) }
             }
         }
+        // Drop only what left the disk. Pruning to the files this call visited
+        // would be wrong here: the callers use very different horizons — a
+        // 15-minute gauge against a 6-hourly 35-day estimate — so the narrow
+        // one would evict everything the wide one just paid to read.
+        pointCache = pointCache.filter { fm.fileExists(atPath: $0.key) }
         return points
+    }
+
+    // Streams the appended tail and returns the absolute offset parsed up to.
+    // Line-by-line on purpose: these transcripts run to tens of MB, and only
+    // the assistant usage lines matter.
+    private static func parsePoints(at url: URL, fromOffset: Int64,
+                                    decoder: JSONDecoder,
+                                    seenRequestIds: inout Set<String>,
+                                    into points: inout [(ts: TimeInterval, tokens: Int64)]) -> Int64 {
+        let sig = "\"type\":\"assistant\"".data(using: .utf8)!
+        var seen = seenRequestIds
+        var out = points
+        let consumed = JSONLReader.stream(at: url, from: fromOffset) { lineData in
+            guard lineData.range(of: sig) != nil,
+                  let rec = try? decoder.decode(Rec.self, from: lineData),
+                  let tsString = rec.timestamp,
+                  let date = parseDate(tsString),
+                  let usage = rec.message?.usage
+            else { return }
+            if let rid = rec.requestId, !seen.insert(rid).inserted { return }
+            // Exclude cache_read: Anthropic's rate limit weighs cache hits
+            // almost to nothing, so counting them at face value (they dwarf
+            // everything else) inflated the fill far past the real limit. This
+            // is closer, though still an estimate — the true cap is model-
+            // weighted and account-specific.
+            let total = (usage.inputTokens ?? 0)
+                + (usage.cacheCreationInputTokens ?? 0)
+                + (usage.outputTokens ?? 0)
+            guard total > 0 else { return }
+            out.append((date.timeIntervalSince1970, total))
+        }
+        seenRequestIds = seen
+        points = out
+        return consumed
     }
 
     // CC timestamps carry fractional seconds ("…58.054Z"); the plain

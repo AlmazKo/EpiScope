@@ -112,11 +112,12 @@ It reads `~/.claude/**` and `~/.codex/**`, and publishes session state to
 - Every live session in the table carries its terminal's icon. Icons are taken at
   runtime from the installed applications; only the kitty mascot is bundled.
 - A double click on a live session focuses its terminal window or tab through the
-  `cc-open` script (looked up in `~/.local/bin`, `~/bin`, `~/dotfiles/bin`,
-  `/usr/local/bin`, `/opt/homebrew/bin`, then the bundled copy; override it with
-  `defaults write … ccOpenPath`). kitty, iTerm2, Terminal, Ghostty and Agterm get
-  the exact tab; xterm activates XQuartz; with no window at all, a fresh terminal
-  opens at the session's cwd. A double click on a dead session opens its details.
+  bundled `cc-open` script. kitty, iTerm2, Terminal, Ghostty and Agterm get the
+  exact tab; Codex App opens the exact local thread through its documented deep
+  link; xterm activates XQuartz; with no window at all, a fresh terminal opens at
+  the session's cwd. External `cc-open` scripts are intentionally ignored so the
+  opener always matches EpiScope's snapshot schema. A double click on a dead
+  session opens its details.
 - Notifications: a banner on `Finished` and `Needs permission`; a click leads to
   the terminal through the same `cc-open`, and the banner is withdrawn as soon as
   the session is visited.

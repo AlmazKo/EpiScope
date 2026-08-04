@@ -18,12 +18,12 @@ memory, and cache.
 | Path | Contents | Reader | Purpose |
 |---|---|---|---|
 | `~/.claude/sessions/<pid>.json` | pid, sessionId, cwd, entrypoint, status, updatedAt | `SessionStore` (shared) → `SessionMonitor`, `TerminalTracker` | the list of live CC sessions, their status and cwd |
-| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | transcript (assistant records with usage, structuredPatch, cwd, gitBranch) | `SessionIndexer` (deepScan), `TokenChartView`, `LimitChart` | tokens, cost, changed lines, model; per-session aggregates; limit reconstruction |
+| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | transcript (assistant records with usage, structuredPatch, cwd, gitBranch) | `SessionIndexer` (deepScan), `TokenChartView`, `LimitChart`, `TerminalTracker` (mtime-gated tail) | tokens, cost, changed lines, model; per-session aggregates; limit reconstruction; terminal API-error outcome |
 | `~/.claude/state/cc-rate-limits.json` | real 5h / weekly limits (written by Claude's hooks and status line) | `LimitChart` | exact limits when they exist |
 | `~/.claude/state/sig-<sid>`, `attended-<sid>` | hook signals about state and attention | `SessionMonitor`, `TerminalTracker` (`computeState`) | session state (waiting / thinking / done) |
 | `~/.claude/settings.json` | `effortLevel`, `hooks`, `statusLine` | `MainWindowController` (effort), `ClaudeHooks` (install) | show the effort; check and complete the integration |
-| `~/.codex/sessions/**/rollout-*.jsonl` | Codex transcript plus rolling limits | `SessionIndexer`, `LimitChart`, `TerminalTracker` (via `lsof`) | Codex sessions and limits; pid → rollout mapping |
-| `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/local_<uuid>.json` (plus `…/audit.jsonl`) | metadata and audit log of Claude Desktop Cowork sessions | `SessionIndexer` | sessions of the Code / Cowork tab |
+| `~/.codex/sessions/**/rollout-*.jsonl` | Codex transcript, cumulative usage and rolling limits | `SessionIndexer`, `TokenChartView`, `LimitChart`, `TerminalTracker` (via `lsof` plus mtime-gated tail) | Codex sessions, token/cost timeline and limits; pid → rollout mapping; terminal error outcome |
+| `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/local_<uuid>.json` (plus `…/audit.jsonl`) | metadata (`cliSessionId`) and audit log of Claude Desktop Cowork sessions | `SessionIndexer` | sessions of the Code / Cowork tab and their exact app deep-link id |
 | `…/Application Support/EpiScope/sessions.json` | **our** index cache | `SessionIndexer` (at launch) | an instant table with no full scan |
 
 ### We write (our own files)
@@ -34,32 +34,60 @@ memory, and cache.
 | `~/.claude/state/permission-wait.json` | `SessionMonitor` | when the wait clocks change | atomically; survives a restart |
 | `…/Application Support/EpiScope/sessions.json` | `SessionIndexer` | every 30 s if dirty, and on pause or exit | atomically; dates in ms |
 | `~/.claude/settings.json` (plus `.episcope.bak`) | `ClaudeHooks` | at launch | additively (it only adds our hooks and status line), with a backup |
-| `~/.claude/hooks/episcope-statusline.sh`, `tab-state.sh`, `cc-open` (bundle) | `ClaudeHooks` | at launch | install and migrate; no-clobber for the status line |
+| `~/.claude/hooks/episcope-statusline.sh`, `tab-state.sh` | `ClaudeHooks` | at launch | install and migrate; no-clobber for the status line |
+| `…/Application Support/EpiScope/reports/<stamp>-<slug>.md` (plus `.json`) | `ReportStore` | when an analysis finishes | atomically; no retention policy — a report is deleted only from the UI |
+| `…/Application Support/EpiScope/search.sqlite` | `SearchIndex` | as transcripts grow | FTS5 in WAL mode; rows for sessions that leave the index are pruned on reconcile |
+| `~/Library/LaunchAgents/<bundleID>.plist` | `LoginItem` | first launch, and on toggle | atomically; removed when Launch-at-Login is turned off |
+| `<temp>/episcope-analysis/<uuid>/**` | `AnalysisRunner`, `TranscriptExtractor` | for the duration of an analysis | the per-user temp root (0700), **not** `/private/tmp` — packets are verbatim conversation text; removed after the run, kept after a failure for a post-mortem |
 
-`cc-states.json` is the only bridge outwards. It is read by `cc-open` (which
-focuses a terminal from a notification or a double click) and by
-`SessionMonitor` itself (kitty states).
+Two of those touch files we do not own, so they are deliberately conservative.
+`~/.claude/settings.json` and the hook scripts are commonly symlinks into a
+dotfiles repo: `ClaudeHooks` resolves the link and writes **through** it, so the
+repo keeps owning the file and the `.episcope.bak` holds content rather than a
+second link. It also re-checks the file's (mtime, size) immediately before the
+atomic swap and abandons the update if anything changed while it was merging —
+our write replaces the whole document, so a hook Claude Code added in that
+window would otherwise vanish.
+
+`cc-open` is an internal app resource rather than a file installed under the
+user's home. `TerminalIntegration` always runs the bundled copy so its parser
+matches the `cc-states.json` producer from the same EpiScope version.
+
+`cc-states.json` is the only bridge outwards. Its v1 entries may include the
+optional `bundle_id` of the hosting application, discovered from process
+ancestry. It is read by `cc-open` (which focuses a terminal or activates an
+application from a notification or a double click) and by `SessionMonitor`
+itself (states and host icons).
 
 ---
 
 ## 2. Who runs when, and on which thread
 
-Three **independent** scanners, each with its own queue and caches. They share
-no state except `SessionStore` for the session files.
+Three scanners, each with its own queue and caches. They share `SessionStore`
+for Claude session files; `SessionMonitor` also hands the already-computed set
+of waiting Codex session ids to `TerminalTracker` in memory, avoiding a second
+rollout-tail scan solely for notifications.
 
 ### TerminalTracker — "where does each session live" plus publishing
 - **Thread and cadence:** a `DispatchSourceTimer` on a background serial queue,
   **1 s** (`TerminalTracker.interval`).
 - **Every tick:** `SessionStore.sessions()` (gated decode) → `ps -p <pids>`
   (liveness, tty, and a guard against pid reuse).
+- **Turn outcome:** transcript / rollout files are statted for live sessions;
+  only a changed file gets a bounded 64 KiB tail read. A terminal Claude API
+  error or Codex terminal `error` publishes the neutral, table-only `error`
+  state; retryable Codex `stream_error` events are ignored. A newer Claude
+  `idle` timestamp also invalidates a stale
+  `thinking` hook left behind when Stop did not fire.
 - **Less often:** `ps -axo` (the Codex lookup) runs **every 4th tick**, cached;
   kitty / iTerm / Terminal / Ghostty location runs **every 2nd tick**, and only
   when the application is running (`NSRunningApplication`), so AppleScript and
   `kitten` are never spawned otherwise.
 - **End of a tick:** publish `cc-states.json` (atomically) and send
-  notifications for state transitions.
+  notifications for state transitions. Codex approval transitions reuse the
+  waiting-id verdict supplied in memory by `SessionMonitor`.
 - **Why:** one path to open a terminal (`cc-open`), the terminal icons, and the
-  Finished / Waiting status.
+  Finished / Waiting / Error status.
 
 ### SessionMonitor — "live status for the menu bar and the table"
 - **Thread and cadence:** a `Timer` on the main run loop, **1 s**, tolerance 0.2.
@@ -68,7 +96,8 @@ no state except `SessionStore` for the session files.
   `refreshKittyStates()` (which reads `cc-states.json` **only when its mtime
   changes**), and `updateWaitClocks`.
 - **Off main:** Codex sessions are read on a separate queue
-  (`refreshCodexLiveAsync`).
+  (`refreshCodexLiveAsync`); their waiting ids are then handed to
+  `TerminalTracker` without another rollout read.
 - **Why:** the needs-attention list, the state badges, and the perm-wait clocks.
 
 ### SessionIndexer — "the session table with aggregates"
@@ -79,9 +108,10 @@ no state except `SessionStore` for the session files.
   1. `rebuildShallow` walks `~/.claude/projects`, the Codex rollouts and Claude
      Desktop, and `stat`s every jsonl. Unchanged files come from the cache; new
      or grown ones are marked as stubs.
-  2. `deepScan` runs on the stubs only (the changed files) and parses **just the
-     tail that was appended**. A live session's row therefore updates within a
-     second, while untouched files cost one `stat` each.
+  2. `deepScan` runs on the stubs only (the changed files). Claude transcripts
+     use their append cursor; Codex currently re-scans the changed rollout to
+     find its latest cumulative snapshot. A live session's row therefore
+     updates within a second, while untouched files cost one `stat` each.
 - **Table updates:** when the row membership is unchanged, fresh data is written
   into the existing nodes **by `sessionId`** and only the changed rows are
   redrawn; the order is not re-sorted, because that would make
@@ -96,9 +126,11 @@ no state except `SessionStore` for the session files.
 ### TokenChartView and LimitChart — the charts
 - Both use their own background queues and compute **on demand** (window opened,
   reindex, a setting changed), not on a timer.
-- `TokenChartView` keeps an incremental byte cursor over `projects/*.jsonl` and
-  reads only the appended bytes; the bucket grid is anchored to wall-clock
-  boundaries.
+- `TokenChartView` keeps incremental byte cursors over Claude project jsonl and
+  Codex rollout jsonl and reads only appended bytes; the bucket grid is anchored
+  to wall-clock boundaries. Its Codex cursor also retains the last cumulative
+  usage snapshot, model, cwd and session id so the next tail can be converted
+  to per-response deltas.
 - `LimitChart` prefers `cc-rate-limits.json` (fresh for 30 minutes), then Codex
   rollouts, then a cached token estimate. It makes **no** network calls and
   touches **no** Keychain.
@@ -117,6 +149,11 @@ no state except `SessionStore` for the session files.
   full reparse happens only when a file shrank or was rewritten.
 - **`requestId` dedup.** Claude writes several assistant records per API call
   (streaming blocks) with the same usage; we count the first one per requestId.
+- **Cumulative Codex usage.** `total_token_usage.input_tokens` includes cache
+  reads and cache writes. We subtract both into separate billing classes;
+  `output_tokens` already includes reasoning, so `reasoning_output_tokens` is
+  retained only as detail and is not added again. The chart subtracts the prior
+  cumulative snapshot and ignores unchanged repeats.
 - **mtime gating wherever possible:** decoding session files, listing project
   directories (a directory is re-read only when a file is added or removed; a
   file that grew is caught by the per-file stat), the monitor's read of
@@ -137,11 +174,16 @@ no state except `SessionStore` for the session files.
   runs): the indexer drops them before its inner `readdir` when Show Temporary is
   off, and the token chart folds them into one neutral bar.
 - **Claude Desktop (Code / Cowork):** the transcript is the `audit.jsonl` next to
-  `local_<uuid>.json`; freshness is keyed on the audit file's mtime and size; the
-  entrypoint is `claude-desktop` and the session opens through `cc-open` using
-  the application's bundle id.
-- **Codex:** the cwd lives inside `session_meta`, and pid → rollout is resolved
-  through `lsof` (once per pid, cached).
+  `local_<uuid>.json`; freshness is keyed on the audit file's mtime and size.
+  The index keeps `local_<uuid>` as its key and stores metadata's `cliSessionId`
+  as the app id. `cc-open` follows `claude://code/<cliSessionId>` (or the live
+  bridge session id for `entrypoint = claude-desktop`) to select the exact
+  session, with bundle activation only as a fallback.
+- **Codex:** the cwd lives inside `session_meta`, pid → rollout is resolved
+  through `lsof` (once per pid, cached), and usage is timestamped by the
+  `token_count` record that actually carries it rather than by the preceding
+  `agent_message`. When Codex App is the host, `cc-open` uses the documented
+  `codex://threads/<thread-id>` deep link to select the exact local thread.
 
 ---
 

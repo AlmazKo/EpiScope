@@ -43,7 +43,9 @@ enum LoginItem {
             format: .xml,
             options: 0
         ) else { return }
-        try? data.write(to: plistURL)
+        // Atomic: a plist truncated by a crash mid-write is one launchd
+        // rejects, and the user only finds out at the next login.
+        try? data.write(to: plistURL, options: .atomic)
     }
 
     static func disable() {

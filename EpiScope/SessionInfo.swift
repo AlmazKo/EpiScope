@@ -1,5 +1,21 @@
 import Foundation
 
+// Session ids come out of files other tools write — ~/.claude/sessions/<pid>.json,
+// transcript filenames — and we then use them as path components
+// (~/.claude/state/sig-<id>, which we also delete) and as arguments of a shell
+// command we put on the clipboard. Real ids are uuids, with a local_ prefix in
+// the Claude desktop store, so anything carrying a separator or a quote is a
+// forgery rather than a session and gets dropped before it can name a file.
+enum SessionID {
+    static func isValid(_ sid: String) -> Bool {
+        guard !sid.isEmpty, sid.count <= 128 else { return false }
+        return sid.utf8.allSatisfy { c in
+            (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A)
+                || (c >= 0x61 && c <= 0x7A) || c == 0x2D || c == 0x5F || c == 0x2E
+        }
+    }
+}
+
 struct SessionInfo: Decodable, Equatable {
     let pid: Int
     let sessionId: String
@@ -21,7 +37,14 @@ struct SessionInfo: Decodable, Equatable {
     // that disambiguates several sessions sharing one cwd in Ghostty.
     var name: String?
 
-    var isWaiting: Bool { status == "waiting" }
+    // User-opened overlays (currently `/btw`) temporarily publish
+    // `waiting / dialog open` even though the main turn keeps running. They are
+    // not permission/question requests and must not enter the attention path.
+    var isEphemeralDialogOpen: Bool {
+        status == "waiting" && waitingFor == "dialog open"
+    }
+    var isWaiting: Bool { status == "waiting" && !isEphemeralDialogOpen }
+    var attentionStatus: String? { isEphemeralDialogOpen ? nil : status }
     var isSdkCli: Bool { entrypoint == "sdk-cli" }
 
     var folderName: String {

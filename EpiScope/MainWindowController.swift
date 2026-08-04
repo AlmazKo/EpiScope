@@ -13,6 +13,9 @@ extension Notification.Name {
     // background daily/weekly insight, or a user-run retro/question).
     // MainWindowController refreshes the unread badge on the Insights item.
     static let insightsReportsChanged = Notification.Name("episcope.insightsReportsChanged")
+    // Fired by ReportsWindowController when a run starts or ends, so the
+    // toolbar's ✦ can pulse for as long as the analysis is in flight.
+    static let insightsRunStateChanged = Notification.Name("episcope.insightsRunStateChanged")
 }
 
 // Single-window list of every Claude session the indexer has seen.
@@ -84,6 +87,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return dot
     }()
     private static let insightsLastSeenKey = "insightsLastSeen"
+    // Pulse while an analysis runs (see refreshInsightsRunPulse).
+    private var insightsPulseTimer: Timer?
+    private var insightsPulseOn = true
+    private static let insightsPulseAlpha: CGFloat = 0.3
     // Each mode owns its search field: scopes search different things
     // and queries must not leak across (placeholders are fixed too).
     private let listSearchItem = NSSearchToolbarItem(itemIdentifier: .search)
@@ -247,6 +254,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             name: .insightsReportsChanged,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(refreshInsightsRunPulse),
+            name: .insightsRunStateChanged,
+            object: nil
+        )
         // Seed "last seen" on first run so pre-existing reports don't badge;
         // only insights created from here on count as unread.
         if UserDefaults.standard.object(forKey: Self.insightsLastSeenKey) == nil {
@@ -325,6 +338,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         refreshFromIndex()
         indexer.resume()
         applyChartMode()
+        // A run may have started while the window was closed.
+        refreshInsightsRunPulse()
     }
 
     private func computeChartIfNeeded() {
@@ -407,6 +422,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // Drop the cached chart so the next window-open recomputes.
         chartComputed = false
         limitTickTimer = nil
+        // Nothing to pulse at while the window is gone; show() picks it up
+        // again if the run is still going.
+        insightsPulseTimer?.invalidate()
+        insightsPulseTimer = nil
         // Nobody is looking — stop the 2-second sweep until the
         // window comes back. show() resumes it.
         indexer.pause()
@@ -601,28 +620,28 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         outlineView.addTableColumn(sessionColor)
 
         let colorDot = NSTableColumn(identifier: ColumnID.colorDot)
-        colorDot.title = ""
-        colorDot.width = 20
-        colorDot.minWidth = 20
-        colorDot.maxWidth = 20
+        colorDot.title = "AI"
+        colorDot.width = 28
+        colorDot.minWidth = 28
+        colorDot.maxWidth = 28
         outlineView.addTableColumn(colorDot)
 
         let terminal = NSTableColumn(identifier: ColumnID.terminal)
-        terminal.title = ""
-        terminal.width = 24
-        terminal.minWidth = 24
-        terminal.maxWidth = 24
+        terminal.title = "App"
+        terminal.width = 34
+        terminal.minWidth = 34
+        terminal.maxWidth = 34
         outlineView.addTableColumn(terminal)
 
         let model = NSTableColumn(identifier: ColumnID.model)
         model.title = "Model"
         model.width = 140
         model.minWidth = 80
-        model.sortDescriptorPrototype = NSSortDescriptor(key: "model", ascending: true)
+        model.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.model.rawValue, ascending: true)
         outlineView.addTableColumn(model)
 
         // Live-status badge: Waiting (red bg) / Busy (animated dots)
-        // / Idle / "—". Empty when the session is not currently running.
+        // / Error / Idle / "—". Empty when the session is not currently running.
         let status = NSTableColumn(identifier: ColumnID.status)
         status.title = "Status"
         status.width = 84
@@ -636,7 +655,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         permWait.title = "Perm Wait"
         permWait.width = 76
         permWait.minWidth = 56
-        permWait.sortDescriptorPrototype = NSSortDescriptor(key: "permWait", ascending: false)
+        permWait.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.permWait.rawValue, ascending: false)
         permWait.isHidden = true
         outlineView.addTableColumn(permWait)
 
@@ -644,7 +663,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         path.title = "Path"
         path.width = 250
         path.minWidth = 140
-        path.sortDescriptorPrototype = NSSortDescriptor(key: "path", ascending: true)
+        path.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.path.rawValue, ascending: true)
         outlineView.addTableColumn(path)
         outlineView.outlineTableColumn = path  // disclosure arrows + group indentation live here
 
@@ -652,7 +671,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         title.title = "Title"
         title.width = 250
         title.minWidth = 160
-        title.sortDescriptorPrototype = NSSortDescriptor(key: "title", ascending: true)
+        title.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.title.rawValue, ascending: true)
         // Title is the elastic column: it absorbs the toolbar's
         // leftover space whenever the window grows, while every
         // other column keeps its natural width.
@@ -663,7 +682,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         input.title = "Input"
         input.width = 80
         input.minWidth = 60
-        input.sortDescriptorPrototype = NSSortDescriptor(key: "inputTokens", ascending: false)
+        input.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.inputTokens.rawValue, ascending: false)
         outlineView.addTableColumn(input)
 
         // Lines of code the session's edits touched: "+123 −45",
@@ -672,7 +691,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         changes.title = "Changes"
         changes.width = 110
         changes.minWidth = 80
-        changes.sortDescriptorPrototype = NSSortDescriptor(key: "changes", ascending: false)
+        changes.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.changes.rawValue, ascending: false)
         outlineView.addTableColumn(changes)
 
         // Hidden-by-default columns follow. Users can flip them on
@@ -683,7 +702,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         name.title = "Name"
         name.width = 160
         name.minWidth = 80
-        name.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true)
+        name.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.name.rawValue, ascending: true)
         name.isHidden = true
         outlineView.addTableColumn(name)
 
@@ -691,7 +710,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         startedAt.title = "Started"
         startedAt.width = 120
         startedAt.minWidth = 80
-        startedAt.sortDescriptorPrototype = NSSortDescriptor(key: "startedAt", ascending: false)
+        startedAt.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.startedAt.rawValue, ascending: false)
         startedAt.isHidden = true
         outlineView.addTableColumn(startedAt)
 
@@ -699,7 +718,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         userMessages.title = "User msgs"
         userMessages.width = 70
         userMessages.minWidth = 50
-        userMessages.sortDescriptorPrototype = NSSortDescriptor(key: "userMessages", ascending: false)
+        userMessages.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.userMessages.rawValue, ascending: false)
         userMessages.isHidden = true
         outlineView.addTableColumn(userMessages)
 
@@ -709,7 +728,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         turns.title = "Turns"
         turns.width = 60
         turns.minWidth = 50
-        turns.sortDescriptorPrototype = NSSortDescriptor(key: "turns", ascending: false)
+        turns.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.turns.rawValue, ascending: false)
         turns.isHidden = true
         outlineView.addTableColumn(turns)
 
@@ -717,7 +736,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         branch.title = "Branch"
         branch.width = 120
         branch.minWidth = 80
-        branch.sortDescriptorPrototype = NSSortDescriptor(key: "branch", ascending: true)
+        branch.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.branch.rawValue, ascending: true)
         branch.isHidden = true
         outlineView.addTableColumn(branch)
 
@@ -725,7 +744,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         cacheRead.title = "Cache"
         cacheRead.width = 80
         cacheRead.minWidth = 60
-        cacheRead.sortDescriptorPrototype = NSSortDescriptor(key: "cacheReadTokens", ascending: false)
+        cacheRead.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.cacheReadTokens.rawValue, ascending: false)
         cacheRead.isHidden = true
         outlineView.addTableColumn(cacheRead)
 
@@ -733,7 +752,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         output.title = "Output"
         output.width = 80
         output.minWidth = 60
-        output.sortDescriptorPrototype = NSSortDescriptor(key: "outputTokens", ascending: false)
+        output.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.outputTokens.rawValue, ascending: false)
         output.isHidden = true
         outlineView.addTableColumn(output)
 
@@ -741,7 +760,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         cost.title = "Cost"
         cost.width = 75
         cost.minWidth = 60
-        cost.sortDescriptorPrototype = NSSortDescriptor(key: "cost", ascending: false)
+        cost.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.cost.rawValue, ascending: false)
         cost.isHidden = true
         outlineView.addTableColumn(cost)
 
@@ -749,10 +768,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         activity.title = "Last Activity"
         activity.width = 130
         activity.minWidth = 100
-        activity.sortDescriptorPrototype = NSSortDescriptor(key: "activity", ascending: false)
+        activity.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.activity.rawValue, ascending: false)
         outlineView.addTableColumn(activity)
 
-        outlineView.sortDescriptors = [NSSortDescriptor(key: "activity", ascending: false)]
+        outlineView.sortDescriptors = [NSSortDescriptor(key: SortKey.activity.rawValue, ascending: false)]
         applyGroupingColumns(groupByDir)
     }
 
@@ -1013,6 +1032,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                                      y: container.bounds.height - s - 2, width: s, height: s)
         insightsBadge.autoresizingMask = [.minXMargin, .minYMargin]
         container.addSubview(insightsBadge)
+        // The toolbar rebuilds this item on every mode switch, so a run that is
+        // already in flight has to re-arm the pulse on the fresh button.
+        refreshInsightsRunPulse()
         return container
     }
 
@@ -1032,6 +1054,35 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
         let newest = reportsWC.newestCompletedReportDate() ?? .distantPast
         insightsBadge.isHidden = newest <= insightsLastSeen
+    }
+
+    // An analysis takes minutes and its only other sign is a row in a list the
+    // user probably isn't looking at, so the ✦ pulses for as long as the run is
+    // in flight. Slower than the menu bar's permission blink on purpose: this
+    // is progress, not an alarm.
+    @objc private func refreshInsightsRunPulse() {
+        let running = reportsWC.isAnalysisRunning
+        guard running else {
+            insightsPulseTimer?.invalidate()
+            insightsPulseTimer = nil
+            insightsButton.animator().alphaValue = 1
+            return
+        }
+        guard insightsPulseTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.9, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.insightsPulseOn.toggle()
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.45
+                    self.insightsButton.animator().alphaValue =
+                        self.insightsPulseOn ? 1 : Self.insightsPulseAlpha
+                }
+            }
+        }
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        insightsPulseTimer = timer
     }
 
     // While the indexer is still deep-scanning, the refresh button is
@@ -1261,41 +1312,73 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         reloadChart()
     }
 
+    // The keys the header prototypes carry. A separate type from ColumnID on
+    // purpose — three of them deliberately differ from their column's id
+    // (col.input/inputTokens, col.cacheRead/cacheReadTokens,
+    // col.output/outputTokens) — and switched exhaustively below, so a new
+    // sortable column fails to compile instead of quietly sorting by activity.
+    // Four used to: Model, Name and Started moved the arrow and reordered
+    // nothing, which is the worst kind of wrong because it looks like it worked.
+    private enum SortKey: String {
+        case model, permWait, path, title, inputTokens, changes
+        case name, startedAt, userMessages, turns, branch
+        case cacheReadTokens, outputTokens, cost, activity
+    }
+
     private func sortFilteredEntries() {
-        guard let sort = outlineView.sortDescriptors.first else { return }
+        guard let sort = outlineView.sortDescriptors.first,
+              let key = sort.key.flatMap(SortKey.init(rawValue:)) else { return }
         let asc = sort.ascending
-        switch sort.key {
-        case "path":
+        switch key {
+        case .path:
             filteredEntries.sort { cmp($0.relativePath, $1.relativePath, ascending: asc) }
-        case "title":
+        case .title:
             filteredEntries.sort { cmp($0.displayTitle, $1.displayTitle, ascending: asc) }
-        case "userMessages":
+        case .userMessages:
             filteredEntries.sort { asc ? ($0.userMessageCount < $1.userMessageCount) : ($0.userMessageCount > $1.userMessageCount) }
-        case "turns":
+        case .turns:
             filteredEntries.sort { asc ? ($0.turns < $1.turns) : ($0.turns > $1.turns) }
-        case "branch":
+        case .branch:
             filteredEntries.sort { cmp($0.lastGitBranch ?? "", $1.lastGitBranch ?? "", ascending: asc) }
-        case "inputTokens":
+        case .inputTokens:
             filteredEntries.sort { asc ? ($0.inputTokens < $1.inputTokens) : ($0.inputTokens > $1.inputTokens) }
-        case "changes":
+        case .changes:
             filteredEntries.sort {
                 let a = $0.linesAdded + $0.linesRemoved
                 let b = $1.linesAdded + $1.linesRemoved
                 return asc ? (a < b) : (a > b)
             }
-        case "cacheReadTokens":
+        case .cacheReadTokens:
             filteredEntries.sort { asc ? ($0.cacheReadTokens < $1.cacheReadTokens) : ($0.cacheReadTokens > $1.cacheReadTokens) }
-        case "outputTokens":
+        case .outputTokens:
             filteredEntries.sort { asc ? ($0.outputTokens < $1.outputTokens) : ($0.outputTokens > $1.outputTokens) }
-        case "cost":
+        case .cost:
             filteredEntries.sort { asc ? ($0.costUSD < $1.costUSD) : ($0.costUSD > $1.costUSD) }
-        case "permWait":
+        case .permWait:
             filteredEntries.sort {
                 let a = monitor.permissionWait(for: $0.sessionId)
                 let b = monitor.permissionWait(for: $1.sessionId)
                 return asc ? (a < b) : (a > b)
             }
-        default:
+        case .model:
+            // Sort by what the column shows, not the raw id: prettyModelName
+            // strips the vendor prefix, so raw ids would group every Claude row
+            // ahead of every Codex one while the visible text looked shuffled.
+            filteredEntries.sort {
+                cmp($0.model.map(Self.prettyModelName) ?? "",
+                    $1.model.map(Self.prettyModelName) ?? "", ascending: asc)
+            }
+        case .name:
+            filteredEntries.sort { cmp($0.name ?? "", $1.name ?? "", ascending: asc) }
+        case .startedAt:
+            // Codex and desktop stubs carry no start until their deep scan
+            // lands; they sink to the bottom of the default newest-first order.
+            filteredEntries.sort {
+                let a = $0.startedAt ?? .distantPast
+                let b = $1.startedAt ?? .distantPast
+                return asc ? (a < b) : (a > b)
+            }
+        case .activity:
             filteredEntries.sort { asc ? ($0.lastActivity < $1.lastActivity) : ($0.lastActivity > $1.lastActivity) }
         }
     }
@@ -1449,17 +1532,33 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     // Bring the selected session's home forward — same single entry point
-    // as the row double-click. cc-open resolves a terminal or the Claude
-    // desktop app from cc-states.json.
+    // as the row double-click. cc-open resolves a terminal from cc-states.json
+    // or follows Claude App's exact-session deep link.
     @objc private func openSelectedTerminal() {
         guard let entry = actionSession() else { return }
-        TerminalIntegration.openSession(sessionId: entry.sessionId)
+        openSessionHome(entry)
     }
 
     // Marks a session as belonging to the Claude desktop app, whether the
     // index captured it (entrypoint / provider) or it's a live Code session.
     private func isDesktopSession(_ entry: SessionIndexEntry) -> Bool {
         entry.isClaudeDesktop || monitor.liveSessions[entry.sessionId]?.entrypoint == "claude-desktop"
+    }
+
+    private func claudeDesktopRouteId(_ entry: SessionIndexEntry) -> String? {
+        guard isDesktopSession(entry) else { return nil }
+        // local_<uuid> is only EpiScope/Claude's storage key and is not a
+        // routable bridge id. Wait for deepScan to publish cliSessionId rather
+        // than knowingly opening Claude's session list during the short stub
+        // phase. Live Code sessions use their normal session id directly.
+        if entry.provider == .claudeDesktop { return entry.appSessionId }
+        return entry.appSessionId ?? entry.sessionId
+    }
+
+    private func openSessionHome(_ entry: SessionIndexEntry) {
+        TerminalIntegration.openSession(
+            sessionId: entry.sessionId,
+            claudeDesktopSessionId: claudeDesktopRouteId(entry))
     }
 
     func outlineViewItemDidExpand(_ notification: Notification) {
@@ -1599,8 +1698,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             view.color = TokenChartView.color(for: entry.sessionId)
             return view
         case ColumnID.terminal:
-            // Tiny image cell: the hosting terminal's icon for sessions
-            // currently alive (kind comes from the tracker's snapshot).
+            // Tiny image cell: the hosting application's icon for sessions
+            // currently alive (host data comes from the tracker's snapshot).
             // Empty otherwise.
             let imgId = NSUserInterfaceItemIdentifier("col.terminalImg")
             let view = (outlineView.makeView(withIdentifier: imgId, owner: self) as? NSImageView)
@@ -1619,12 +1718,17 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             } else if isDesktopSession(entry) {
                 // Claude desktop has no terminal — show the app's icon.
                 view.image = Self.claudeDesktopIcon
+            } else if let term = monitor.terminalKinds[entry.sessionId] {
+                // The tracker publishes all live Claude and Codex processes,
+                // while `liveSessions` contains only the subset relevant to
+                // status monitoring. Host icons must not depend on that subset.
+                let sid = entry.sessionId
+                view.image = Self.terminalIcon(
+                    for: term, bundleId: monitor.hostBundleIds[sid])
             } else if monitor.liveSessions[entry.sessionId] != nil {
                 let sid = entry.sessionId
-                if let term = monitor.terminalKinds[sid] {
-                    view.image = Self.terminalIcon(for: term)
-                } else if Self.needsAttention(status: monitor.liveSessions[sid]?.status,
-                                              trackerState: monitor.kittyStates[sid]) {
+                if Self.needsAttention(session: monitor.liveSessions[sid],
+                                       trackerState: monitor.kittyStates[sid]) {
                     // Alive, needs the user, and hosted by no known terminal —
                     // a detached / headless task. Only flag it in an attention
                     // state (a fresh session whose terminal the tracker hasn't
@@ -1634,7 +1738,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                     view.toolTip = "Detached — no terminal to focus"
                 } else {
                     // Not yet located — neutral glyph, same as before.
-                    view.image = Self.terminalIcon(for: nil)
+                    view.image = Self.terminalIcon(for: nil, bundleId: nil)
                 }
             } else {
                 view.image = nil
@@ -1644,23 +1748,30 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let viewId = NSUserInterfaceItemIdentifier("col.statusBadge")
             let badge = (outlineView.makeView(withIdentifier: viewId, owner: self) as? StatusBadgeView)
                 ?? StatusBadgeView(identifier: viewId)
-            if let live = monitor.liveSessions[entry.sessionId] {
-                switch live.status {
-                case "waiting":
+            let trackerState = monitor.kittyStates[entry.sessionId]
+            if trackerState == "error" {
+                // Failed turns remain inspectable, but are deliberately not an
+                // attention state: neutral badge, no pearlescence/highlight.
+                badge.configure(text: "Error",
+                                color: .labelColor,
+                                background: nil)
+            } else if let live = monitor.liveSessions[entry.sessionId] {
+                if live.isWaiting {
                     badge.configure(text: "Waiting",
                                     color: .white,
                                     background: NSColor.systemRed.withAlphaComponent(0.9))
-                case "busy":
+                } else if live.status == "busy" {
                     badge.configure(text: Self.busyText(monitor.busyDuration(for: entry.sessionId)),
                                     color: .white,
                                     background: nil,
                                     pearlescent: true)
-                default:
+                } else {
                     // Alive but the sessions/*.json status is idle/absent —
-                    // Claude desktop never writes one, and SDK-CLI omits it.
+                    // Claude desktop never writes one, SDK-CLI omits it, and a
+                    // user-opened `/btw` dialog is deliberately transparent.
                     // Fall back to the tracker's computed state (from the
                     // hooks), which covers thinking / needs_permission / done.
-                    switch monitor.kittyStates[entry.sessionId] {
+                    switch trackerState {
                     case "needs_permission":
                         badge.configure(text: "Waiting",
                                         color: .white,
@@ -1849,8 +1960,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // user — parked on a permission prompt (waiting / needs_permission) or
     // finished (done). A session whose terminal the tracker simply hasn't
     // located yet is busy/thinking, so it never trips this.
-    private static func needsAttention(status: String?, trackerState: String?) -> Bool {
-        if status == "waiting" { return true }
+    private static func needsAttention(session: SessionInfo?, trackerState: String?) -> Bool {
+        if session?.isWaiting == true { return true }
         return trackerState == "needs_permission" || trackerState == "done"
     }
 
@@ -1891,38 +2002,41 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             && monitor.terminalKinds[entry.sessionId] == nil
     }
 
-    // Icon for the terminal hosting a session. Nothing is bundled except
-    // the kitty mascot: the rest are the installed apps' own icons via
-    // NSWorkspace (always current, no licensing of third-party artwork),
-    // with an SF Symbol for sessions in no recognised terminal (IDE, ssh).
+    // Icon for the application hosting a session. A bundle id from process
+    // ancestry wins; dedicated terminal kinds remain as fallbacks for exact
+    // adapters that do not need to walk the process tree.
     private static var terminalIconCache: [String: NSImage?] = [:]
 
-    private static func terminalIcon(for term: String?) -> NSImage? {
-        let key = term ?? "generic"
+    private static func terminalIcon(for term: String?, bundleId: String?) -> NSImage? {
+        let key = bundleId ?? term ?? "generic"
         if let cached = terminalIconCache[key] { return cached }
         let icon: NSImage?
-        switch term {
-        case "kitty":
-            icon = kittyImage
-        case "iterm2":
-            icon = appIcon(bundleId: "com.googlecode.iterm2")
-        case "terminal":
-            icon = appIcon(bundleId: "com.apple.Terminal")
-        case "ghostty":
-            icon = appIcon(bundleId: "com.mitchellh.ghostty")
-        case "agterm":
-            icon = appIcon(bundleId: "com.umputun.agterm")
-        case "xterm":
-            // xterm has no app bundle of its own — XQuartz hosts it.
-            icon = appIcon(bundleId: "org.xquartz.X11")
-                ?? NSImage(systemSymbolName: "xmark.square", accessibilityDescription: "xterm")
-        case "jetbrains":
-            // Use the icon of the running JetBrains IDE (any product).
-            icon = NSWorkspace.shared.runningApplications
-                .first { $0.bundleIdentifier?.hasPrefix("com.jetbrains") == true }?.icon
-                ?? NSImage(systemSymbolName: "hammer", accessibilityDescription: "JetBrains IDE")
-        default:
-            icon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "terminal")
+        if let bundleId, let appImage = appIcon(bundleId: bundleId) {
+            icon = appImage
+        } else {
+            switch term {
+            case "kitty":
+                icon = kittyImage
+            case "iterm2":
+                icon = appIcon(bundleId: "com.googlecode.iterm2")
+            case "terminal":
+                icon = appIcon(bundleId: "com.apple.Terminal")
+            case "ghostty":
+                icon = appIcon(bundleId: "com.mitchellh.ghostty")
+            case "agterm":
+                icon = appIcon(bundleId: "com.umputun.agterm")
+            case "xterm":
+                // xterm has no app bundle of its own — XQuartz hosts it.
+                icon = appIcon(bundleId: "org.xquartz.X11")
+                    ?? NSImage(systemSymbolName: "xmark.square", accessibilityDescription: "xterm")
+            case "jetbrains":
+                // Legacy snapshots did not publish an exact bundle id.
+                icon = NSWorkspace.shared.runningApplications
+                    .first { $0.bundleIdentifier?.hasPrefix("com.jetbrains") == true }?.icon
+                    ?? NSImage(systemSymbolName: "hammer", accessibilityDescription: "JetBrains IDE")
+            default:
+                icon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "terminal")
+            }
         }
         icon?.size = NSSize(width: 16, height: 16)
         terminalIconCache[key] = icon
@@ -1930,6 +2044,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private static func appIcon(bundleId: String) -> NSImage? {
+        if let icon = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == bundleId })?.icon {
+            return icon
+        }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)
         else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
@@ -2118,9 +2236,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // ready to paste into a terminal to reopen the session where it lived.
     @objc private func copyResumeCommand() {
         guard let entry = actionSession() else { return }
+        // The id is a transcript filename, so quote it like the path: this
+        // string is built to be pasted into a shell, and a session whose file
+        // was named by someone else must not carry a second command into it.
+        let sid = Self.shellQuote(entry.sessionId)
         let launch = entry.provider == .codex
-            ? "codex resume \(entry.sessionId)"
-            : "claude --resume \(entry.sessionId)"
+            ? "codex resume \(sid)"
+            : "claude --resume \(sid)"
         let cmd = "cd \(Self.shellQuote(entry.cwd)) && \(launch)"
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -2323,7 +2445,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             highlightTranscriptMatches(for: highlight, scrollToFirstMatch: scrollTo == nil)
         }
         guard let scrollTo, !scrollTo.isEmpty else { return }
-        guard let ei = events.firstIndex(where: { $0.text.hasPrefix(scrollTo) }),
+        let visibleEvents = events.filter { $0.kind != .usage }
+        guard let ei = visibleEvents.firstIndex(where: { $0.text.hasPrefix(scrollTo) }),
               ei < ranges.count else {
             // Message not in the loaded (tail-capped) transcript — fall back to
             // the first query match if there is one.
@@ -2431,6 +2554,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         _ events: [SessionIndexer.TranscriptEvent],
         truncated: Bool = false
     ) -> (text: NSAttributedString, ranges: [NSRange]) {
+        let visibleEvents = events.filter { $0.kind != .usage }
         let bodyFontSize: CGFloat = NSFont.systemFontSize          // 13pt
         let headerFontSize: CGFloat = NSFont.smallSystemFontSize   // 11pt
         let body = NSMutableAttributedString()
@@ -2442,7 +2566,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                     .foregroundColor: NSColor.tertiaryLabelColor,
                 ]))
         }
-        if events.isEmpty {
+        if visibleEvents.isEmpty {
             body.append(NSAttributedString(string: "No user-visible messages.", attributes: [
                 .font: NSFont.systemFont(ofSize: bodyFontSize),
                 .foregroundColor: NSColor.secondaryLabelColor,
@@ -2459,8 +2583,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         bodyPara.lineSpacing = 0
 
         var ranges: [NSRange] = []
-        ranges.reserveCapacity(events.count)
-        for event in events {
+        ranges.reserveCapacity(visibleEvents.count)
+        for event in visibleEvents {
             let blockStart = body.length
             let isUser = event.kind == .user
             let stamp = event.timestamp.map(timeStampFormatter.string(from:)) ?? ""
@@ -2496,15 +2620,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
     @objc private func rowDoubleClicked() {
         guard let entry = clickedSession() else { return }
-        // One path for everything: if the tracker knows where the session
-        // lives (published in cc-states.json — a terminal, or the Claude app
-        // for a desktop "Code" session), cc-open focuses/opens it; otherwise
-        // drill into the transcript.
-        if monitor.terminalKinds[entry.sessionId] != nil {
+        // Claude App has an exact-session URL even when a historical session
+        // has no live cc-states entry. Other providers still need a tracked
+        // host; detached sessions drill into their transcript.
+        if claudeDesktopRouteId(entry) != nil
+            || monitor.terminalKinds[entry.sessionId] != nil {
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString(entry.sessionId, forType: .string)
-            TerminalIntegration.openSession(sessionId: entry.sessionId)
+            openSessionHome(entry)
         } else {
             enterDetailsMode(for: entry)
         }
@@ -2555,8 +2679,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private func liveComposite(_ sid: String, waitingIds: Set<String>) -> String {
         let state = monitor.kittyStates[sid] ?? ""
         let term = monitor.terminalKinds[sid] ?? ""
+        let bundleId = monitor.hostBundleIds[sid] ?? ""
         let waiting = waitingIds.contains(sid) ? "w" : ""
-        return "\(state)|\(term)|\(waiting)"
+        return "\(state)|\(term)|\(bundleId)|\(waiting)"
     }
 
     // While any session is parked on a permission prompt the Perm Wait
@@ -3273,10 +3398,11 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
         case .messages:
             return detailEntry == nil && selectedSession() != nil
         case .openTerminal:
-            // Enabled when we know the session's hosting terminal
-            // (published in cc-states.json for live Claude + Codex).
+            // Claude App can address an indexed historical session directly;
+            // other providers require a live host from cc-states.json.
             guard let s = actionSession() else { return false }
-            return monitor.terminalKinds[s.sessionId] != nil
+            return claudeDesktopRouteId(s) != nil
+                || monitor.terminalKinds[s.sessionId] != nil
         default:
             return true
         }

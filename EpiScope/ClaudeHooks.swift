@@ -16,6 +16,9 @@ import Foundation
 //     status line is never clobbered,
 //   * invalid JSON aborts the install rather than "fixing" the file,
 //   * the previous settings.json is kept as settings.json.episcope.bak,
+//   * a symlinked config is written through, not replaced, so a dotfiles
+//     repo keeps owning the file and the backup holds content, not a link,
+//   * a file that changed while we were merging is left alone entirely,
 //   * the new file is round-trip-validated and swapped in atomically,
 //   * a managed script is overwritten only while its marker is intact.
 enum ClaudeHooks {
@@ -45,8 +48,30 @@ enum ClaudeHooks {
     private static let scriptMarker = "episcope-hook"
     private static let statusLineMarker = "episcope-statusline"
 
+    // Both settings.json and the hook scripts are commonly symlinks into a
+    // dotfiles repo. Write through the link: replacing the path itself leaves a
+    // regular file behind and silently detaches the repo, and copying the link
+    // would make the "backup" a second link instead of a copy of the content.
+    private static func resolved(_ path: String) -> String {
+        guard (try? FileManager.default.attributesOfItem(atPath: path))?[.type]
+                as? FileAttributeType == .typeSymbolicLink
+        else { return path }
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    // (mtime, size), taken before we read and re-checked before we swap. Our
+    // write is a whole-document replacement, so a hook Claude Code added — or
+    // an edit the user made — in between would vanish without a trace.
+    private static func stamp(of path: String) -> String? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date,
+              let size = attrs[.size] as? NSNumber
+        else { return nil }
+        return "\(mtime.timeIntervalSince1970)/\(size.int64Value)"
+    }
+
     private static func settingsRoot() -> [String: Any]? {
-        guard let data = FileManager.default.contents(atPath: settingsPath),
+        guard let data = FileManager.default.contents(atPath: resolved(settingsPath)),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return nil }
         return root
@@ -91,12 +116,13 @@ enum ClaudeHooks {
         do {
             try fm.createDirectory(atPath: home + "/.claude/hooks",
                                    withIntermediateDirectories: true)
-            let existing = try? String(contentsOfFile: path, encoding: .utf8)
+            let target = resolved(path)
+            let existing = try? String(contentsOfFile: target, encoding: .utf8)
             if existing == nil || existing?.contains(marker) == true {
                 if existing != script {
-                    try script.write(toFile: path, atomically: true, encoding: .utf8)
+                    try script.write(toFile: target, atomically: true, encoding: .utf8)
                 }
-                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target)
             }
         } catch {
             return "Could not install \(resource).sh: \(error.localizedDescription)"
@@ -124,7 +150,11 @@ enum ClaudeHooks {
         guard !missing.isEmpty || needsStatusLine else { return nil }
 
         var root: [String: Any] = [:]
-        let settingsExists = fm.fileExists(atPath: settingsPath)
+        let target = resolved(settingsPath)
+        let settingsExists = fm.fileExists(atPath: target)
+        // Taken before the read, so a write that lands between the two is
+        // still caught by the re-check below.
+        let before = settingsExists ? stamp(of: target) : nil
         if settingsExists {
             guard let parsed = settingsRoot() else {
                 return "~/.claude/settings.json is not valid JSON — left untouched. "
@@ -165,14 +195,25 @@ enum ClaudeHooks {
             }
             _ = try JSONSerialization.jsonObject(with: data)  // round-trip guard
             if settingsExists {
+                guard stamp(of: target) == before else {
+                    return "~/.claude/settings.json changed while EpiScope was updating "
+                         + "it — nothing was written, so that change is intact. "
+                         + "EpiScope will retry on the next launch."
+                }
                 _ = try? fm.removeItem(atPath: backupPath)
-                try fm.copyItem(atPath: settingsPath, toPath: backupPath)
-                let tmp = settingsPath + ".episcope.tmp"
+                try fm.copyItem(atPath: target, toPath: backupPath)
+                let tmp = target + ".episcope.tmp"
+                _ = try? fm.removeItem(atPath: tmp)
                 guard fm.createFile(atPath: tmp, contents: data)
                 else { return "Could not write to ~/.claude." }
-                _ = try fm.replaceItemAt(
-                    URL(fileURLWithPath: settingsPath),
-                    withItemAt: URL(fileURLWithPath: tmp))
+                do {
+                    _ = try fm.replaceItemAt(
+                        URL(fileURLWithPath: target),
+                        withItemAt: URL(fileURLWithPath: tmp))
+                } catch {
+                    _ = try? fm.removeItem(atPath: tmp)   // no orphan next to their config
+                    throw error
+                }
             } else {
                 guard fm.createFile(atPath: settingsPath, contents: data)
                 else { return "Could not write to ~/.claude." }

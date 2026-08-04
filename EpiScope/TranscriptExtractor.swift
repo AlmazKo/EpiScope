@@ -265,25 +265,52 @@ nonisolated enum TranscriptExtractor {
         // session contributes only the tokens/lines/turns it spent inside the
         // window, not its whole life. Sessions with no in-window work drop out.
         var rows: [MetricRow] = []
+        // Sessions we can only quote whole, because their provider has no
+        // per-interval fold. Counted so the totals below can stay interval-only.
+        var lifetimeOnly = 0
         for e in entries {
-            if let since {
-                guard let w = windowedStats(for: e, since: since) else { continue }
+            let lifetimeRow = MetricRow(
+                e: e, cost: e.costUSD, input: e.inputTokens, cacheRead: e.cacheReadTokens,
+                added: e.linesAdded, removed: e.linesRemoved,
+                turns: e.turns, userMsgs: e.userMessageCount, lastActivity: e.lastActivity,
+                periodSec: e.startedAt.map { e.lastActivity.timeIntervalSince($0) }, windowed: false)
+            guard let since else { rows.append(lifetimeRow); continue }
+            if let w = windowedStats(for: e, since: since) {
                 rows.append(MetricRow(
                     e: e, cost: w.cost, input: w.input, cacheRead: w.cacheRead,
                     added: w.linesAdded, removed: w.linesRemoved,
                     turns: w.turns, userMsgs: w.userMsgs, lastActivity: w.last,
                     periodSec: w.last.timeIntervalSince(w.first), windowed: true))
-            } else {
-                rows.append(MetricRow(
-                    e: e, cost: e.costUSD, input: e.inputTokens, cacheRead: e.cacheReadTokens,
-                    added: e.linesAdded, removed: e.linesRemoved,
-                    turns: e.turns, userMsgs: e.userMessageCount, lastActivity: e.lastActivity,
-                    periodSec: e.startedAt.map { e.lastActivity.timeIntervalSince($0) }, windowed: false))
+            } else if !e.provider.supportsWindowedStats, e.lastActivity >= since,
+                      !e.cwd.isEmpty {
+                // The cwd test drops a stub whose deep scan has not run yet:
+                // it has no project and zeroed totals, and its freshness makes
+                // it pass the activity test every time.
+                // Active inside the interval, but only its whole life can be
+                // quoted. Dropping it made every report understate the fleet
+                // silently; adding lifetime cost to interval totals would
+                // overstate them instead. So: listed, flagged, not summed.
+                rows.append(lifetimeRow)
+                lifetimeOnly += 1
             }
         }
 
         let scope = since != nil ? "work in the selected interval" : "all-time totals"
-        var lines = ["# Session catalog (\(rows.count) sessions · \(scope))", ""]
+        // Two counts, never one: `rows` holds both kinds, and a single number
+        // next to "work in the selected interval" would be a third figure that
+        // matches neither section below.
+        let heading = lifetimeOnly > 0
+            ? "# Session catalog (\(rows.count - lifetimeOnly) sessions · \(scope)"
+                + " · plus \(lifetimeOnly) with lifetime totals only)"
+            : "# Session catalog (\(rows.count) sessions · \(scope))"
+        var lines = [heading, ""]
+        if lifetimeOnly > 0 {
+            lines.append("Note: \(lifetimeOnly) of these sessions carry lifetime totals rather "
+                + "than interval work — their provider records no per-request timestamps. "
+                + "They appear under Sessions marked `span`, and are left out of Project "
+                + "totals so those stay interval-only. Do not add the two together.")
+            lines.append("")
+        }
 
         struct ProjectAgg {
             var sessions = 0
@@ -294,7 +321,8 @@ nonisolated enum TranscriptExtractor {
             var idleSec = 0.0
         }
         var byProject: [String: ProjectAgg] = [:]
-        for r in rows {
+        // An interval report sums only rows actually folded over the interval.
+        for r in rows where since == nil || r.windowed {
             var agg = byProject[r.e.relativePath] ?? ProjectAgg()
             agg.sessions += 1
             agg.cost += r.cost
@@ -325,6 +353,10 @@ nonisolated enum TranscriptExtractor {
             if let p = r.periodSec {
                 line += r.windowed ? " · active \(duration(p))" : " · span \(duration(p))"
             }
+            // Unconditional, unlike the span above, which is missing whenever
+            // startedAt is unknown: inside an interval catalog a lifetime row
+            // must never be able to read as an interval one.
+            if since != nil, !r.windowed { line += " · lifetime totals" }
             if let wait = waits[e.sessionId], wait >= 60 {
                 line += " · perm-wait \(duration(wait))"
             }
@@ -336,7 +368,9 @@ nonisolated enum TranscriptExtractor {
             let ratio = r.input > 0 ? r.cacheRead / r.input : 0
             if ratio >= 100 { line += " · cache-read \(ratio)x" }
             if let eff = e.effort, !eff.isEmpty { line += " · effort=\(eff)" }
-            if let t = e.toolSummary, !t.isEmpty { line += " · tools: \(t)" }
+            if let t = SessionIndexer.toolActivity(for: e), !t.isEmpty {
+                line += " · tools: \(t)"
+            }
             if let raw = SessionIndexer.transcriptURL(for: e) {
                 line += " · raw: \(raw.path)"
             }
@@ -360,8 +394,8 @@ nonisolated enum TranscriptExtractor {
     }
 
     static func windowedStats(for entry: SessionIndexEntry, since: Date) -> WindowStats? {
-        guard let url = SessionIndexer.transcriptURL(for: entry),
-              url.path.contains("/.claude/projects/") else { return nil }
+        guard entry.provider.supportsWindowedStats,
+              let url = SessionIndexer.transcriptURL(for: entry) else { return nil }
         struct Rec: Decodable {
             let type: String?; let timestamp: String?; let requestId: String?
             let message: Msg?; let toolUseResult: TUR?

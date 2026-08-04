@@ -9,7 +9,7 @@ import SQLite3
 // file via a per-session byte cursor (mirrors the token indexer's model).
 //
 // Two connections so search stays instant during the one-time cold build:
-//  • writeDB on indexQueue folds transcript bytes,
+//  • writeDB on the scan queue folds transcript bytes,
 //  • readDB on queryQueue answers MATCH against the WAL snapshot concurrently.
 // Session metadata (title / folder / time) is NOT stored here — the UI joins it
 // from the live SessionIndexer.entries by session id, so it's always fresh.
@@ -50,16 +50,16 @@ final class SearchIndex {
 
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    private let indexQueue = DispatchQueue(label: "episcope.search.index", qos: .utility)
+    // The FTS backfill shares the scan queue — see WorkScheduler.scanQueue.
     private let queryQueue = DispatchQueue(label: "episcope.search.query", qos: .userInitiated)
 
-    private var writeDB: OpaquePointer?   // indexQueue only
+    private var writeDB: OpaquePointer?   // scan queue only
     private var readDB: OpaquePointer?    // queryQueue only
 
-    // sessionId -> (observed file size, parse cursor, next seq). indexQueue only.
+    // sessionId -> (observed file size, parse cursor, next seq). scan queue only.
     private var cursors: [String: (size: Int64, offset: Int64, seq: Int64)] = [:]
     // sessionId -> resolved transcript URL (Codex/Desktop need a tree walk to
-    // locate — cache it so reconcile doesn't re-scan every tick). indexQueue only.
+    // locate — cache it so reconcile doesn't re-scan every tick). scan queue only.
     private var urlCache: [String: URL] = [:]
     // Coalescing: while a (possibly long) pass runs, newer reconciles just stash
     // the latest snapshot here; the running pass picks it up when it finishes.
@@ -76,8 +76,17 @@ final class SearchIndex {
     // MARK: - Lifecycle
 
     func open() {
-        indexQueue.async { [weak self] in self?.openWrite() }
-        queryQueue.async { [weak self] in self?.openRead() }
+        // Ordered, not parallel: only openWrite carries SQLITE_OPEN_CREATE, so
+        // on a fresh install openRead used to lose the race against the file
+        // existing at all. It has no retry, so readDB stayed nil for the life
+        // of the process and deep search returned nothing, silently — and the
+        // next launch found the file and worked, which is why it never
+        // reproduced for anyone who restarted the app.
+        WorkScheduler.shared.run(.init(id: "search-open", deferrable: false)) { [weak self] in
+            guard let self else { return }
+            self.openWrite()
+            self.queryQueue.async { [weak self] in self?.openRead() }
+        }
     }
 
     private func openWrite() {
@@ -150,7 +159,9 @@ final class SearchIndex {
         let work = entries.map {
             WorkItem(id: $0.sessionId, provider: $0.provider, cwd: $0.cwd, size: $0.fileSize)
         }
-        indexQueue.async { [weak self] in
+        // Deferred: the backfill is the heaviest thing at launch and nobody can
+        // search before the window is even open, so it waits for the index.
+        WorkScheduler.shared.run(.init(id: "search-reconcile")) { [weak self] in
             guard let self else { return }
             self.latestWork = work
             guard !self.scheduled else { return }
@@ -165,6 +176,7 @@ final class SearchIndex {
 
     private func runReconcile(_ work: [WorkItem]) {
         guard let db = writeDB else { return }
+        pruneVanished(db, live: Set(work.map(\.id)))
         // New sessions, or files whose size changed since last fold.
         let todo = work.filter { item in
             guard let c = cursors[item.id] else { return item.size > 0 }
@@ -234,6 +246,36 @@ final class SearchIndex {
             provider: item.provider, sessionId: item.id, cwd: item.cwd) else { return nil }
         urlCache[item.id] = u
         return u
+    }
+
+    // The index holds the full text of every message of every session, so it is
+    // roughly a second copy of ~/.claude/projects — and until now nothing ever
+    // removed a row: deleteSession only fires when a file shrinks, so a session
+    // the user deleted (or a project directory that was removed) kept its text
+    // here forever and the database only ever grew. Dropping rows for sessions
+    // that are no longer in the index is self-healing if it ever fires too
+    // eagerly, since a session with no cursor is simply treated as new.
+    private func pruneVanished(_ db: OpaquePointer, live: Set<String>) {
+        guard !live.isEmpty else { return }   // nothing scanned yet — not "all gone"
+        let gone = cursors.keys.filter { !live.contains($0) }
+        guard !gone.isEmpty else { return }
+        exec(db, "BEGIN;")
+        for id in gone {
+            deleteSession(db, id)
+            deleteCursor(db, id)
+            cursors[id] = nil
+        }
+        exec(db, "COMMIT;")
+    }
+
+    private func deleteCursor(_ db: OpaquePointer, _ id: String) {
+        var s: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM cursor WHERE session_id=?;", -1, &s, nil)
+                == SQLITE_OK
+        else { return }
+        defer { sqlite3_finalize(s) }
+        sqlite3_bind_text(s, 1, id, -1, Self.transient)
+        sqlite3_step(s)
     }
 
     private func deleteSession(_ db: OpaquePointer, _ id: String) {
