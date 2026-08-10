@@ -40,6 +40,7 @@ nonisolated enum TranscriptExtractor {
             "## Stats (from EpiScope index)",
         ]
         var head = "project: \(entry.relativePath)"
+        if entry.isExternalSource { head += " · source: \(entry.sourceName)" }
         if let b = entry.lastGitBranch, !b.isEmpty { head += " · branch: \(b)" }
         if let m = entry.model { head += " · model: \(m)" }
         if let e = entry.effort { head += " (\(e))" }
@@ -346,6 +347,7 @@ nonisolated enum TranscriptExtractor {
             let e = r.e
             var line = "- \(e.sessionId) · \(day.string(from: r.lastActivity))"
                 + " · \(e.displayTitle) · \(e.relativePath)"
+            if e.isExternalSource { line += " · source \(e.sourceName)" }
             if let m = e.model { line += " · \(m)" }
             line += String(format: " · $%.2f · %d turns · %d user msgs",
                            r.cost, r.turns, r.userMsgs)

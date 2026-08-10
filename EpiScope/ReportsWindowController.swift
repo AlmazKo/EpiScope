@@ -39,6 +39,10 @@ final class ReportsWindowController: NSWindowController {
     private var runStartedAt: Date?
     private var elapsedTimer: Timer?
 
+    // Set by MainWindowController. Insights owns rendering, while the main
+    // window owns the canonical table-row opening behaviour and host routing.
+    var onOpenSession: ((String) -> Void)?
+
     private let tableView = NSTableView()
     private let textView = ReportTextView.make()
     private let cancelButton = NSButton(title: "Cancel analysis", target: nil, action: nil)
@@ -101,6 +105,7 @@ final class ReportsWindowController: NSWindowController {
 
         textView.isEditable = false
         textView.isSelectable = true
+        textView.delegate = self
         textView.textContainerInset = NSSize(width: 16, height: 18)
         textView.autoresizingMask = [.width]
         let textScroll = NSScrollView()
@@ -393,8 +398,12 @@ final class ReportsWindowController: NSWindowController {
 
     private func launch(_ config: AnalysisJobConfig, prompt: String,
                         addDirs: [URL], workDir: URL, maxTurns: Int) {
+        // config.model carries the menu id (which is also the pricing key); the
+        // CLI is asked for that engine's own name for the same model.
+        let choice = AnalysisModelChoice.named(config.model)
         var request = AnalysisRequest(prompt: prompt, addDirs: addDirs,
-                                      model: config.model, workDir: workDir)
+                                      engine: choice.engine,
+                                      model: choice.cliModel, workDir: workDir)
         request.maxTurns = maxTurns
         runner.run(request) { [weak self] result in
             self?.runFinished(config, result: result)
@@ -403,8 +412,10 @@ final class ReportsWindowController: NSWindowController {
 
     private func failPreparation(_ message: String, config: AnalysisJobConfig) {
         clearRunningState()
+        var report = makeReport(config, status: .failed)
+        report.errorSummary = message
+        insertSaved(store.save(report, markdown: ""))
         tableView.reloadData()
-        presentError(title: "Analysis not started", message: message)
     }
 
     private func runFinished(_ config: AnalysisJobConfig,
@@ -424,14 +435,18 @@ final class ReportsWindowController: NSWindowController {
             var report = makeReport(config, status: .cancelled)
             report.errorSummary = "Cancelled."
             insertSaved(store.save(report, markdown: ""))
-        case .failure(.cliNotFound):
+        case .failure(.cliNotFound(let engine)):
             tableView.reloadData()
-            presentCLINotFound()
+            presentCLINotFound(engine)
         case .failure(let error):
+            // No alert: the failure is already a row in the list with the
+            // message in its body, and most runs are the daily/weekly ones
+            // nobody asked for right now — a modal over whatever the operator
+            // is doing is the wrong way to report them. The CLI-missing case
+            // above keeps its dialog because it offers a fix.
             var report = makeReport(config, status: .failed)
             report.errorSummary = error.userMessage
             insertSaved(store.save(report, markdown: ""))
-            presentError(title: "Analysis failed", message: error.userMessage)
         }
     }
 
@@ -516,41 +531,33 @@ final class ReportsWindowController: NSWindowController {
 
     // MARK: - Alerts
 
-    private func presentError(title: String, message: String) {
+    // Recovery path for a missing CLI: pick the binary by hand — saved to that
+    // engine's own path default, which its locate() checks first. Which CLI is
+    // missing depends on the chosen model, so the alert names it rather than
+    // assuming Claude.
+    private func presentCLINotFound(_ engine: AnalysisEngine) {
         guard let window else { return }
         let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.beginSheetModal(for: window)
-    }
-
-    // Recovery path for a missing CLI: pick the binary by hand — saved to
-    // the claudeCLIPath default that ClaudeCLI.locate() checks first.
-    private func presentCLINotFound() {
-        guard let window else { return }
-        let alert = NSAlert()
-        alert.messageText = "claude CLI not found"
-        alert.informativeText = "EpiScope runs analyses through the claude CLI "
-            + "(headless), which wasn't found in the usual install locations. "
-            + "Install Claude Code, or point EpiScope at the binary."
+        alert.messageText = "\(engine.cliName) CLI not found"
+        alert.informativeText = engine.cliMissingMessage
         alert.addButton(withTitle: "Choose Binary…")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn else { return }
-            DispatchQueue.main.async { self?.pickCLIBinary() }
+            DispatchQueue.main.async { self?.pickCLIBinary(engine) }
         }
     }
 
-    private func pickCLIBinary() {
+    private func pickCLIBinary(_ engine: AnalysisEngine) {
         guard let window else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
-        panel.message = "Select the claude CLI binary"
+        panel.message = "Select the \(engine.cliName) CLI binary"
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
-            UserDefaults.standard.set(url.path, forKey: "claudeCLIPath")
+            UserDefaults.standard.set(url.path, forKey: engine.cliPathDefaultsKey)
         }
     }
 
@@ -599,9 +606,11 @@ final class ReportsWindowController: NSWindowController {
             let body = NSMutableParagraphStyle()
             body.lineSpacing = 4
             body.paragraphSpacing = 8
-            out.append(MarkdownRenderer.render(markdown, baseFont: .systemFont(ofSize: 14),
-                                               paragraphStyle: body,
-                                               codeBackground: .quaternaryLabelColor))
+            let rendered = NSMutableAttributedString(attributedString: MarkdownRenderer.render(
+                markdown, baseFont: .systemFont(ofSize: 14),
+                paragraphStyle: body, codeBackground: .quaternaryLabelColor))
+            linkSessionReferences(in: rendered, report: report)
+            out.append(rendered)
         case .failed:
             out.append(NSAttributedString(
                 string: report.errorSummary ?? "Failed.",
@@ -615,6 +624,52 @@ final class ReportsWindowController: NSWindowController {
         }
         textView.textStorage?.setAttributedString(out)
         textView.scroll(.zero)
+    }
+
+    // Reports are model output, so MarkdownRenderer intentionally refuses all
+    // custom URL schemes. Add internal session links only after rendering and
+    // only for ids that both belong to this report's saved scope and still
+    // exist in the index. The model cannot choose the link destination.
+    private func linkSessionReferences(
+        in text: NSMutableAttributedString,
+        report: AnalysisReport
+    ) {
+        let available = Set(indexer.entries.map(\.sessionId))
+        var owners: [String: Set<String>] = [:]
+
+        for sid in report.scopeSessionIds where available.contains(sid) {
+            var tokens = [sid, String(sid.prefix(8))]
+            // Cowork/local-agent ids start with `local_`; reports may shorten
+            // either the full storage id or its UUID portion.
+            if sid.hasPrefix("local_") {
+                let uuid = String(sid.dropFirst("local_".count))
+                tokens.append(String(uuid.prefix(8)))
+                tokens.append("local_" + String(uuid.prefix(8)))
+            }
+            for token in tokens where token.count >= 8 {
+                owners[token.lowercased(), default: []].insert(sid)
+            }
+        }
+
+        let whole = NSRange(location: 0, length: text.length)
+        for (token, ids) in owners where ids.count == 1 {
+            guard let sid = ids.first,
+                  let target = URL(string: "episcope-session://open/\(sid)") else { continue }
+            // Session references are standalone tokens. This keeps the short
+            // form from matching the beginning of a full UUID.
+            let escaped = NSRegularExpression.escapedPattern(for: token)
+            guard let regex = try? NSRegularExpression(
+                pattern: "(?<![A-Za-z0-9_-])\(escaped)(?![A-Za-z0-9_-])",
+                options: [.caseInsensitive]) else { continue }
+            for match in regex.matches(in: text.string, range: whole) {
+                text.addAttributes([
+                    .link: target,
+                    .foregroundColor: NSColor.linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .toolTip: "Open session",
+                ], range: match.range)
+            }
+        }
     }
 
     private static let dateFormatter: DateFormatter = {
@@ -698,6 +753,25 @@ extension ReportsWindowController: NSMenuItemValidation {
     }
 }
 
+// Internal report links never reach NSWorkspace. Ordinary web links still use
+// NSTextView's default handling; MarkdownRenderer has already rejected every
+// non-web target supplied by model output.
+extension ReportsWindowController: NSTextViewDelegate {
+    func textView(
+        _ textView: NSTextView,
+        clickedOnLink link: Any,
+        at charIndex: Int
+    ) -> Bool {
+        guard let url = link as? URL,
+              url.scheme?.lowercased() == "episcope-session" else { return false }
+        guard url.host == "open",
+              let sid = url.pathComponents.last,
+              SessionID.isValid(sid) else { return true }
+        onOpenSession?(sid)
+        return true
+    }
+}
+
 // MARK: - Table
 
 extension ReportsWindowController: NSTableViewDataSource, NSTableViewDelegate {
@@ -730,6 +804,9 @@ extension ReportsWindowController: NSTableViewDataSource, NSTableViewDelegate {
             ])
         }
         let field = cell.textField!
+        field.font = (colId == "cost" || colId == "date")
+            ? .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            : .systemFont(ofSize: 12)
         field.textColor = .labelColor
         field.alignment = colId == "cost" ? .right : .natural
 

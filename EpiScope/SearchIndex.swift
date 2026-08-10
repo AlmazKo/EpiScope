@@ -66,7 +66,14 @@ final class SearchIndex {
     private var latestWork: [WorkItem]?
     private var scheduled = false
 
-    private struct WorkItem { let id: String; let provider: SessionProvider; let cwd: String; let size: Int64 }
+    private struct WorkItem {
+        let id: String
+        let provider: SessionProvider
+        let cwd: String
+        let size: Int64
+        let transcriptPath: String?
+        let external: Bool
+    }
 
     // Progress for the UI. Called on main; set before open(). done==total==0 idle.
     var onProgress: ((_ done: Int, _ total: Int) -> Void)?
@@ -156,8 +163,13 @@ final class SearchIndex {
     // MARK: - Reconcile (called from main when entries change)
 
     func reconcile(entries: [SessionIndexEntry]) {
+        // Staged sessions must never reach the real full-text database — it
+        // outlives demo mode, and a fake row in it is a permanent lie.
+        if DemoFleet.isEnabled { return }
         let work = entries.map {
-            WorkItem(id: $0.sessionId, provider: $0.provider, cwd: $0.cwd, size: $0.fileSize)
+            WorkItem(id: $0.sessionId, provider: $0.provider, cwd: $0.cwd,
+                     size: $0.fileSize, transcriptPath: $0.transcriptPath,
+                     external: $0.isExternalSource)
         }
         // Deferred: the backfill is the heaviest thing at launch and nobody can
         // search before the window is even open, so it waits for the index.
@@ -243,7 +255,8 @@ final class SearchIndex {
     private func resolveURL(_ item: WorkItem) -> URL? {
         if let u = urlCache[item.id] { return u }
         guard let u = SessionIndexer.transcriptURL(
-            provider: item.provider, sessionId: item.id, cwd: item.cwd) else { return nil }
+            provider: item.provider, sessionId: item.id, cwd: item.cwd,
+            transcriptPath: item.transcriptPath, external: item.external) else { return nil }
         urlCache[item.id] = u
         return u
     }
@@ -315,6 +328,11 @@ final class SearchIndex {
     // MARK: - Query
 
     func search(_ raw: String, completion: @escaping ([MessageHit]) -> Void) {
+        if DemoFleet.isEnabled {
+            let hits = DemoFleet.search(raw)
+            DispatchQueue.main.async { completion(hits) }
+            return
+        }
         guard let match = Self.ftsQuery(from: raw) else {
             DispatchQueue.main.async { completion([]) }
             return

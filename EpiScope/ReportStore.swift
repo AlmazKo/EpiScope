@@ -64,6 +64,9 @@ final class ReportStore {
     }
 
     func list() -> [AnalysisReport] {
+        // Screenshot mode: staged runs, so Insights has something to show
+        // without a real analysis run having ever happened on this machine.
+        if DemoFleet.isEnabled { return DemoFleet.reports() }
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: Self.dir,
                                                       includingPropertiesForKeys: nil)
@@ -87,6 +90,7 @@ final class ReportStore {
     }
 
     func markdown(for report: AnalysisReport) -> String? {
+        if DemoFleet.isEnabled { return DemoFleet.markdown(for: report) }
         guard let url = markdownURL(for: report) else { return nil }
         return try? String(contentsOf: url, encoding: .utf8)
     }

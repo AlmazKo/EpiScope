@@ -42,8 +42,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let reportsWC: ReportsWindowController
     private enum WindowMode { case list, details, search, insights }
     private var windowMode: WindowMode = .list
-    // Where "back" returns from details: the list, or the search feed if the
-    // detail was opened by clicking a search result.
+    // Where "back" returns from details: the list, search feed or Insights,
+    // depending on where the session was opened.
     private var detailsReturnMode: WindowMode = .list
     // Claude has no per-session effort in the transcript — only the
     // global effortLevel in settings.json. Refreshed on each reindex.
@@ -58,6 +58,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let outlineView = CenteredOutlineView()
     private let chartView = TokenChartView()
     private let sessionChartView = SessionUsageChartView()
+    // Details gives the chart slot more room: the per-session view stacks the
+    // lifecycle strip under the curves, and 110pt leaves the curves squashed.
+    // Everything in that slot is pinned to chartView, so one constant moves
+    // the divider and the table with it.
+    private static let listChartHeight: CGFloat = 110
+    private static let detailsChartHeight: CGFloat = 168
+    private var chartHeight = NSLayoutConstraint()
     private let limitChartView = LimitChartView()
     // Ticks the limit gauges' reset countdown while a limit mode is on.
     private var limitTickTimer: Timer? { willSet { limitTickTimer?.invalidate() } }
@@ -78,6 +85,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // The Insights toolbar item is view-based so it can carry an unread badge:
     // a dot shown when a report was created since the user last opened Insights.
     private let insightsButton = NSButton()
+    private lazy var insightsIcon = PearlescentToolbarIconView(image: Self.toolbarSymbol(
+        "sparkles", accessibilityDescription: "Insights"))
     private let insightsBadge: NSView = {
         let dot = NSView()
         dot.wantsLayer = true
@@ -100,6 +109,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // after copying — toolbar labels are hidden in icon mode, so the
     // feedback has to live in the image.
     private var copyItems: [NSToolbarItem] = []
+    // One instance lives in the list toolbar and one in details. Their image
+    // follows the selected session's hosting application (Ghostty, IDEA, etc.)
+    // while both keep the same exact-session action.
+    private var openSessionItems: [NSToolbarItem] = []
     private var copyResetWork: DispatchWorkItem?
     // The reindex toolbar item is a view that swaps between a refresh
     // button and a spinner while the indexer is still scanning.
@@ -110,6 +123,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let transcriptView = NSTextView(usingTextLayoutManager: true)
     private let transcriptScroll = NSScrollView()
     private let divider = NSBox()
+    // Shown over the table when it has no rows. An overlay rather than a row,
+    // so an empty table costs no layout and the header stays put.
+    private let emptyLabel = NSTextField(labelWithString: "")
+    // Undoes every narrowing at once. Also an overlay, and only on screen while
+    // there is something to undo — the table's normal state gains nothing.
+    private let clearFiltersButton = NSButton(title: "", target: nil, action: nil)
     private var outsideClickMonitor: Any?
     // Non-nil while the window is in transcript-detail mode for that
     // session. setMode() flips view visibility based on this.
@@ -119,6 +138,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // from the reports window).
     // Insights is a fleet-level mode embedded in this window (à la deep search),
     // never tied to a selected session — see enterInsights().
+
+    // Time range brushed on the fleet chart, if any. It narrows the table to
+    // the sessions that billed tokens in that window — deliberately not
+    // persisted: it is a question you ask of the chart in front of you, and a
+    // filter that outlived a relaunch would look like a missing session list.
+    private var chartSelection: TokenChartView.Selection?
 
     private static let groupByDirKey = "groupByDirectory"
     private var groupByDir: Bool {
@@ -230,6 +255,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         super.init(window: window)
         window.delegate = self
         setupUI()
+        reportsWC.onOpenSession = { [weak self] sessionId in
+            self?.openSessionLikeTableRow(sessionId: sessionId)
+        }
 
         indexer.onUpdate = { [weak self] in self?.refreshFromIndex() }
         indexer.onProgress = { [weak self] in self?.refreshStatusLabel() }
@@ -260,6 +288,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             self,
             selector: #selector(refreshInsightsRunPulse),
             name: .insightsRunStateChanged,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(sessionSourcesChanged),
+            name: .sessionSourcesChanged,
             object: nil
         )
         // Seed "last seen" on first run so pre-existing reports don't badge;
@@ -347,7 +381,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private func computeChartIfNeeded() {
         guard !chartComputed else { return }
         chartComputed = true
-        TokenChartView.computeBuckets { [weak self] buckets, windowEnd in
+        TokenChartView.computeBuckets(
+            externalEntries: indexer.entries.filter(\.isExternalSource)
+        ) { [weak self] buckets, windowEnd in
             self?.chartView.setBuckets(buckets, windowEnd: windowEnd)
         }
         // Overlay the rate-limit window starts (5h + weekly) as markers.
@@ -375,6 +411,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             chartView.isHidden = false
             computeChartIfNeeded()
         } else {
+            // The brush lives on the token chart. Leaving it filtering the
+            // table from behind the Limits gauges would read as sessions
+            // having gone missing.
+            chartView.clearSelection()
             chartView.isHidden = true
             limitChartView.isHidden = false
             limitChartView.loading = true
@@ -454,6 +494,44 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         chartModeControl.target = self
         chartModeControl.action = #selector(chartModeChanged)
 
+        chartView.onSelectionChange = { [weak self] selection in
+            guard let self else { return }
+            self.chartSelection = selection
+            self.applyFilter(forceReorder: true)
+            self.refreshStatusLabel()
+        }
+        // A click on the chart means "show me everything again", so it drops the
+        // row selection along with the range. The chart is the one place both
+        // narrowings are visible at once — the brushed span and the highlighted
+        // segment — which makes it the honest place to undo them, and it costs
+        // no button. Esc and a click below the last row still do it too.
+        chartView.onBackgroundClick = { [weak self] in
+            self?.outlineView.deselectAll(nil)
+        }
+        // Names for the chart's series. Grouped by directory the key already is
+        // a cwd; otherwise it is a session id, which only the index can turn
+        // into something a person recognises.
+        chartView.seriesLabel = { [weak self] key in
+            guard let self else { return key }
+            if let entry = allEntries.first(where: { $0.sessionId == key }) {
+                let title = entry.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !title.isEmpty else { return entry.folderName }
+                // Only the AI-written title is clipped. The project is what
+                // identifies the row, and it is short — spending the budget on
+                // a sentence would leave the name it belongs to cut off.
+                let limit = 30
+                let clipped = title.count <= limit
+                    ? title
+                    : String(title.prefix(limit - 1))
+                        .trimmingCharacters(in: .whitespaces) + "…"
+                return "\(entry.folderName) · \(clipped)"
+            }
+            // A cwd (grouping mode) or a session the index has since dropped.
+            return key.hasPrefix("/")
+                ? URL(fileURLWithPath: key).lastPathComponent
+                : key
+        }
+
         for (item, placeholder) in [
             (listSearchItem, "Filter by title, project or session id"),
             (detailsSearchItem, "Search in transcript"),
@@ -513,17 +591,43 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         transcriptView.textContainerInset = NSSize(width: 20, height: 14)
         transcriptView.autoresizingMask = [.width]
         transcriptView.textContainer?.widthTracksTextView = true
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyLabel.alignment = .center
+        emptyLabel.font = .systemFont(ofSize: 13)
+        emptyLabel.textColor = .secondaryLabelColor
+        // Two of the messages carry a second line telling the operator how to
+        // get the rows back; a label is single-line until told otherwise.
+        emptyLabel.usesSingleLineMode = false
+        emptyLabel.maximumNumberOfLines = 0
+        emptyLabel.lineBreakMode = .byWordWrapping
+        emptyLabel.isHidden = true
+        content.addSubview(emptyLabel)
+
+        clearFiltersButton.translatesAutoresizingMaskIntoConstraints = false
+        clearFiltersButton.bezelStyle = .rounded
+        clearFiltersButton.controlSize = .small
+        clearFiltersButton.font = .systemFont(ofSize: 11)
+        clearFiltersButton.target = self
+        clearFiltersButton.action = #selector(clearAllFilters)
+        clearFiltersButton.isHidden = true
+        content.addSubview(clearFiltersButton)
+
         content.addSubview(transcriptScroll)
 
         configureOutline()
         restoreColumnVisibility()
         scroll.documentView = outlineView
+        // Right-click the header to pick columns. The header is where a user
+        // looks for this first; Settings → Columns stays as the discoverable
+        // path and both drive the same toggle, so their ticks cannot disagree.
+        outlineView.headerView?.menu = columnsMenu
 
+        chartHeight = chartView.heightAnchor.constraint(equalToConstant: Self.listChartHeight)
         NSLayoutConstraint.activate([
             chartView.topAnchor.constraint(equalTo: content.topAnchor),
             chartView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             chartView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            chartView.heightAnchor.constraint(equalToConstant: 110),
+            chartHeight,
 
             sessionChartView.topAnchor.constraint(equalTo: chartView.topAnchor),
             sessionChartView.leadingAnchor.constraint(equalTo: chartView.leadingAnchor),
@@ -543,6 +647,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+
+            // Centred on the rows area, below the header the table keeps drawing.
+            emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            emptyLabel.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 96),
+            emptyLabel.leadingAnchor.constraint(greaterThanOrEqualTo: scroll.leadingAnchor, constant: 24),
+            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: scroll.trailingAnchor, constant: -24),
+
+            // Bottom centre: the columns that carry text sit left and right of
+            // it, so a pill here covers the least. Floating over the rows
+            // rather than above them keeps the table's geometry fixed whether
+            // a filter is on or off.
+            clearFiltersButton.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            clearFiltersButton.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -16),
 
             transcriptScroll.topAnchor.constraint(equalTo: scroll.topAnchor),
             transcriptScroll.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
@@ -808,7 +925,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
     private func applyFilter(forceReorder: Bool = false) {
         let term = searchTerm.lowercased()
+        let brushed = chartSelection?.sessionIds
         filteredEntries = allEntries.filter { e in
+            if let brushed, !brushed.contains(e.sessionId) { return false }
             if term.isEmpty { return true }
             return e.relativePath.lowercased().contains(term)
                 || (e.title?.lowercased().contains(term) ?? false)
@@ -842,6 +961,77 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
 
         refreshStatusLabel()
+        refreshEmptyState()
+    }
+
+    // What an empty table means, in its own words. Naming the narrowing that
+    // emptied it is the point: "no sessions" and "no sessions in the range you
+    // dragged" call for different moves, and with the rows gone the range is
+    // the only thing still on screen to undo.
+    // Narrowings the operator applied by hand, and can therefore be asked to
+    // undo. Deliberately not the Show Temporary setting: that one is not a
+    // filter someone set on this screen and expects to drop again.
+    private var hasActiveFilters: Bool {
+        chartSelection != nil
+            || !searchTerm.trimmingCharacters(in: .whitespaces).isEmpty
+            || outlineView.selectedRow >= 0
+    }
+
+    private func refreshFilterButton() {
+        clearFiltersButton.isHidden = !hasActiveFilters
+        // No count: the title bar subtitle already carries "N of M", and a
+        // number that changes under the pointer makes the button look like it
+        // does something different each time.
+        clearFiltersButton.title = "Show all"
+    }
+
+    @objc private func clearAllFilters() {
+        chartView.clearSelection()      // fires onSelectionChange, which refilters
+        chartSelection = nil
+        if !searchTerm.isEmpty {
+            listSearchItem.searchField.stringValue = ""
+            searchTerm = ""
+        }
+        outlineView.deselectAll(nil)
+        applyFilter(forceReorder: true)
+        refreshStatusLabel()
+    }
+
+    private func refreshEmptyState() {
+        refreshFilterButton()
+        guard filteredEntries.isEmpty else {
+            emptyLabel.isHidden = true
+            return
+        }
+        let term = searchTerm.trimmingCharacters(in: .whitespaces)
+        let ranged = chartSelection != nil
+        let text: String
+        switch (allEntries.isEmpty, ranged, term.isEmpty) {
+        case (true, _, _):
+            text = indexer.pendingDeepScan > 0
+                ? "Reading sessions…"
+                : "No sessions yet. Start one in Claude Code or Codex and it shows up here."
+        case (false, true, false):
+            text = "Nothing matching “\(term)” in the selected range."
+        case (false, true, true):
+            text = "No sessions ran in the selected range."
+        case (false, false, false):
+            text = "Nothing matching “\(term)”."
+        case (false, false, true):
+            // Every session is filtered out by something that is not on this
+            // screen at all, so the setting has to be named.
+            text = showTemporary
+                ? "No sessions to show."
+                : "No sessions to show. Temporary ones are hidden — Settings → Show Temporary."
+        }
+        emptyLabel.stringValue = text
+        emptyLabel.isHidden = false
+    }
+
+    @objc private func sessionSourcesChanged() {
+        refreshFromIndex()
+        updateOpenSessionToolbarItems()
+        outlineView.reloadData()
     }
 
     // True when both trees hold the same sessions and the same groups —
@@ -944,11 +1134,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // scroll to a session — used when a notification is tapped but we don't know
     // where the agent's terminal is.
     func revealSession(sessionId: String) {
-        show()
+        // Leave a fleet-level surface before bringing the window forward.
+        // Otherwise show() refreshes the title/data while still in Insights or
+        // Search and the subsequently revealed list inherits that stale mode
+        // state (most visibly the "Insights" subtitle).
         if windowMode != .list {
             windowMode = .list
             applyMode()
+            refreshStatusLabel()
         }
+        show()
         // A revealed session must be visible even under an active quick filter,
         // so clear it here (applyMode no longer wipes it on every list entry).
         if !searchTerm.isEmpty {
@@ -956,6 +1151,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             searchTerm = ""
             applyFilter()
         }
+        refreshStatusLabel()
         if selectAndScroll(sessionId: sessionId) { return }
         // No selectable row — e.g. a detached / headless session filtered out
         // of the table (hidden temporary, or a thin transcript). A notification
@@ -993,19 +1189,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Reindex toolbar item view: a refresh button with a spinner
     // stacked on top, swapped by updateLoadingIndicator().
     private func makeReindexView() -> NSView {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 30, height: 24))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 30, height: 30))
         reindexButton.frame = container.bounds
         reindexButton.autoresizingMask = [.width, .height]
         reindexButton.bezelStyle = .texturedRounded
         reindexButton.isBordered = true
-        reindexButton.image = NSImage(systemSymbolName: "arrow.clockwise",
-                                      accessibilityDescription: "Reindex sessions")
+        reindexButton.image = Self.toolbarSymbol(
+            "arrow.clockwise", accessibilityDescription: "Reindex sessions")
         reindexButton.imagePosition = .imageOnly
         reindexButton.target = self
         reindexButton.action = #selector(reindexNow)
         container.addSubview(reindexButton)
 
-        reindexSpinner.frame = NSRect(x: (30 - 16) / 2, y: (24 - 16) / 2, width: 16, height: 16)
+        reindexSpinner.frame = NSRect(x: (30 - 16) / 2, y: (30 - 16) / 2, width: 16, height: 16)
         reindexSpinner.style = .spinning
         reindexSpinner.controlSize = .small
         reindexSpinner.isDisplayedWhenStopped = false
@@ -1017,17 +1213,26 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Insights toolbar item view: a bordered button with an unread-badge dot
     // pinned to its top-right corner (mirrors makeReindexView's pattern).
     private func makeInsightsItemView() -> NSView {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 34, height: 24))
+        // Keep the custom view square. A wider frame makes the native textured
+        // hover background a pill, unlike adjacent toolbar action buttons.
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 30, height: 30))
         insightsButton.frame = container.bounds
         insightsButton.autoresizingMask = [.width, .height]
         insightsButton.bezelStyle = .texturedRounded
         insightsButton.isBordered = true
         insightsButton.imagePosition = .imageOnly
-        insightsButton.image = NSImage(systemSymbolName: "wand.and.stars",
-                                       accessibilityDescription: "Insights")
+        // The native button owns hover/press interaction; the non-interactive
+        // overlay supplies the animated pearlescent glyph.
+        insightsButton.image = nil
+        insightsButton.toolTip = "Insights"
+        insightsButton.setAccessibilityLabel("Insights")
         insightsButton.target = self
         insightsButton.action = #selector(showInsights)
         container.addSubview(insightsButton)
+
+        insightsIcon.frame = NSRect(x: 5, y: 5, width: 20, height: 20)
+        insightsIcon.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
+        container.addSubview(insightsIcon)
 
         let s: CGFloat = 8
         insightsBadge.frame = NSRect(x: container.bounds.width - s - 3,
@@ -1068,6 +1273,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             insightsPulseTimer?.invalidate()
             insightsPulseTimer = nil
             insightsButton.animator().alphaValue = 1
+            insightsIcon.animator().alphaValue = 1
             return
         }
         guard insightsPulseTimer == nil else { return }
@@ -1078,6 +1284,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.45
                     self.insightsButton.animator().alphaValue =
+                        self.insightsPulseOn ? 1 : Self.insightsPulseAlpha
+                    self.insightsIcon.animator().alphaValue =
                         self.insightsPulseOn ? 1 : Self.insightsPulseAlpha
                 }
             }
@@ -1251,10 +1459,41 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Exposed for AppDelegate so the Settings → Columns submenu can
     // build itself from whatever columns the outline view holds right
     // now. Returns rows like (identifier raw value, header title, isHidden).
+    // Rebuilt on every open (menuNeedsUpdate) rather than kept in sync: the
+    // same columns can be toggled from Settings, and a stale tick here would be
+    // a lie about what the table is showing.
+    private lazy var columnsMenu: NSMenu = {
+        let menu = NSMenu(title: "Columns")
+        menu.delegate = self
+        return menu
+    }()
+
+    private func rebuildColumnsMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for col in columnsForMenu() {
+            let item = NSMenuItem(title: col.title,
+                                  action: #selector(toggleColumnFromHeader(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = col.rawId
+            item.state = col.isHidden ? .off : .on
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func toggleColumnFromHeader(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        toggleColumn(rawIdentifier: raw)
+    }
+
     func columnsForMenu() -> [(rawId: String, title: String, isHidden: Bool)] {
         outlineView.tableColumns.compactMap { col in
             let title = col.headerCell.stringValue
             guard !title.isEmpty else { return nil }
+            // The outline column carries the disclosure triangles and the group
+            // indentation. Hiding it leaves grouped rows with no way to expand,
+            // which reads as a broken table rather than a hidden column.
+            guard col !== outlineView.outlineTableColumn else { return nil }
             return (col.identifier.rawValue, title, col.isHidden)
         }
     }
@@ -1275,6 +1514,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // hidden if the user previously hid it).
     private func restoreColumnVisibility() {
         for col in outlineView.tableColumns {
+            // The outline column is no longer offered in either menu, so a
+            // stored "hidden" from before that could never be undone.
+            guard col !== outlineView.outlineTableColumn else { continue }
             let key = Self.columnHiddenKey(col.identifier.rawValue)
             if UserDefaults.standard.object(forKey: key) != nil {
                 col.isHidden = UserDefaults.standard.bool(forKey: key)
@@ -1510,6 +1752,10 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // so highlight by the selected row's cwd (group header or child).
         chartView.highlightedSessionId = chartHighlightKey()
         updateResumeButtonVisibility()
+        // Selecting a row narrows nothing in the table, so applyFilter never
+        // runs — but the button offers to drop the selection too, so it has to
+        // learn about it here.
+        refreshFilterButton()
     }
 
     private func chartHighlightKey() -> String? {
@@ -1525,7 +1771,84 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Copy / Messages enablement depends on the selection — push the
     // toolbar through validateToolbarItem whenever it changes.
     private func updateResumeButtonVisibility() {
+        updateOpenSessionToolbarItems()
         window?.toolbar?.validateVisibleItems()
+    }
+
+    private func updateOpenSessionToolbarItems() {
+        let entry = actionSession()
+        let image = entry.flatMap(toolbarHostIcon(for:)) ?? Self.toolbarMissingHostIcon
+        for item in openSessionItems {
+            item.image = image
+        }
+    }
+
+    // Keep the empty state on the same square canvas as real application
+    // icons. A raw `terminal` symbol has rectangular intrinsic metrics, which
+    // makes the toolbar glyph appear to jump when the selection changes.
+    private static let toolbarMissingHostIcon: NSImage? = {
+        toolbarSymbol("questionmark.square",
+                      accessibilityDescription: "No session app")
+            ?? toolbarSymbol("square", accessibilityDescription: "No session app")
+    }()
+
+    private static let toolbarIconSize = NSSize(width: 20, height: 20)
+    private static let toolbarIconContentSide: CGFloat = 18
+    private static let toolbarSymbolConfiguration = NSImage.SymbolConfiguration(
+        pointSize: 16, weight: .regular)
+
+    // Every toolbar image gets the same square footprint. The source is fitted
+    // proportionally rather than stretched, so wide symbols (terminal, text
+    // search) and narrow symbols (back, trash) stay optically stable.
+    private static func squareToolbarImage(from source: NSImage) -> NSImage {
+        let sourceSize = source.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return source }
+        let side = toolbarIconContentSide
+        let scale = min(side / sourceSize.width, side / sourceSize.height)
+        let drawSize = NSSize(width: sourceSize.width * scale,
+                              height: sourceSize.height * scale)
+        let drawRect = NSRect(x: (toolbarIconSize.width - drawSize.width) / 2,
+                              y: (toolbarIconSize.height - drawSize.height) / 2,
+                              width: drawSize.width, height: drawSize.height)
+        let image = NSImage(size: toolbarIconSize, flipped: false) { _ in
+            source.draw(in: drawRect, from: .zero, operation: .sourceOver,
+                        fraction: 1, respectFlipped: true,
+                        hints: [.interpolation: NSImageInterpolation.high])
+            return true
+        }
+        image.isTemplate = source.isTemplate
+        return image
+    }
+
+    private static func toolbarSymbol(
+        _ name: String, accessibilityDescription: String
+    ) -> NSImage? {
+        guard let base = NSImage(systemSymbolName: name,
+                                 accessibilityDescription: accessibilityDescription),
+              let configured = base.withSymbolConfiguration(toolbarSymbolConfiguration)
+        else { return nil }
+        configured.isTemplate = true
+        return squareToolbarImage(from: configured)
+    }
+
+    // Use the same host resolution as the App table column, but copy the image
+    // before giving it the larger toolbar size so the 16-point cell icon cache
+    // remains untouched.
+    private func toolbarHostIcon(for entry: SessionIndexEntry) -> NSImage? {
+        let source: NSImage?
+        if entry.isExternalSource
+            && SessionSourceStore.shared.isOffline(sourceID: entry.sourceID) {
+            source = Self.offlineSourceIcon
+        } else if isDesktopSession(entry) {
+            source = Self.claudeDesktopIcon
+        } else if let term = monitor.terminalKinds[entry.sessionId] {
+            source = Self.terminalIcon(
+                for: term, bundleId: monitor.hostBundleIds[entry.sessionId])
+        } else {
+            source = nil
+        }
+        guard let source else { return nil }
+        return Self.squareToolbarImage(from: source)
     }
 
     @objc private func openMessages() {
@@ -1537,7 +1860,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // as the row double-click. cc-open resolves a terminal from cc-states.json
     // or follows Claude App's exact-session deep link.
     @objc private func openSelectedTerminal() {
-        guard let entry = actionSession() else { return }
+        guard let entry = actionSession(), !entry.isExternalSource else { return }
         openSessionHome(entry)
     }
 
@@ -1548,7 +1871,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func claudeDesktopRouteId(_ entry: SessionIndexEntry) -> String? {
-        guard isDesktopSession(entry) else { return nil }
+        guard !entry.isExternalSource, isDesktopSession(entry) else { return nil }
         // local_<uuid> is only EpiScope/Claude's storage key and is not a
         // routable bridge id. Wait for deepScan to publish cliSessionId rather
         // than knowingly opening Claude's session list during the short stub
@@ -1710,7 +2033,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             // before each branch decides whether to override them.
             view.contentTintColor = nil
             view.toolTip = nil
-            if isNonInteractive(entry) {
+            if entry.isExternalSource
+                && SessionSourceStore.shared.isOffline(sourceID: entry.sourceID) {
+                view.image = Self.offlineSourceIcon
+                view.toolTip = "Cached session · source unavailable"
+            } else if isNonInteractive(entry) {
                 // Launched with -p / driven over the SDK (entrypoint "sdk-cli"):
                 // never had an interactive terminal. A "-p" badge in place of a
                 // terminal icon, for live and past runs alike.
@@ -1751,9 +2078,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let badge = (outlineView.makeView(withIdentifier: viewId, owner: self) as? StatusBadgeView)
                 ?? StatusBadgeView(identifier: viewId)
             let trackerState = monitor.kittyStates[entry.sessionId]
-            if trackerState == "error" {
-                // Failed turns remain inspectable, but are deliberately not an
-                // attention state: neutral badge, no pearlescence/highlight.
+            if trackerState == "error" || trackerState == "error_attended" {
+                // Attention is carried by the menu-bar alarm; the table keeps
+                // the Error badge itself neutral before and after acknowledgment.
                 badge.configure(text: "Error",
                                 color: .labelColor,
                                 background: nil)
@@ -1958,13 +2285,36 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return i
     }()
 
+    // Cached sessions remain usable when an external source disappears. Keep
+    // their replacement App icon on the exact same square canvas as real app
+    // icons so rows do not jump when the mount reconnects.
+    private static let offlineSourceIcon: NSImage? = {
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(hierarchicalColor: .secondaryLabelColor))
+        guard let base = NSImage(
+            systemSymbolName: "externaldrive.badge.xmark",
+            accessibilityDescription: "Cached session — source unavailable")?
+            .withSymbolConfiguration(symbolConfig) else { return nil }
+        let size = NSSize(width: 16, height: 16)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.quaternaryLabelColor.withAlphaComponent(0.16).setFill()
+            NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                         xRadius: 3.5, yRadius: 3.5).fill()
+            base.draw(in: rect.insetBy(dx: 2, dy: 2))
+            return true
+        }
+        image.size = size
+        return image
+    }()
+
     // A detached session is worth flagging only once it actually needs the
-    // user — parked on a permission prompt (waiting / needs_permission) or
-    // finished (done). A session whose terminal the tracker simply hasn't
-    // located yet is busy/thinking, so it never trips this.
+    // user — parked on a permission prompt (waiting / needs_permission),
+    // finished (done), or failed (error). A session whose terminal the tracker
+    // simply hasn't located yet is busy/thinking, so it never trips this.
     private static func needsAttention(session: SessionInfo?, trackerState: String?) -> Bool {
         if session?.isWaiting == true { return true }
         return trackerState == "needs_permission" || trackerState == "done"
+            || trackerState == "error"
     }
 
     // "-p" — the terminal-column badge for a non-interactive session. Drawn to
@@ -2219,6 +2569,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        // Two menus share this delegate; the row one's logic reads the clicked
+        // session, which a header click does not have.
+        if menu === columnsMenu {
+            rebuildColumnsMenu(menu)
+            return
+        }
         // Copy Resume Command and Delete apply to any CLI-owned Claude / Codex
         // session (not the app-managed Claude desktop store).
         let cli = clickedSession().map(isCliSession) ?? false
@@ -2231,7 +2587,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // whose transcript it owns (so can move to the Trash). Excludes the
     // app-managed Claude desktop store.
     private func isCliSession(_ entry: SessionIndexEntry) -> Bool {
-        (entry.provider == .claude || entry.provider == .codex) && !isDesktopSession(entry)
+        !entry.isExternalSource
+            && (entry.provider == .claude || entry.provider == .codex)
+            && !isDesktopSession(entry)
     }
 
     // `cd '<cwd>' && claude --resume <id>` (codex: `codex resume <id>`),
@@ -2345,13 +2703,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         pb.setString(entry.sessionId, forType: .string)
         copyResetWork?.cancel()
         for item in copyItems {
-            item.image = NSImage(systemSymbolName: "checkmark",
-                                 accessibilityDescription: "Copied")
+            item.image = Self.toolbarSymbol("checkmark", accessibilityDescription: "Copied")
         }
         let work = DispatchWorkItem { [weak self] in
             for item in self?.copyItems ?? [] {
-                item.image = NSImage(systemSymbolName: "doc.on.doc",
-                                     accessibilityDescription: "Copy session ID")
+                item.image = Self.toolbarSymbol(
+                    "doc.on.doc", accessibilityDescription: "Copy session ID")
             }
         }
         copyResetWork = work
@@ -2359,7 +2716,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     // Back button — context-aware: details returns to wherever it was opened
-    // from (the list, or the search feed); search returns to the list.
+    // from (the list, search feed or Insights); fleet modes return to the list.
     @objc private func goBack() {
         switch windowMode {
         case .details:
@@ -2369,8 +2726,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             // Restores the "EpiScope" title + count subtitle (detailEntry nil).
             refreshStatusLabel()
             transcriptView.textStorage?.setAttributedString(NSAttributedString())
-            // Don't keep the full transcript event array alive after leaving.
-            sessionChartView.events = []
+            // Don't keep the session's parsed timeline alive after leaving.
+            sessionChartView.timeline = SessionTimeline()
             if windowMode == .search { focusDeepSearch() }
         case .search:
             windowMode = .list
@@ -2407,7 +2764,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func enterDetailsMode(for entry: SessionIndexEntry, highlight: String? = nil, scrollTo: String? = nil) {
-        detailsReturnMode = windowMode == .search ? .search : .list
+        detailsReturnMode = (windowMode == .search || windowMode == .insights)
+            ? windowMode : .list
         detailEntry = entry
         // Title bar keeps the directory; the session title goes in the
         // subtitle below it (mirrors the list-mode title/subtitle split).
@@ -2418,15 +2776,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         applyMode()
         // Async — the jsonl can be many MB; don't freeze the UI on click.
         let target = entry
+        // The recorded permission waits are main-actor state in the monitor,
+        // so read them here and hand them to the builder off-thread.
+        let waits = monitor.permissionSegments(for: entry.sessionId)
         transcriptView.textStorage?.setAttributedString(NSAttributedString(
             string: "Loading…",
             attributes: [.foregroundColor: NSColor.secondaryLabelColor]
         ))
         DispatchQueue.global(qos: .userInitiated).async {
             let (events, truncated) = SessionIndexer.loadTranscript(for: target)
+            let timeline = SessionTimeline.build(for: target, permissionWaits: waits)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.detailEntry?.sessionId == target.sessionId else { return }
-                self.sessionChartView.events = events
+                self.sessionChartView.timeline = timeline
                 let (attr, ranges) = Self.compactTranscript(events, truncated: truncated)
                 self.transcriptView.textStorage?.setAttributedString(attr)
                 self.focusTranscript(events: events, ranges: ranges,
@@ -2521,6 +2883,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             : isInsights ? insightsToolbar
             : listToolbar
         updateResumeButtonVisibility()
+        chartHeight.constant = isDetails ? Self.detailsChartHeight : Self.listChartHeight
 
         // The transcript-scoped field only matters in details (re-seeded there
         // when a search result is opened). The list's quick filter is kept
@@ -2533,6 +2896,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
 
         outlineView.enclosingScrollView?.isHidden = !isList
+        // The placeholder belongs to the table, so it leaves with it — it is a
+        // sibling of the scroll view, not a subview, and would otherwise hang
+        // over the transcript or the search feed.
+        if !isList {
+            emptyLabel.isHidden = true
+            clearFiltersButton.isHidden = true
+        }
         transcriptScroll.isHidden = !isDetails
         sessionChartView.isHidden = !isDetails
         divider.isHidden = isSearch || isInsights
@@ -2633,6 +3003,25 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
     @objc private func rowDoubleClicked() {
         guard let entry = clickedSession() else { return }
+        openSessionLikeTableRow(entry)
+    }
+
+    private func openSessionLikeTableRow(sessionId: String) {
+        guard let entry = indexer.entries.first(where: { $0.sessionId == sessionId }) else {
+            NSSound.beep()
+            return
+        }
+        openSessionLikeTableRow(entry)
+    }
+
+    // One user action for a table double-click and a trusted Insights link.
+    // Keeping the decision here prevents report rendering from growing its own
+    // subtly different terminal / Claude Desktop routing rules.
+    private func openSessionLikeTableRow(_ entry: SessionIndexEntry) {
+        if entry.isExternalSource {
+            enterDetailsMode(for: entry)
+            return
+        }
         // Claude App has an exact-session URL even when a historical session
         // has no live cc-states entry. Other providers still need a tracked
         // host; detached sessions drill into their transcript.
@@ -3074,6 +3463,74 @@ final class SessionColorSwatchView: NSView {
 // Pill-shaped status badge: text label on top of an optional rounded
 // background. Used in the Status column to make the waiting/busy
 // state pop without flooding the eye with bullets or colour everywhere.
+// Shared mother-of-pearl cycle. Active-session pills and the Insights glyph
+// deliberately use one palette and cadence so the colour has one meaning.
+private enum PearlescentPalette {
+    private static func color(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGColor {
+        NSColor(srgbRed: r, green: g, blue: b, alpha: 0.96).cgColor
+    }
+
+    static let a = [color(0.58, 0.18, 0.50), color(0.40, 0.20, 0.64), color(0.22, 0.30, 0.70)]
+    static let b = [color(0.40, 0.20, 0.64), color(0.22, 0.30, 0.70), color(0.12, 0.44, 0.62)]
+    static let c = [color(0.22, 0.30, 0.70), color(0.12, 0.44, 0.62), color(0.12, 0.52, 0.44)]
+
+    static func animate(_ layer: CAGradientLayer, key: String) {
+        layer.colors = a
+        let animation = CAKeyframeAnimation(keyPath: "colors")
+        animation.values = [a, b, c, a]
+        animation.duration = 4
+        animation.calculationMode = .linear
+        animation.repeatCount = .infinity
+        layer.add(animation, forKey: key)
+    }
+}
+
+// Animated gradient clipped to a square toolbar symbol. It overlays a native
+// NSButton and opts out of hit-testing, preserving the button's standard round
+// hover and pressed states.
+private final class PearlescentToolbarIconView: NSView {
+    private let gradient = CAGradientLayer()
+    private let glyphMask = CALayer()
+
+    init(image: NSImage?) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+        gradient.mask = glyphMask
+        layer?.addSublayer(gradient)
+
+        if let image {
+            var rect = NSRect(origin: .zero, size: image.size)
+            glyphMask.contents = image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        }
+        glyphMask.contentsGravity = .resizeAspect
+        updateContentsScale()
+        PearlescentPalette.animate(gradient, key: "pearl")
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+
+    override func layout() {
+        super.layout()
+        gradient.frame = bounds
+        glyphMask.frame = bounds
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateContentsScale()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func updateContentsScale() {
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        gradient.contentsScale = scale
+        glyphMask.contentsScale = scale
+    }
+}
+
 final class StatusBadgeView: NSView {
     private let label = NSTextField(labelWithString: "")
     private let pill = NSView()
@@ -3149,27 +3606,12 @@ final class StatusBadgeView: NSView {
         }
     }
 
-    // Mother-of-pearl palettes the gradient morphs between — pale, shifting
-    // hues with no directional sweep, so it reads as iridescent, not "loading".
-    private static func pearl(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGColor {
-        NSColor(srgbRed: r, green: g, blue: b, alpha: 0.96).cgColor
-    }
-    private static let pearlA = [pearl(0.58, 0.18, 0.50), pearl(0.40, 0.20, 0.64), pearl(0.22, 0.30, 0.70)]
-    private static let pearlB = [pearl(0.40, 0.20, 0.64), pearl(0.22, 0.30, 0.70), pearl(0.12, 0.44, 0.62)]
-    private static let pearlC = [pearl(0.22, 0.30, 0.70), pearl(0.12, 0.44, 0.62), pearl(0.12, 0.52, 0.44)]
-
     // Slowly cross-fades the gradient through the palettes — Core Animation, so
     // it runs on the render server with zero main-thread / relayout cost.
     private func startPearl() {
         pearl.isHidden = false
         guard pearl.animation(forKey: "pearl") == nil else { return }
-        pearl.colors = Self.pearlA
-        let a = CAKeyframeAnimation(keyPath: "colors")
-        a.values = [Self.pearlA, Self.pearlB, Self.pearlC, Self.pearlA]
-        a.duration = 4
-        a.calculationMode = .linear
-        a.repeatCount = .infinity
-        pearl.add(a, forKey: "pearl")
+        PearlescentPalette.animate(pearl, key: "pearl")
     }
 
     private func stopPearl() {
@@ -3283,7 +3725,7 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
         label: String, action: Selector
     ) -> NSToolbarItem {
         let item = NSToolbarItem(itemIdentifier: id)
-        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        item.image = Self.toolbarSymbol(symbol, accessibilityDescription: label)
         item.label = label
         item.toolTip = label
         item.target = self
@@ -3308,12 +3750,14 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
                     .analyzeSession, .deleteSession, .flexibleSpace, .search]
         }
         // Islands: reindex stands alone (data refresh), then the selection
-        // actions (copy / messages / terminal); a fixed space breaks the
+        // actions (copy / messages / host app); a fixed space breaks the
         // toolbar capsule between them. Collapse / expand ride with the
         // selection group and only appear when grouping by directory.
-        var ids: [NSToolbarItem.Identifier] = [.reindex, .space, .copySession, .messages, .openTerminal, .analyze]
+        // Insights is fleet-level, so it belongs in the trailing global-actions
+        // island with full search rather than beside session-scoped actions.
+        var ids: [NSToolbarItem.Identifier] = [.reindex, .space, .copySession, .messages, .openTerminal]
         if groupByDir { ids += [.collapseAll, .expandAll] }
-        ids += [.flexibleSpace, .chartMode, .flexibleSpace, .deepSearch, .search]
+        ids += [.flexibleSpace, .chartMode, .flexibleSpace, .analyze, .deepSearch, .search]
         return ids
     }
 
@@ -3349,8 +3793,11 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
             return actionItem(id, symbol: "bubble.left",
                               label: "Messages", action: #selector(openMessages))
         case .openTerminal:
-            return actionItem(id, symbol: "terminal",
-                              label: "Go to terminal", action: #selector(openSelectedTerminal))
+            let item = actionItem(id, symbol: "terminal",
+                                  label: "Open session app", action: #selector(openSelectedTerminal))
+            openSessionItems.append(item)
+            updateOpenSessionToolbarItems()
+            return item
         case .collapseAll:
             return actionItem(id, symbol: "arrow.down.to.line.compact",
                               label: "Collapse all", action: #selector(collapseAll))
@@ -3380,13 +3827,13 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
             refreshInsightsBadge()
             return item
         case .copyResume:
-            return actionItem(id, symbol: "doc.on.clipboard",
+            return actionItem(id, symbol: "list.clipboard",
                               label: "Copy Resume Command", action: #selector(copyResumeCommand))
         case .revealFinder:
             return actionItem(id, symbol: "folder",
                               label: "Reveal Transcript in Finder", action: #selector(revealTranscriptInFinder))
         case .analyzeSession:
-            return actionItem(id, symbol: "wand.and.stars",
+            return actionItem(id, symbol: "sparkles",
                               label: "Analyze Session", action: #selector(analyzeClickedSession))
         case .deleteSession:
             return actionItem(id, symbol: "trash",
@@ -3414,8 +3861,9 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
             // Claude App can address an indexed historical session directly;
             // other providers require a live host from cc-states.json.
             guard let s = actionSession() else { return false }
-            return claudeDesktopRouteId(s) != nil
+            return !s.isExternalSource && (claudeDesktopRouteId(s) != nil
                 || monitor.terminalKinds[s.sessionId] != nil
+            )
         default:
             return true
         }

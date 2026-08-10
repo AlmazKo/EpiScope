@@ -57,9 +57,10 @@ final class SessionMonitor {
 
     // Verdicts published by ~/dotfiles/kitty/state-daemon.sh
     // (cc-states.json, rewritten every tracker tick): thinking /
-    // needs_permission / done / error / idle. "done" = the turn finished and
-    // the user hasn't focused that kitty window since — the table
-    // renders it as a yellow "Finished"; "error" is table-only and neutral.
+    // needs_permission / done / error / error_attended / idle. "done" = the
+    // turn finished and the user hasn't focused that kitty window since;
+    // "error" is an unacknowledged failed turn, while "error_attended" keeps
+    // the table's neutral Error label after its attention alarm is cleared.
     // All the focus / attended bookkeeping lives in the publisher; we only
     // read its output.
     // Keyed by sessionId (stable across pid reuse); the daemon keys
@@ -138,10 +139,18 @@ final class SessionMonitor {
     // perm-wait (a human actively blocked on the dialog), the overflow accrues
     // as idle-open (prompt left sitting while away). Splitting at the source
     // keeps "stalled on approval" from masquerading as hours of idle time.
-    private static let waitCap: TimeInterval = 15 * 60
+    // `SessionTimeline` splits a painted segment at the same boundary.
+    nonisolated static let waitCap: TimeInterval = 15 * 60
     private var waitTotals: [String: TimeInterval] = [:]
     private var idleTotals: [String: TimeInterval] = [:]
     private var waitingSince: [String: Date] = [:]
+    // Closed segments, newest last. The totals above say how long a session
+    // spent waiting; only these say *when*, which is what the details-mode
+    // lifecycle strip paints — nothing else on disk remembers a wait that is
+    // already over. Capped globally so the file cannot grow without bound.
+    private static let segmentCap = 4000
+    private static let segmentFloor: TimeInterval = 3
+    private var waitSegments: [WaitFile.Segment] = []
     // Open-segment starts restored from disk, consumed by the first
     // sample: still-waiting sessions resume their clock; anything else
     // ended at an unknowable moment and is dropped (undercounting beats
@@ -156,6 +165,22 @@ final class SessionMonitor {
         var totals: [String: TimeInterval]
         var since: [String: TimeInterval]  // epoch seconds
         var idle: [String: TimeInterval]?  // optional: older files lack it
+        var segments: [Segment]?           // optional: older files lack it
+
+        // Short keys — one closed wait each, and there are thousands.
+        struct Segment: Codable {
+            let s: String          // session id
+            let a: TimeInterval    // start, epoch seconds
+            let b: TimeInterval    // end, epoch seconds
+        }
+    }
+
+    // When this session's prompts were on screen, oldest first. Read on the
+    // main actor and handed to the timeline builder before it hops off.
+    func permissionSegments(for sessionId: String) -> [(start: Date, end: Date)] {
+        waitSegments
+            .filter { $0.s == sessionId }
+            .map { (Date(timeIntervalSince1970: $0.a), Date(timeIntervalSince1970: $0.b)) }
     }
 
     func permissionWait(for sessionId: String) -> TimeInterval {
@@ -180,6 +205,15 @@ final class SessionMonitor {
             if elapsed > Self.waitCap {
                 idleTotals[sid, default: 0] += elapsed - Self.waitCap
             }
+            // A prompt answered within a couple of samples is noise on a
+            // timeline measured in hours; keep the totals, drop the segment.
+            if elapsed >= Self.segmentFloor {
+                waitSegments.append(WaitFile.Segment(
+                    s: sid, a: since.timeIntervalSince1970, b: now.timeIntervalSince1970))
+                if waitSegments.count > Self.segmentCap {
+                    waitSegments.removeFirst(waitSegments.count - Self.segmentCap)
+                }
+            }
             waitingSince.removeValue(forKey: sid)
             dirty = true
         }
@@ -192,6 +226,7 @@ final class SessionMonitor {
         else { return }
         waitTotals = file.totals
         idleTotals = file.idle ?? [:]
+        waitSegments = file.segments ?? []
         restoredSince = file.since.mapValues { Date(timeIntervalSince1970: $0) }
     }
 
@@ -199,7 +234,8 @@ final class SessionMonitor {
         let file = WaitFile(
             totals: waitTotals,
             since: waitingSince.mapValues { $0.timeIntervalSince1970 },
-            idle: idleTotals)
+            idle: idleTotals,
+            segments: waitSegments)
         guard let data = try? JSONEncoder().encode(file) else { return }
         try? FileManager.default.createDirectory(
             at: Self.waitFileURL.deletingLastPathComponent(),
@@ -225,6 +261,19 @@ final class SessionMonitor {
     func start() {
         guard !started else { return }
         started = true
+        // Screenshot mode: the badges and host icons come from the demo
+        // document. No sampling job is registered, so no real process ever
+        // appears next to the staged fleet.
+        if DemoFleet.isEnabled {
+            let demo = DemoFleet.liveState()
+            liveSessions = demo.live
+            waiting = demo.waiting
+            terminalKinds = demo.kinds
+            kittyStates = demo.states
+            onUpdate?()
+            onLiveStateChange?()
+            return
+        }
         loadWaitClocks()
         sample()
         // Sampling touches @MainActor state, so the job runs on main; the

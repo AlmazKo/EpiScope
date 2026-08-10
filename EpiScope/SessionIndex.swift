@@ -143,6 +143,14 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // Claude's local-agent metadata is indexed by local_<uuid>, while the
     // claude://code route expects its sibling cliSessionId.
     var appSessionId: String?
+    // The raw session id remains globally unique. Source metadata is provenance
+    // only: it controls filtering, read-only actions and the Offline treatment.
+    var sourceID: String = "builtin.claude"
+    var sourceName: String = "Claude Code"
+    var isExternalSource: Bool = false
+    // Custom sources are parsed from their durable local snapshot, never from
+    // the unreliable mount. Built-in entries can still reconstruct this path.
+    var transcriptPath: String?
     // True when this session is running in / belongs to the Claude desktop
     // app (its Code tab, or the local-agent-mode/Cowork sandbox).
     var isClaudeDesktop: Bool { provider == .claudeDesktop || entrypoint == "claude-desktop" }
@@ -221,7 +229,7 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
 nonisolated struct SessionIndex: Codable, Sendable {
     // Bump when SessionIndexEntry changes shape or accounting semantics so we
     // discard caches built by older EpiScope versions.
-    static let currentVersion = 15
+    static let currentVersion = 16
 
     var version: Int = SessionIndex.currentVersion
     var entries: [SessionIndexEntry] = []
@@ -313,6 +321,7 @@ final class SessionIndexer {
     // Starts true for the initial scan; a safety-net forces a scan periodically
     // in case an event is ever missed.
     private var watcher: DirWatcher?
+    private var sourceObserver: NSObjectProtocol?
     private var projectsDirty = true
     private var ticksSinceScan = 0
     private static let safetyScanTicks = 30   // ~30 s
@@ -329,8 +338,25 @@ final class SessionIndexer {
     private static let saveInterval: TimeInterval = 30
 
     func start() {
+        // Screenshot mode: stage a fake fleet and never touch the real trees —
+        // no watcher, no scan, so nothing can overwrite it mid-shot.
+        if DemoFleet.isEnabled {
+            entries = DemoFleet.entries()
+            publish()
+            return
+        }
         loadFromDisk()
         if !entries.isEmpty { publish() }
+        sourceObserver = NotificationCenter.default.addObserver(
+            forName: .sessionSourcesChanged, object: nil, queue: .main
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.startWatcher()
+                if (note.userInfo?["reindex"] as? Bool) != false { self.kickReindex() }
+                else { self.publish() }
+            }
+        }
         startWatcher()
         kickReindex()
         startTimer()
@@ -339,7 +365,8 @@ final class SessionIndexer {
     private func startWatcher() {
         // Derived, so a provider added later is watched without anyone
         // remembering to extend this list.
-        let paths = SessionProvider.allCases.map { $0.watchRoot.path }
+        watcher = nil
+        let paths = SessionSourceStore.shared.indexRoots().map { $0.url.path }
         watcher = DirWatcher(paths: paths) { [weak self] in
             DispatchQueue.main.async { self?.projectsDirty = true }
         }
@@ -410,14 +437,20 @@ final class SessionIndexer {
     }
 
     func kickReindex() {
+        // Every scan funnels through here — start(), resume(), the source-change
+        // observer, the safety tick and the toolbar's Refresh. Guarding only
+        // start() left the staged fleet alive until the window opened and
+        // resume() kicked a real pass straight over it.
+        if DemoFleet.isEnabled { return }
         guard !paused, !reindexing else { return }
         reindexing = true
         let cached = entries
+        let roots = SessionSourceStore.shared.indexRoots()
         WorkScheduler.shared.run(.init(id: "index-pass", group: WorkScheduler.Group.index, deferrable: false)) {
             // Phase 1 — cheap shallow pass. Returns one entry per
             // jsonl on disk: cache hits are full entries, misses are
             // stubs with only filesystem metadata populated.
-            let (allEntries, stubIds, codexPaths) = Self.rebuildShallow(cache: cached)
+            let (allEntries, stubIds, codexPaths) = Self.rebuildShallow(cache: cached, roots: roots)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if allEntries != self.entries {
@@ -484,11 +517,15 @@ final class SessionIndexer {
     // The 1 s sweep handles normal freshness; this is the "rebuild from
     // scratch" escape hatch.
     func fullReindex() {
+        // The other way in: Refresh and the debug rebuild. Same reason as
+        // kickReindex — a staged fleet must survive every user action.
+        if DemoFleet.isEnabled { return }
         guard !paused, !reindexing else { return }
         reindexing = true
+        let roots = SessionSourceStore.shared.indexRoots()
         WorkScheduler.shared.run(.init(id: "index-full", group: WorkScheduler.Group.index, priority: .interactive, deferrable: false)) {
             // Empty cache → every file is a fresh stub → deep-scanned in full.
-            let (stubs, stubIds, codexPaths) = Self.rebuildShallow(cache: [])
+            let (stubs, stubIds, codexPaths) = Self.rebuildShallow(cache: [], roots: roots)
             DispatchQueue.main.async { [weak self] in
                 self?.totalDeepScan = stubIds.count
                 self?.pendingDeepScan = stubIds.count
@@ -554,7 +591,7 @@ final class SessionIndexer {
     }
 
     nonisolated private static func rebuildShallow(
-        cache: [SessionIndexEntry]
+        cache: [SessionIndexEntry], roots: [SessionIndexRoot]
     ) -> (entries: [SessionIndexEntry], stubIds: Set<String>, codexPaths: [String: URL]) {
         let cacheBySessionId: [String: SessionIndexEntry] = Dictionary(
             uniqueKeysWithValues: cache.map { ($0.sessionId, $0) }
@@ -637,6 +674,8 @@ final class SessionIndexer {
                         cwd: cwd,
                         provider: .claude,
                         title: nil, name: nil, model: nil,
+                        sourceID: "builtin.claude", sourceName: "Claude Code",
+                        transcriptPath: jsonl.path,
                         userMessageCount: 0,
                         lastGitBranch: nil,
                         lastActivity: mtime,
@@ -692,6 +731,8 @@ final class SessionIndexer {
                     cwd: "",
                     provider: .codex,
                     title: nil, name: nil, model: nil,
+                    sourceID: "builtin.codex", sourceName: "Codex",
+                    transcriptPath: jsonl.path,
                     userMessageCount: 0,
                     lastGitBranch: nil,
                     lastActivity: mtime,
@@ -746,6 +787,9 @@ final class SessionIndexer {
                             cwd: "",
                             provider: .claudeDesktop,
                             title: nil, name: nil, model: nil,
+                            sourceID: "builtin.claude-desktop",
+                            sourceName: "Claude Desktop",
+                            transcriptPath: audit.path,
                             userMessageCount: 0,
                             lastGitBranch: nil,
                             lastActivity: mtime,
@@ -759,8 +803,191 @@ final class SessionIndexer {
             }
         }
 
+        let external = scanExternalRoots(
+            roots.filter(\.external), cacheBySessionId: cacheBySessionId,
+            claimedSessionIDs: Set(found.map(\.sessionId)), includeTemporary: includeTemporary)
+        found.append(contentsOf: external.entries)
+        stubIds.formUnion(external.stubIds)
+        codexPaths.merge(external.filePaths) { current, _ in current }
         found.sort { $0.lastActivity > $1.lastActivity }
         return (found, stubIds, codexPaths)
+    }
+
+    nonisolated private struct ExternalScanResult {
+        var entries: [SessionIndexEntry] = []
+        var stubIds: Set<String> = []
+        var filePaths: [String: URL] = [:]
+    }
+
+    // External sources are already durable local snapshots by the time they
+    // reach the indexer. Their layouts deliberately mirror the three built-in
+    // provider roots, so the parsers stay identical and no network filesystem
+    // call can leak into an index pass.
+    nonisolated private static func scanExternalRoots(
+        _ roots: [SessionIndexRoot],
+        cacheBySessionId: [String: SessionIndexEntry],
+        claimedSessionIDs: Set<String>,
+        includeTemporary: Bool
+    ) -> ExternalScanResult {
+        let fm = FileManager.default
+        var result = ExternalScanResult()
+        var claimed = claimedSessionIDs
+
+        func cachedEntry(_ id: String, root: SessionIndexRoot, path: URL,
+                         mtime: Date, size: Int64) -> SessionIndexEntry? {
+            guard var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
+                  sameTimestamp(cached.lastActivity, mtime), cached.fileSize == size
+            else { return nil }
+            cached.sourceName = root.sourceName
+            cached.transcriptPath = path.path
+            return cached
+        }
+
+        for root in roots {
+            switch root.provider {
+            case .claude:
+                guard let projects = try? fm.contentsOfDirectory(
+                    at: root.url, includingPropertiesForKeys: nil) else { continue }
+                for project in projects {
+                    let decodedCwd = ClaudeProjectPath.decode(project.lastPathComponent)
+                    let isTemporary = decodedCwd.hasPrefix("/private/tmp/")
+                        || decodedCwd.hasPrefix("/private/var/")
+                    if !includeTemporary, isTemporary { continue }
+                    guard let files = try? fm.contentsOfDirectory(
+                        at: project, includingPropertiesForKeys: nil) else { continue }
+                    for jsonl in files where jsonl.pathExtension == "jsonl" {
+                        let id = jsonl.deletingPathExtension().lastPathComponent
+                        guard !claimed.contains(id),
+                              let attrs = try? fm.attributesOfItem(atPath: jsonl.path),
+                              let mtime = attrs[.modificationDate] as? Date,
+                              let size = (attrs[.size] as? NSNumber)?.int64Value
+                        else { continue }
+                        claimed.insert(id)
+                        if let cached = cachedEntry(id, root: root, path: jsonl,
+                                                    mtime: mtime, size: size) {
+                            result.entries.append(cached)
+                            continue
+                        }
+                        var entry: SessionIndexEntry
+                        if var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
+                           cached.fileSize <= size, cached.lastParsedSize == cached.fileSize {
+                            cached.fileSize = size
+                            cached.lastActivity = mtime
+                            cached.sourceName = root.sourceName
+                            cached.transcriptPath = jsonl.path
+                            entry = cached
+                        } else {
+                            entry = SessionIndexEntry(
+                                sessionId: id, cwd: decodedCwd, provider: .claude,
+                                title: nil, name: nil, model: nil,
+                                sourceID: root.sourceID, sourceName: root.sourceName,
+                                isExternalSource: true, transcriptPath: jsonl.path,
+                                userMessageCount: 0, lastGitBranch: nil,
+                                lastActivity: mtime,
+                                startedAt: attrs[.creationDate] as? Date,
+                                fileSize: size, lastParsedSize: 0)
+                        }
+                        result.entries.append(entry)
+                        result.stubIds.insert(id)
+                        result.filePaths[id] = jsonl
+                    }
+                }
+
+            case .codex:
+                guard let enumerator = fm.enumerator(
+                    at: root.url, includingPropertiesForKeys: nil) else { continue }
+                while let jsonl = enumerator.nextObject() as? URL {
+                    guard jsonl.pathExtension == "jsonl",
+                          jsonl.lastPathComponent.hasPrefix("rollout-") else { continue }
+                    let basename = jsonl.deletingPathExtension().lastPathComponent
+                    let id = String(basename.suffix(36))
+                    guard id.count == 36, !claimed.contains(id),
+                          let attrs = try? fm.attributesOfItem(atPath: jsonl.path),
+                          let mtime = attrs[.modificationDate] as? Date,
+                          let size = (attrs[.size] as? NSNumber)?.int64Value
+                    else { continue }
+                    claimed.insert(id)
+                    if let cached = cachedEntry(id, root: root, path: jsonl,
+                                                mtime: mtime, size: size) {
+                        result.entries.append(cached)
+                        continue
+                    }
+                    var entry: SessionIndexEntry
+                    if var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
+                       cached.fileSize <= size, cached.lastParsedSize == cached.fileSize {
+                        cached.fileSize = size
+                        cached.lastActivity = mtime
+                        cached.sourceName = root.sourceName
+                        cached.transcriptPath = jsonl.path
+                        entry = cached
+                    } else {
+                        entry = SessionIndexEntry(
+                            sessionId: id, cwd: "", provider: .codex,
+                            title: nil, name: nil, model: nil,
+                            sourceID: root.sourceID, sourceName: root.sourceName,
+                            isExternalSource: true, transcriptPath: jsonl.path,
+                            userMessageCount: 0, lastGitBranch: nil,
+                            lastActivity: mtime, startedAt: nil, fileSize: size)
+                    }
+                    result.entries.append(entry)
+                    result.stubIds.insert(id)
+                    result.filePaths[id] = jsonl
+                }
+
+            case .claudeDesktop:
+                guard let accounts = try? fm.contentsOfDirectory(
+                    at: root.url, includingPropertiesForKeys: nil) else { continue }
+                for account in accounts {
+                    guard let workspaces = try? fm.contentsOfDirectory(
+                        at: account, includingPropertiesForKeys: nil) else { continue }
+                    for workspace in workspaces {
+                        guard let files = try? fm.contentsOfDirectory(
+                            at: workspace, includingPropertiesForKeys: nil) else { continue }
+                        for meta in files where meta.pathExtension == "json"
+                            && meta.lastPathComponent.hasPrefix("local_") {
+                            let id = meta.deletingPathExtension().lastPathComponent
+                            guard !claimed.contains(id) else { continue }
+                            let audit = meta.deletingPathExtension()
+                                .appendingPathComponent("audit.jsonl")
+                            let heavy = fm.fileExists(atPath: audit.path) ? audit : meta
+                            guard let attrs = try? fm.attributesOfItem(atPath: heavy.path),
+                                  let mtime = attrs[.modificationDate] as? Date,
+                                  let size = (attrs[.size] as? NSNumber)?.int64Value
+                            else { continue }
+                            claimed.insert(id)
+                            if let cached = cachedEntry(id, root: root, path: audit,
+                                                        mtime: mtime, size: size) {
+                                result.entries.append(cached)
+                                continue
+                            }
+                            var entry: SessionIndexEntry
+                            if var cached = cacheBySessionId[id],
+                               cached.sourceID == root.sourceID,
+                               cached.fileSize <= size,
+                               cached.lastParsedSize == cached.fileSize {
+                                cached.fileSize = size
+                                cached.lastActivity = mtime
+                                cached.sourceName = root.sourceName
+                                cached.transcriptPath = audit.path
+                                entry = cached
+                            } else {
+                                entry = SessionIndexEntry(
+                                    sessionId: id, cwd: "", provider: .claudeDesktop,
+                                    title: nil, name: nil, model: nil,
+                                    sourceID: root.sourceID, sourceName: root.sourceName,
+                                    isExternalSource: true, transcriptPath: audit.path,
+                                    userMessageCount: 0, lastGitBranch: nil,
+                                    lastActivity: mtime, startedAt: nil, fileSize: size)
+                            }
+                            result.entries.append(entry)
+                            result.stubIds.insert(id)
+                            result.filePaths[id] = meta
+                        }
+                    }
+                }
+            }
+        }
+        return result
     }
 
     // Phase-2 deep scan: locates the jsonl for a stub entry and parses
@@ -769,7 +996,7 @@ final class SessionIndexer {
     nonisolated private static func deepScan(entry: SessionIndexEntry, fileURL: URL?) -> SessionIndexEntry? {
         switch entry.provider {
         case .claude:
-            let jsonl = URL(fileURLWithPath: jsonlPath(for: entry))
+            let jsonl = fileURL ?? URL(fileURLWithPath: jsonlPath(for: entry))
             // Seed accumulators with what we already had from cache
             // (zeros if this is a fresh entry).
             // Seed with the previously known cwd / titles so an
@@ -1183,8 +1410,13 @@ final class SessionIndexer {
                 } else if lineData.range(of: patchSig) != nil,
                           let patch = try? decoder.decode(PatchLine.self, from: lineData),
                           let result = patch.toolUseResult {
+                    // Claude Code 2.1 stopped labelling Edit results: an update
+                    // now carries oldString / newString / structuredPatch and
+                    // no `type` at all, which silently zeroed the line churn of
+                    // every recent session. Older transcripts still say
+                    // "update", so both shapes count.
                     switch result.type {
-                    case "update":
+                    case "update", nil:
                         for hunk in result.structuredPatch ?? [] {
                             for l in hunk.lines ?? [] {
                                 if l.hasPrefix("+") { stats.linesAdded += 1 }
@@ -1520,6 +1752,9 @@ final class SessionIndexer {
     // the audit.jsonl for a Cowork desktop session). nil if it can't be
     // located. Used by loadTranscript and the row's "Reveal in Finder".
     nonisolated static func transcriptURL(for entry: SessionIndexEntry) -> URL? {
+        if entry.isExternalSource, let path = entry.transcriptPath {
+            return SessionSourceStore.validatedSnapshotPath(path)
+        }
         switch entry.provider {
         case .claude:
             return insideProjects(URL(fileURLWithPath: jsonlPath(for: entry)))
@@ -1535,7 +1770,12 @@ final class SessionIndexer {
     // transcript off the main actor (the Codex/Desktop cases walk the session
     // tree) without building a full entry. cwd is only used for Claude.
     nonisolated static func transcriptURL(provider: SessionProvider,
-                                          sessionId: String, cwd: String) -> URL? {
+                                          sessionId: String, cwd: String,
+                                          transcriptPath: String? = nil,
+                                          external: Bool = false) -> URL? {
+        if external, let transcriptPath {
+            return SessionSourceStore.validatedSnapshotPath(transcriptPath)
+        }
         switch provider {
         case .claude:
             return insideProjects(ClaudeProjectPath.transcript(
@@ -1555,6 +1795,9 @@ final class SessionIndexer {
     nonisolated static let transcriptTailBytes = 4_000_000
     nonisolated static func loadTranscript(for entry: SessionIndexEntry)
         -> (events: [TranscriptEvent], truncated: Bool) {
+        // Screenshot mode: a staged conversation, so opening any row shows a
+        // readable dialogue instead of the empty view a fake path would give.
+        if DemoFleet.isEnabled { return (DemoFleet.transcript(for: entry), false) }
         guard let url = transcriptURL(for: entry) else { return ([], false) }
         let (data, truncated) = tailData(of: url, maxBytes: transcriptTailBytes)
         let events: [TranscriptEvent]

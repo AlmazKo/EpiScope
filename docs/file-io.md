@@ -18,27 +18,32 @@ memory, and cache.
 | Path | Contents | Reader | Purpose |
 |---|---|---|---|
 | `~/.claude/sessions/<pid>.json` | pid, sessionId, cwd, entrypoint, status, updatedAt | `SessionStore` (shared) → `SessionMonitor`, `TerminalTracker` | the list of live CC sessions, their status and cwd |
-| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | transcript (assistant records with usage, structuredPatch, cwd, gitBranch) | `SessionIndexer` (deepScan), `TokenChartView`, `LimitChart`, `TerminalTracker` (mtime-gated tail) | tokens, cost, changed lines, model; per-session aggregates; limit reconstruction; terminal API-error outcome |
+| `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | transcript (assistant records with usage, structuredPatch, cwd, gitBranch) | `SessionIndexer` (deepScan), `TokenChartView`, `LimitChart`, `SessionTimeline` (details), `TerminalTracker` (mtime-gated tail) | tokens, cost, changed lines, model; per-session aggregates; limit reconstruction; terminal API-error outcome |
 | `~/.claude/state/cc-rate-limits.json` | real 5h / weekly limits (written by Claude's hooks and status line) | `LimitChart` | exact limits when they exist |
-| `~/.claude/state/sig-<sid>`, `attended-<sid>` | hook signals about state and attention | `SessionMonitor`, `TerminalTracker` (`computeState`) | session state (waiting / thinking / done) |
+| `~/.claude/state/sig-<sid>`, `attended-<sid>` | hook signals and EpiScope acknowledgments | `SessionMonitor`, `TerminalTracker` (`computeState`) | session state and whether a finished or failed turn has been visited |
 | `~/.claude/settings.json` | `effortLevel`, `hooks`, `statusLine` | `MainWindowController` (effort), `ClaudeHooks` (install) | show the effort; check and complete the integration |
-| `~/.codex/sessions/**/rollout-*.jsonl` | Codex transcript, cumulative usage and rolling limits | `SessionIndexer`, `TokenChartView`, `LimitChart`, `TerminalTracker` (via `lsof` plus mtime-gated tail) | Codex sessions, token/cost timeline and limits; pid → rollout mapping; terminal error outcome |
-| `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/local_<uuid>.json` (plus `…/audit.jsonl`) | metadata (`cliSessionId`) and audit log of Claude Desktop Cowork sessions | `SessionIndexer` | sessions of the Code / Cowork tab and their exact app deep-link id |
+| `~/.codex/sessions/**/rollout-*.jsonl` | Codex transcript, cumulative usage and rolling limits | `SessionIndexer`, `TokenChartView`, `LimitChart`, `SessionTimeline` (details), `TerminalTracker` (via `lsof` plus mtime-gated tail) | Codex sessions, token/cost timeline and limits; pid → rollout mapping; terminal error outcome |
+| `~/Library/Application Support/Claude/local-agent-mode-sessions/<acct>/<ws>/local_<uuid>.json` (plus `…/audit.jsonl`) | metadata (`cliSessionId`) and audit log of Claude Desktop Cowork sessions | `SessionIndexer`, `SessionTimeline` (details) | sessions of the Code / Cowork tab and their exact app deep-link id |
+| `~/Library/Application Support/Claude/claude-code-sessions/<acct>/<ws>/local_<uuid>.json` | Claude Desktop Code-tab metadata (`sessionId`, `cliSessionId`) | `cc-open` (only when a Desktop session is opened) | translate the mirrored CLI transcript id to the tab's exact `/epitaxy/local_<uuid>` route |
+| User-selected session source or mounted home | recognised Claude Code, Codex and Claude Desktop transcript layouts | disposable `source-sync` child process (30 s cadence, 120 s deadline) | update an isolated local snapshot without letting an unreliable mount block the app or its local index |
 | `…/Application Support/EpiScope/sessions.json` | **our** index cache | `SessionIndexer` (at launch) | an instant table with no full scan |
+| `…/Application Support/EpiScope/demo-fleet.json` | staged fleet for screenshots | `DemoFleet` (only when `demoFleet` is set) | show the product without the author's projects; every scanner stays parked so no real data reaches the screen |
 
 ### We write (our own files)
 
 | Path | Writer | When | How |
 |---|---|---|---|
 | `~/.claude/state/cc-states.json` | `TerminalTracker` | every tick (1 s) | atomically (tmp + rename); the v1 contract |
-| `~/.claude/state/permission-wait.json` | `SessionMonitor` | when the wait clocks change | atomically; survives a restart |
+| `~/.claude/state/permission-wait.json` | `SessionMonitor` | when the wait clocks change | atomically; survives a restart. Alongside the per-session totals it keeps the last 4000 **closed** wait segments — the only record anywhere of *when* a prompt was on screen, which is what the details-mode lifecycle strip paints |
 | `…/Application Support/EpiScope/sessions.json` | `SessionIndexer` | every 30 s if dirty, and on pause or exit | atomically; dates in ms |
 | `~/.claude/settings.json` (plus `.episcope.bak`) | `ClaudeHooks` | at launch | additively (it only adds our hooks and status line), with a backup |
 | `~/.claude/hooks/episcope-statusline.sh`, `tab-state.sh` | `ClaudeHooks` | at launch | install and migrate; no-clobber for the status line |
 | `…/Application Support/EpiScope/reports/<stamp>-<slug>.md` (plus `.json`) | `ReportStore` | when an analysis finishes | atomically; no retention policy — a report is deleted only from the UI |
 | `…/Application Support/EpiScope/search.sqlite` | `SearchIndex` | as transcripts grow | FTS5 in WAL mode; rows for sessions that leave the index are pruned on reconcile |
+| `…/Application Support/EpiScope/session-sources.json` | `SessionSourceStore` | when a custom source is added, changed or synced | atomically persisted source configuration and last successful sync time |
+| `…/Application Support/EpiScope/session-sources/<id>/snapshot/**` | disposable `source-sync` child process | when an enabled custom source is available | private, atomic per-file copies of recognised transcripts; previous files are retained on every failure |
 | `~/Library/LaunchAgents/<bundleID>.plist` | `LoginItem` | first launch, and on toggle | atomically; removed when Launch-at-Login is turned off |
-| `<temp>/episcope-analysis/<uuid>/**` | `AnalysisRunner`, `TranscriptExtractor` | for the duration of an analysis | the per-user temp root (0700), **not** `/private/tmp` — packets are verbatim conversation text; removed after the run, kept after a failure for a post-mortem |
+| `<temp>/episcope-analysis/<uuid>/**` | `AnalysisRunner`, `TranscriptExtractor` | for the duration of an analysis | the per-user temp root (0700), **not** `/private/tmp` — packets are verbatim conversation text; removed after the run, kept after a failure for a post-mortem. A Codex run also has the CLI write `last-message.md` here, so the result is read before the dir is removed |
 
 Two of those touch files we do not own, so they are deliberately conservative.
 `~/.claude/settings.json` and the hook scripts are commonly symlinks into a
@@ -59,6 +64,13 @@ ancestry. It is read by `cc-open` (which focuses a terminal or activates an
 application from a notification or a double click) and by `SessionMonitor`
 itself (states and host icons).
 
+Custom session sources are a separate read-only bridge inwards. The main
+process never walks or opens a configured mount. A bundled Python child copies
+only recognised `.json` / `.jsonl` files to a private local snapshot, publishes
+each file with an atomic rename and is terminated after 120 seconds. A failed
+or missing source leaves the previous snapshot untouched, so `SessionIndexer`
+and `SearchIndex` never interpret temporary unavailability as deletion.
+
 ---
 
 ## 2. Who runs when, and on which thread
@@ -75,9 +87,11 @@ rollout-tail scan solely for notifications.
   (liveness, tty, and a guard against pid reuse).
 - **Turn outcome:** transcript / rollout files are statted for live sessions;
   only a changed file gets a bounded 64 KiB tail read. A terminal Claude API
-  error or Codex terminal `error` publishes the neutral, table-only `error`
-  state; retryable Codex `stream_error` events are ignored. A newer Claude
-  `idle` timestamp also invalidates a stale
+  error or Codex terminal `error` publishes `error` until the operator opens
+  the session through EpiScope, then `error_attended`; both render as a neutral
+  Error badge, but only the first drives the amber attention alarm and banner.
+  Retryable Codex `stream_error` events are ignored. A newer Claude `idle`
+  timestamp also invalidates a stale
   `thinking` hook left behind when Stop did not fire.
 - **Less often:** `ps -axo` (the Codex lookup) runs **every 4th tick**, cached;
   kitty / iTerm / Terminal / Ghostty location runs **every 2nd tick**, and only
@@ -98,7 +112,8 @@ rollout-tail scan solely for notifications.
 - **Off main:** Codex sessions are read on a separate queue
   (`refreshCodexLiveAsync`); their waiting ids are then handed to
   `TerminalTracker` without another rollout read.
-- **Why:** the needs-attention list, the state badges, and the perm-wait clocks.
+- **Why:** the needs-attention list, reaction alarms, state badges, and the
+  perm-wait clocks.
 
 ### SessionIndexer — "the session table with aggregates"
 - **Thread and cadence:** a `Timer` on the main run loop, **1 s**, tolerance 0.3.
@@ -122,6 +137,10 @@ rollout-tail scan solely for notifications.
   flicker.
 - **Why:** the table rows and their tokens, cost, changed lines, model and turns.
 - It saves the index cache to disk every 30 s when dirty, and on pause.
+- Built-in provider roots are still indexed directly. Enabled custom sources
+  contribute only their local snapshot roots; their mounted paths never enter
+  an index pass. `sessionId` remains the global key, while `sourceID` is retained
+  only for filtering, read-only actions and Offline presentation.
 
 ### TokenChartView and LimitChart — the charts
 - Both use their own background queues and compute **on demand** (window opened,
@@ -134,6 +153,17 @@ rollout-tail scan solely for notifications.
 - `LimitChart` prefers `cc-rate-limits.json` (fresh for 30 minutes), then Codex
   rollouts, then a cached token estimate. It makes **no** network calls and
   touches **no** Keychain.
+- `SessionTimeline` runs once per session opened in details, on the same
+  background hop that loads the transcript for the viewer. It streams the
+  **whole** transcript and byte-filters each line before decoding, so only
+  prompts, turn receipts, errors, patches and usage reach `JSONDecoder`. One
+  pass feeds everything above the conversation — the lifecycle strip, the three
+  usage curves and the message markers. The viewer's 4 MB tail cap governs the
+  conversation alone: sharing it would have drawn a month of phases against the
+  last tenth of a curve, and the curve would have accumulated from the tail
+  boundary rather than from the session's start. Usage dedupes by `requestId`
+  like `foldUsage` does; the details chart used to skip that and ran 1.7-2.3×
+  over the table.
 
 ---
 
@@ -173,12 +203,13 @@ rollout-tail scan solely for notifications.
 - **Temporary sessions** (`/private/tmp/*`, `/private/var/*` — sub-tasks and e2e
   runs): the indexer drops them before its inner `readdir` when Show Temporary is
   off, and the token chart folds them into one neutral bar.
-- **Claude Desktop (Code / Cowork):** the transcript is the `audit.jsonl` next to
-  `local_<uuid>.json`; freshness is keyed on the audit file's mtime and size.
-  The index keeps `local_<uuid>` as its key and stores metadata's `cliSessionId`
-  as the app id. `cc-open` follows `claude://code/<cliSessionId>` (or the live
-  bridge session id for `entrypoint = claude-desktop`) to select the exact
-  session, with bundle activation only as a fallback.
+- **Claude Desktop (Code / Cowork):** local-agent transcripts use the
+  `audit.jsonl` next to `local_<uuid>.json`; freshness is keyed on the audit
+  file's mtime and size. A Code tab can instead mirror its transcript under
+  `~/.claude/projects` while `claude-code-sessions` maps that CLI id back to the
+  owning `local_<uuid>` tab. On an explicit open, `cc-open` follows
+  `claude://claude.ai/epitaxy/local_<uuid>` for the latter and retains the
+  `claude://code/<cliSessionId>` route for older local-agent metadata.
 - **Codex:** the cwd lives inside `session_meta`, pid → rollout is resolved
   through `lsof` (once per pid, cached), and usage is timestamped by the
   `token_count` record that actually carries it rather than by the preceding

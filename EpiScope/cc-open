@@ -33,11 +33,50 @@ ok_id "$SID" || { echo "cc-open: refusing malformed session id" >&2; exit 2; }
 CLAUDE_DESKTOP_SID="${2:-}"
 [ -n "$CLAUDE_DESKTOP_SID" ] && { ok_id "$CLAUDE_DESKTOP_SID" || exit 2; }
 
+# Claude Desktop writes Code-tab metadata under its own local_<uuid> id while
+# mirroring the transcript under the CLI id in ~/.claude. Recent builds route
+# those tabs through /epitaxy/local_<uuid>; claude://code/<cli-id> is accepted
+# by LaunchServices but silently rejected by Claude's URL handler. Resolve the
+# pair only on an explicit open, not in either one-second scanner.
+open_claude_desktop_session() {
+  local target_sid="$1"
+  local desktop_local_sid
+  desktop_local_sid="$(/usr/bin/python3 - "$target_sid" <<'EOF'
+import glob, json, os, re, sys
+
+target = sys.argv[1]
+root = os.path.join(
+    os.path.expanduser("~"),
+    "Library", "Application Support", "Claude", "claude-code-sessions")
+pattern = os.path.join(root, "*", "*", "local_*.json")
+for path in glob.iglob(pattern):
+    try:
+        if os.path.getsize(path) > 1024 * 1024:
+            continue
+        with open(path) as fh:
+            metadata = json.load(fh)
+    except (OSError, ValueError):
+        continue
+    if metadata.get("cliSessionId") != target:
+        continue
+    local_id = metadata.get("sessionId")
+    if isinstance(local_id, str) and re.fullmatch(r"local_[A-Za-z0-9._-]+", local_id):
+        print(local_id)
+        break
+EOF
+)"
+  if [ -n "$desktop_local_sid" ]; then
+    ok_id "$desktop_local_sid" || return 1
+    open "claude://claude.ai/epitaxy/$desktop_local_sid" 2>/dev/null
+    return $?
+  fi
+  open "claude://code/$target_sid" 2>/dev/null
+}
+
 # Historical Claude App sessions may have no live cc-states entry. The table
-# supplies the metadata's cliSessionId explicitly; Claude uses it to bridge the
-# indexed local_<uuid> record to the exact Code/Cowork session in the app.
+# supplies their provider-owned route id explicitly.
 if [ -n "$CLAUDE_DESKTOP_SID" ]; then
-  open "claude://code/$CLAUDE_DESKTOP_SID" 2>/dev/null && exit 0
+  open_claude_desktop_session "$CLAUDE_DESKTOP_SID" && exit 0
   open -b com.anthropic.claudefordesktop 2>/dev/null && exit 0
 fi
 
@@ -204,10 +243,52 @@ EOF
   xterm)
     open -a XQuartz 2>/dev/null && exit 0
     ;;
-  # JetBrains IDEs: REF is the IDE bundle id. No per-tab focus API, so
-  # we just bring the IDE app forward.
+  # JetBrains IDEs: REF is the IDE bundle id. Their native launcher forwards a
+  # project path over the running instance's command-line channel and reuses
+  # the open project. `open -b <bundle> <path>` is not equivalent: on macOS it
+  # starts initializing a duplicate project before disposing it, which makes
+  # merged project tabs jump and flash. Resolve the executable from the running
+  # LaunchServices entry instead of guessing which product/version is installed.
+  # A terminal may start below the root, so prefer its nearest .idea ancestor.
   jetbrains)
-    ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
+    if ok_bundle "$REF" && [[ "$REF" == com.jetbrains.* ]]; then
+      PROJECT="${CWD%/}"
+      case "$PROJECT" in
+        /*)
+          [ -n "$PROJECT" ] || PROJECT="/"
+          ORIGINAL_PROJECT="$PROJECT"
+          while [ "$PROJECT" != "/" ] && [ ! -d "$PROJECT/.idea" ]; do
+            PROJECT="${PROJECT%/*}"
+            [ -n "$PROJECT" ] || PROJECT="/"
+          done
+          [ -d "$PROJECT/.idea" ] || PROJECT="$ORIGINAL_PROJECT"
+          LAUNCHER="$(lsappinfo list 2>/dev/null | /usr/bin/awk -v bid="$REF" '
+            index($0, "bundleID=\"" bid "\"") { found=1; next }
+            found && /^[[:space:]]*executable path="/ {
+              sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+            }
+            found && /^[0-9]+\)/ { exit }
+          ')"
+          case "$LAUNCHER" in
+            /*)
+              if [ -x "$LAUNCHER" ]; then
+                # IDEA 2026.1 can call AppIcon.requestAttention off the EDT when
+                # a launcher command arrives while it is in the background.
+                # Activate first; the short grace period lets that event land
+                # before the launcher asks ProjectUtil to focus the project.
+                open -b "$REF" >/dev/null 2>&1
+                sleep 0.2
+                "$LAUNCHER" "$PROJECT" >/dev/null 2>&1 && exit 0
+              fi
+              ;;
+          esac
+          ;;
+      esac
+      # Launcher discovery can fail if LaunchServices is briefly unavailable.
+      # Activation is safe; do not pass the project to `open` and recreate the
+      # duplicate-project behaviour this branch exists to avoid.
+      open -b "$REF" 2>/dev/null && exit 0
+    fi
     ;;
   # Any app bundle that has no dedicated adapter yet. Process ancestry gives
   # us its bundle id, which is enough for both automatic icons and activation.
@@ -220,12 +301,11 @@ EOF
     ok_bundle "$APP_BUNDLE" && open -b "$APP_BUNDLE" 2>/dev/null && exit 0
     ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
     ;;
-  # Claude desktop (Code / local-agent mode) accepts a bridge session id in its
-  # registered URL scheme, so open the exact session instead of whichever one
-  # happened to be visible last. Live ~/.claude sessions already use SID as the
-  # bridge id; indexed local_<uuid> sessions pass cliSessionId as argv[2] above.
+  # Live Desktop sessions are keyed by their CLI id in cc-states. Resolve the
+  # paired local id when this is a Code-tab session; retain the old code route
+  # for local-agent sessions that have no claude-code-sessions metadata.
   claude-desktop)
-    open "claude://code/$SID" 2>/dev/null && exit 0
+    open_claude_desktop_session "$SID" && exit 0
     ok_bundle "$REF" && open -b "$REF" 2>/dev/null && exit 0
     ;;
   iterm2)

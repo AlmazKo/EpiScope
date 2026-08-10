@@ -51,8 +51,10 @@ struct SessionInfo: Decodable, Equatable {
         URL(fileURLWithPath: cwd).lastPathComponent
     }
 
-    var updatedAtDate: Date {
-        guard let updatedAt else { return .distantPast }
-        return Date(timeIntervalSince1970: TimeInterval(updatedAt) / 1000)
+    // Exact for regular CLI sessions; updatedAt is the provider fallback for
+    // Codex and SDK-driven sessions that do not publish statusUpdatedAt.
+    var statusChangedAtDate: Date? {
+        guard let ms = statusUpdatedAt ?? updatedAt else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
     }
 }

@@ -77,13 +77,13 @@ final class MenuBarChart {
     private static let speed: CGFloat = 5
     private static let speedSpread = 8...12   // in tenths of the base
 
-    // The chart is always these six slots wide: a fleet that outgrows the
+    // The chart is always these five slots wide: a fleet that outgrows the
     // menu bar would push everything else off screen, and a chart that
     // resized with the session count would make the whole right-hand side
     // of the menu bar jitter. Sessions fill the slots from the left (the
     // caller sorts requests first, so a cut only ever drops the least
     // urgent bars); the leftovers stay as faint, still placeholders.
-    private static let slots = 6
+    private static let slots = 5
     private static let emptyAlpha: CGFloat = 0.15
 
     private static let fps = 10
@@ -165,7 +165,7 @@ final class MenuBarChart {
     }
 
     // The whole input: which sessions to show, in the order to show them.
-    // Anything past the six slots is dropped — the caller sorts requests
+    // Anything past the five slots is dropped — the caller sorts requests
     // first, so the bars that survive are the ones worth the space.
     func update(bars newBars: [Bar]) {
         bars = Array(newBars.prefix(Self.slots))

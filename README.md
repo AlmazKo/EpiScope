@@ -1,184 +1,239 @@
-# EpiScope
+<p align="center">
+  <img src="episcope.png" width="88" alt="EpiScope icon">
+</p>
 
-A menu-bar app and window that tracks [Claude Code](https://claude.com/claude-code),
-[OpenAI Codex](https://github.com/openai/codex-cli) and Claude Desktop sessions
-on macOS.
+<h1 align="center">EpiScope</h1>
 
-It lights up the menu bar when one of your sessions is waiting for permission,
-and shows every session on the machine in one window: tokens, cost, status, the
-transcript of each conversation and a spend timeline.
+<p align="center">
+  <strong>The native macOS control center for your AI coding sessions.</strong><br>
+  Monitor every session, search every conversation, and understand where your
+  tokens, time, and money go.
+</p>
 
-Pure AppKit (no SwiftUI), no network and no analytics — everything stays local.
-It reads `~/.claude/**` and `~/.codex/**`, and publishes session state to
-`~/.claude/state/cc-states.json` for external consumers.
+<p align="center">
+  <kbd>Claude Code &amp; Desktop</kbd>&nbsp;&nbsp;
+  <kbd>OpenAI Codex</kbd>
+</p>
 
-## Features
+<p align="center">
+  <strong>Free and open source</strong> · Local-first · No telemetry<br>
+  No EpiScope account · No subscription
+</p>
 
-**Menu bar**
-- A `?` icon in the menu bar. It turns red and blinks at 1 Hz while a Claude Code
-  session waits for permission.
-- An optional system sound when a new permission prompt appears (pick it in
-  _Settings → Sound_).
-- The menu lists the waiting sessions with folder, tool and waiting time. A click
-  copies the session id and focuses the session's terminal (the same logic as the
-  main table). App settings (Launch at Login, Sound and the rest) live in the
-  app's **Settings** menu; the status bar is about sessions only.
+<p align="center">
+  <code>brew install --cask AlmazKo/tap/episcope</code>
+</p>
 
-**Main window (list)**
-- A session table with the columns **Color · Vendor · Model · Status · Path ·
-  Title · Input · Changes · Last Activity** by default. The rest (Perm Wait,
-  Name, Started, User msgs, Turns, Branch, Cache, Output, Cost) are turned on in
-  _Settings → Columns_.
-- The **Status** column: `Waiting` on red (waiting for permission), `Busy` with
-  running dots (the model is typing), `Finished` on yellow (the turn is over and
-  the window has not been opened yet — the tracker's verdict), `Idle` (the pid is
-  alive), `—` (not running).
-- **Model** shows the name plus the reasoning effort for Codex (for example
-  `gpt-5.5 xhigh`, read from `turn_context.payload.effort`).
-- **Title** stretches automatically to the free width of the window.
-- Selecting a row **highlights its segment in the chart**: the others fade to
-  alpha 0.18 and the selected session moves down the stack, to the baseline.
-- Esc or a click outside the table clears the selection.
-- The window title shows the session count and the indexing progress:
-  `EpiScope · 187 sessions · Loading 50 / 187`.
-- Above the table sits a stacked token chart with time axes. Its window is
-  configured in _Settings → Chart Window_ (1/2/5/7 days); the bucket size scales
-  so that roughly 100–250 columns remain.
+![EpiScope shows every AI session with live status, model, project, token usage, cost, and activity history](docs/img/main-window.png)
 
-**Details mode (double-click a finished session; for a live one, the Messages button)**
-- The session title and its relative path move into the window title. The toolbar
-  holds Back, the session actions and a search field.
-- On top: a line or stacked chart of the spend of **this session only**, with
-  Input / Cache / Output checkboxes. Bars are 15 minutes wide and empty windows
-  are skipped.
-- Below: the user ↔ model conversation (tools and diffs are hidden).
-- Markdown in the model's answers is rendered by a built-in parser: headers,
-  **bold**, *italic*, `code`, fenced ```code blocks```, lists, blockquotes, and
-  tables drawn with Unicode box-drawing characters
-  (`┌─┬─┐ │ ├─┼─┤ │ └─┴─┘`) with tinted borders.
-- Transcript search uses the same field; Enter jumps to the next match.
+---
 
-**Full-text search (⌘F)**
-- A deep-search mode in the main window (the magnifier left of the filter, or ⌘F)
-  over a SQLite FTS5 index of the text of every conversation — with no external
-  dependency (the system `libsqlite3`). Results are per-message cards with
-  highlighted matches; a click opens the session, scrolls to the message and
-  washes it. The index is built incrementally and survives relaunches.
+## One workspace for every agent session
 
-**AI Insights (observability over the whole fleet)**
-- An analytics layer on top of the telemetry EpiScope already collects. Local
-  first: the numbers come from the index, the narrative from a headless
-  `claude -p` run. Nothing leaves the machine.
-- **Automatic**: a daily report every morning (for the previous day) and a
-  separate weekly one on Mondays. One consolidated report: TL;DR, what needs
-  attention, cost and savings, anomalies, patterns and hotspots, per-project
-  health, CLAUDE.md candidates. A push notification opens Insights mode.
-- Embedded in the main window as its own mode (the ✦ button, like deep search):
-  the runs list on the left, the report on the right. It always works over the
-  whole fleet, never over one selected session; a run is managed from the list's
-  right-click menu.
-- **Only two controls** (_Settings_): on/off and the analysis model (Sonnet 4.6
-  by default / Sonnet 5 / Opus 4.8 / Haiku 4.5). See
-  [`docs/insights-lab.md`](docs/insights-lab.md).
+Running several coding agents in parallel is most useful when you can see what
+each one is doing and return as soon as it needs you. EpiScope brings terminal
+tabs, desktop threads, projects, and session history into one clear view.
 
-**Indexer**
-- **Incremental**: for sessions it already knows, it reads only the bytes added
-  since the last index instead of the whole jsonl. An active 50 MB session is
-  indexed in milliseconds.
-- Polls every 2 seconds, plus an immediate kick when the live state changes (a
-  session started or died).
-- Streaming records are deduplicated by `requestId`, so the token counters match
-  Claude's `/usage`.
-- The real cwd is read from the jsonl body (the `cwd` field) instead of being
-  reconstructed from the folder name, so paths with a hyphen (`my-project`) do
-  not turn into `my/project`.
-- **Temporary sessions** (`/private/tmp/*`, `/private/var/*`) are skipped
-  entirely while the toggle is off — not indexed, not counted, not part of the
-  loading progress.
-- Cost is computed from a model price list: Opus 4.x ($5/$25), Sonnet 4.x
-  ($3/$15), Haiku 4.5 ($1/$5), Fable 5 / Mythos 5 ($10/$50), GPT-5.x ($5/$10),
-  and so on. Update prices in `SessionIndex.pricingTable`.
+It watches each session's live state, brings you back when attention is needed,
+indexes your history, and turns agent activity into useful statistics and
+AI-assisted insights.
 
-**Terminal integration (always on)**
-- EpiScope is the session tracker: it works out which terminal hosts each CC
-  session and publishes a snapshot to `~/.claude/state/cc-states.json` for
-  external consumers (`kitty-painter.py`, `cc-open`). Full adapters (window/tab
-  plus focus): kitty (`kitten @ ls`), iTerm2 and Terminal.app (AppleScript,
-  joined by tty), Ghostty 1.3+ (AppleScript, joined by working directory),
-  Agterm (`agtermctl` plus `AGTERM_SESSION_ID` / `AGTERM_WINDOW_ID` from the
-  process environment — an exact window/session binding, see
-  [`docs/agterm.md`](docs/agterm.md)). For xterm and anything else the terminal
-  kind is detected from the process ancestry, without a window.
-- Every live session in the table carries its terminal's icon. Icons are taken at
-  runtime from the installed applications; only the kitty mascot is bundled.
-- A double click on a live session focuses its terminal window or tab through the
-  bundled `cc-open` script. kitty, iTerm2, Terminal, Ghostty and Agterm get the
-  exact tab; Codex App opens the exact local thread through its documented deep
-  link; xterm activates XQuartz; with no window at all, a fresh terminal opens at
-  the session's cwd. External `cc-open` scripts are intentionally ignored so the
-  opener always matches EpiScope's snapshot schema. A double click on a dead
-  session opens its details.
-- Notifications: a banner on `Finished` and `Needs permission`; a click leads to
-  the terminal through the same `cc-open`, and the banner is withdrawn as soon as
-  the session is visited.
-- The `Finished` status (a yellow badge) is the tracker's verdict: the turn is
-  over and the window has not been opened yet.
+It is more than a session switcher: **EpiScope is search and analytics for your
+entire local agent history.**
 
-**Other**
-- A prebuilt LaunchAgent plist for autostart
-  (`~/Library/LaunchAgents/almazko.EpiScope.plist`), enabled on first launch.
-- A session's colour is a deterministic FNV-1a hash of its sessionId → HSB, so
-  the same session keeps one hue everywhere.
-- The session index lives in
-  `~/Library/Application Support/EpiScope/sessions.json`.
+## What EpiScope brings together
 
-## Install
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Manage the whole fleet</h3>
+      See live and historical sessions from Claude Code, Codex, and Claude
+      Desktop in one table. Track status, model, project, tokens, cost, turns,
+      code changes, and last activity.
+    </td>
+    <td width="50%" valign="top">
+      <h3>React at the right moment</h3>
+      The menu bar shows which sessions are working, finished, failed, or
+      waiting for permission. Optional sounds and macOS notifications bring you
+      back while you stay focused on your current work.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Search every conversation</h3>
+      Full-text search runs across the complete local history of every supported
+      agent. Open a result directly at the matching message.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Understand your usage</h3>
+      Explore token and cost timelines by session and project, monitor account
+      limits, and understand how your agent budget is distributed.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Get daily and weekly insights</h3>
+      Automatic reports surface anomalies, expensive patterns, project health,
+      recurring friction, and concrete candidates for improving
+      <code>CLAUDE.md</code>.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Jump to the exact session</h3>
+      Open the exact terminal tab or desktop thread that owns a live session.
+    </td>
+  </tr>
+</table>
 
-Grab the DMG from the
-[releases](https://github.com/almazko/EpiScope/releases), drag the app to
-`/Applications` and launch it. Or install it from the tap:
+## 🔔 Know when any session needs you
+
+The menu-bar indicator is a compact live view of the entire fleet. It animates
+while agents work, turns red for a permission request, and turns amber when a
+turn finishes or fails. Open it to see every active session and every session
+that needs attention, alongside your Claude and Codex rate-limit meters.
+
+<p align="center">
+  <img src="docs/img/menu-bar.png" width="340"
+       alt="EpiScope menu showing rate limits, sessions that need attention, and active sessions">
+</p>
+
+Click a session or its notification to return to it immediately. EpiScope can
+focus the exact tab in kitty, iTerm2, Terminal.app, Ghostty, and Agterm, or open
+the exact thread in Claude Desktop and the Codex app.
+
+## 🔎 Search is a first-class feature
+
+Session history is most useful when it is easy to retrieve. Press
+<kbd>⌘ F</kbd> to search the full text of every indexed conversation across
+providers and projects. Results appear as message-level excerpts; selecting one
+opens the conversation at that exact message.
+
+The search index is built incrementally with the system SQLite FTS5 library and
+stays on your Mac.
+
+## ✨ Analytics across every session
+
+EpiScope keeps a long-term record of sessions, tokens, cost, turns, code changes,
+permission wait time, and tool activity. Use the timeline and table to compare
+projects, models, providers, and individual sessions through one consistent
+view.
+
+Optional **AI Insights** turn those statistics into one focused daily report and
+one weekly review:
+
+- what needs attention
+- cost, usage, and potential savings
+- anomalies and recurring hotspots
+- health summaries for each project
+- evidence-backed suggestions for your agent instructions
+
+The metrics are computed locally from the index. Narrative analysis is generated
+through the CLI and model you configure — `claude` or `codex`. See
+[`docs/insights-lab.md`](docs/insights-lab.md) for the methodology.
+
+## ⚡ Native, lightweight, and local-first
+
+EpiScope is a pure AppKit application with no third-party runtime dependencies.
+The universal binary is about **3 MB** and uses about **30 MB of memory** when
+idle. It is designed to stay open all day alongside your agents.
+
+## 🔐 Privacy and analytics
+
+> [!IMPORTANT]
+> **EpiScope does not collect product analytics.** There is no telemetry,
+> analytics SDK, tracking, EpiScope account, or remote dashboard. The app does
+> not report which features you use, which projects you work on, or what your
+> sessions contain.
+
+The statistics shown inside EpiScope are computed for you on your Mac. Session
+history is read from the agents' local files; the full-text index, usage
+metrics, costs, and reports are stored locally and are never collected by the
+project author.
+
+> [!NOTE]
+> Optional **AI Insights** explicitly invoke your local `claude` or `codex` CLI,
+> whichever the chosen model belongs to. Those
+> requests follow the network, account, and data-handling configuration of that
+> CLI and the provider behind it. The EpiScope project does not receive or
+> collect the requests or results.
+
+## 🛡️ Security by design
+
+- **Small attack surface.** The app has no networking code, embedded web
+  service, third-party runtime dependencies, account system, or Keychain
+  access.
+- **Defensive input handling.** Session IDs are validated before file access,
+  external values are passed to AppleScript as arguments, and generated links
+  are limited to web URLs.
+- **Conservative file access.** EpiScope reads session data from `~/.claude`
+  and `~/.codex`. Its Claude Code integration is installed additively, keeps a
+  backup of modified configuration, and never clobbers an existing status line.
+  Files owned by EpiScope are updated atomically.
+- **Private temporary data.** Analysis scratch data uses the private per-user
+  temporary directory and is removed after a successful run.
+- **Verified distribution.** Release builds and DMGs are developer-signed,
+  Apple-notarized, and stapled.
+
+The complete read/write boundary is documented in
+[`docs/file-io.md`](docs/file-io.md).
+
+---
+
+## 🧩 Supported apps and terminals
+
+EpiScope currently supports sessions from
+[**Claude Code**](https://claude.com/claude-code),
+[**OpenAI Codex**](https://github.com/openai/codex), and **Claude Desktop**,
+including Code and Cowork sessions.
+
+> **Exact window and tab**<br>
+> kitty · iTerm2 · Terminal.app · Ghostty 1.3+ · [Agterm](docs/agterm.md)
+
+> **Exact desktop session**<br>
+> Claude Desktop · Codex app
+
+> **Detected with a universal fallback**<br>
+> Other terminals and IDEs open at the session directory.
+
+Every live row carries its host application's icon, making parallel sessions
+easy to distinguish at a glance.
+
+## 📦 Install
+
+Install with Homebrew:
 
 ```bash
-brew tap almazko/tap
-brew install --cask episcope
+brew install --cask AlmazKo/tap/episcope
 ```
 
-## Build from source
+Or download the latest DMG from
+[GitHub Releases](https://github.com/AlmazKo/EpiScope/releases) and drag EpiScope
+to `/Applications`. The app and DMG are signed, notarized, and stapled, so the
+first launch works offline.
+
+### Requirements
+
+macOS 14 Sonoma or newer. Apple Silicon and Intel Macs are supported.
+
+<details>
+<summary><strong>Build from source</strong></summary>
+
+<br>
 
 ```bash
-git clone https://github.com/almazko/EpiScope.git
+git clone https://github.com/AlmazKo/EpiScope.git
 cd EpiScope
 open EpiScope.xcodeproj
 ```
 
-The minimum target is macOS 14.0 (Sonoma). For a test build, press ⌘R in Xcode.
+Choose your own development team in Xcode under *Signing & Capabilities*, then
+press **⌘R**. You can also build without signing by setting
+`CODE_SIGNING_ALLOWED=NO`.
 
-## Release
+</details>
 
-`release.sh` builds the Release configuration, signs it, packs a DMG, notarizes
-it with Apple and staples the ticket:
+---
 
-```bash
-# one-time: store a notary profile in the Keychain
-xcrun notarytool store-credentials episcope-notary \
-    --apple-id <your-id> \
-    --team-id <your-team-id> \
-    --password <app-specific-password>
+## 💜 Free and open source
 
-./release.sh
-# → EpiScope.dmg next to the script
-```
-
-The profile name can be overridden with `EPISCOPE_NOTARY_PROFILE`. The DMG is
-mounted as `/Volumes/EpiScope-<version>`, because otherwise the path would clash
-with the LaunchServices-registered `EpiScope.app` and TCC would block the write.
-
-## System requirements
-
-- macOS 14.0+ (Sonoma)
-- Apple Silicon or Intel
-- ~3 MB on disk (universal .app), ~30 MB RAM when idle
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+EpiScope is free to use, has no paid tier, and is released under the
+[MIT License](LICENSE). Issues, ideas, and contributions are welcome.

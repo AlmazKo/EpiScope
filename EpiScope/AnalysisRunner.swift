@@ -20,7 +20,9 @@ nonisolated struct AnalysisRequest {
     // Directories the agent may Read/Grep/Glob: the packet dir plus the
     // raw ~/.claude/projects/<encoded-cwd> dirs for drill-down.
     let addDirs: [URL]
-    // CLI --model argument (alias or full id).
+    // Which CLI runs this — it decides the argv and how the result is read.
+    var engine: AnalysisEngine = .claude
+    // CLI --model argument (alias or full id), in that CLI's own naming.
     let model: String
     // Scratch cwd for the run — create via AnalysisRunner.makeWorkDir()
     // and write packets into it before calling run().
@@ -41,7 +43,7 @@ nonisolated struct AnalysisOutcome {
 }
 
 nonisolated enum AnalysisError: Error {
-    case cliNotFound
+    case cliNotFound(AnalysisEngine)
     case launchFailed(String)
     case exit(code: Int32, stderr: String)
     // Clean exit but the CLI reported is_error (not logged in, limit
@@ -52,14 +54,13 @@ nonisolated enum AnalysisError: Error {
 
     var userMessage: String {
         switch self {
-        case .cliNotFound:
-            return "The claude CLI was not found. Install Claude Code, or point "
-                + "EpiScope at the binary via the claudeCLIPath default."
+        case .cliNotFound(let engine):
+            return engine.cliMissingMessage
         case .launchFailed(let why):
-            return "Could not launch the claude CLI: \(why)"
+            return "Could not launch the analysis CLI: \(why)"
         case .exit(let code, let stderr):
             let tail = stderr.isEmpty ? "" : "\n\n\(stderr)"
-            return "claude exited with status \(code).\(tail)"
+            return "The analysis CLI exited with status \(code).\(tail)"
         case .agentError(let message):
             return message
         case .timeout(let seconds):
@@ -152,9 +153,9 @@ final class AnalysisRunner {
             completion(.failure(.launchFailed("an analysis is already running")))
             return
         }
-        guard let cli = ClaudeCLI.locate() else {
+        guard let cli = request.engine.locate() else {
             lease.release()
-            completion(.failure(.cliNotFound))
+            completion(.failure(.cliNotFound(request.engine)))
             return
         }
         // Held until the process is reaped in finish(); the group stays busy
@@ -163,27 +164,9 @@ final class AnalysisRunner {
 
         let p = Process()
         p.executableURL = cli
-        var args = [
-            "-p",
-            "--output-format", "json",
-            "--model", request.model,
-            "--max-turns", String(request.maxTurns),
-            "--allowedTools", "Read,Grep,Glob",
-            // --allowedTools pre-approves tools; it does not disable the rest.
-            // Without the three flags below the run would inherit the user's
-            // own permissions.allow, defaultMode and MCP servers — so how
-            // contained this agent is would depend on how somebody else
-            // configured their CLI, while it chews on transcript text written
-            // by whoever the observed sessions talked to.
-            "--disallowedTools",
-            "Bash,Write,Edit,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task",
-            "--permission-mode", "default",
-            "--strict-mcp-config",
-        ]
-        for dir in request.addDirs { args += ["--add-dir", dir.path] }
-        p.arguments = args
+        p.arguments = request.engine.arguments(for: request)
         p.currentDirectoryURL = request.workDir
-        p.environment = ClaudeCLI.environment(for: cli)
+        p.environment = AnalysisEngine.environment(for: cli)
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -281,6 +264,16 @@ final class AnalysisRunner {
             return
         }
         if status != 0 {
+            // Codex says why in its event stream and puts startup noise on
+            // stderr (a models-cache warning it prints on healthy runs too), so
+            // the exit code plus stderr is the least informative thing we have.
+            // Prefer the stream whenever it carried an error.
+            if request.engine == .codex,
+               let streamed = Self.codexStreamError(stdout: stdout) {
+                cleanUp(request.workDir)
+                completion(.failure(.agentError(streamed)))
+                return
+            }
             // Keep workDir for a post-mortem; the temp root is periodically
             // purged by the OS anyway.
             let tail = String(data: stderr.suffix(2000), encoding: .utf8) ?? ""
@@ -289,8 +282,11 @@ final class AnalysisRunner {
             return
         }
 
+        // Parse before cleanUp: Codex writes its final message into a file
+        // inside workDir, so removing the dir first would take the report.
+        let outcome = Self.parseResult(request: request, stdout: stdout)
         cleanUp(request.workDir)
-        completion(Self.parseResult(stdout: stdout))
+        completion(outcome)
     }
 
     private func cleanUp(_ workDir: URL) {
@@ -317,7 +313,15 @@ final class AnalysisRunner {
         let durationMs: Double?
     }
 
-    nonisolated private static func parseResult(stdout: Data)
+    nonisolated private static func parseResult(request: AnalysisRequest, stdout: Data)
+        -> Result<AnalysisOutcome, AnalysisError> {
+        switch request.engine {
+        case .claude: return parseClaudeResult(stdout: stdout)
+        case .codex: return parseCodexResult(request: request, stdout: stdout)
+        }
+    }
+
+    nonisolated private static func parseClaudeResult(stdout: Data)
         -> Result<AnalysisOutcome, AnalysisError> {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -341,5 +345,144 @@ final class AnalysisRunner {
             numTurns: res.numTurns,
             durationSec: res.durationMs.map { $0 / 1000 },
             parsedJSON: true))
+    }
+
+    // MARK: - Codex event stream
+
+    // `codex exec --json` streams one JSON object per line:
+    //   {"type":"thread.started","thread_id":"…"}
+    //   {"type":"turn.started"}
+    //   {"type":"item.completed","item":{"type":"agent_message","text":"…"}}
+    //   {"type":"turn.completed","usage":{"input_tokens":…,"cached_input_tokens":…,
+    //                                     "output_tokens":…,"reasoning_output_tokens":…}}
+    // The report itself comes from --output-last-message rather than the last
+    // agent_message: it survives a stream shape change, and reasoning-only
+    // turns don't shift which message is "last".
+    nonisolated private struct CodexEvent: Decodable {
+        struct Item: Decodable {
+            let type: String?
+            let text: String?
+        }
+        struct Usage: Decodable {
+            let inputTokens: Int64?
+            let cachedInputTokens: Int64?
+            let outputTokens: Int64?
+            let reasoningOutputTokens: Int64?
+        }
+        struct Failure: Decodable {
+            let message: String?
+        }
+        let type: String?
+        let threadId: String?
+        let item: Item?
+        let usage: Usage?
+        // Why a run failed: an `error` event carries the message at the top
+        // level, `turn.failed` puts it under `error`. Both are emitted, and the
+        // process exits non-zero — but its stderr holds only startup noise, so
+        // this stream is the only place the actual reason appears.
+        let message: String?
+        let error: Failure?
+    }
+
+    nonisolated private static func parseCodexResult(request: AnalysisRequest, stdout: Data)
+        -> Result<AnalysisOutcome, AnalysisError> {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let raw = String(data: stdout, encoding: .utf8) ?? ""
+
+        var threadId: String?
+        var lastMessage: String?
+        var usage: CodexEvent.Usage?
+        var turns = 0
+        let errorMessage = codexStreamError(stdout: stdout)
+        var sawEvent = false
+
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let data = line.data(using: .utf8),
+                  let event = try? decoder.decode(CodexEvent.self, from: data)
+            else { continue }   // Codex prefixes some lines with plain log text.
+            sawEvent = true
+            switch event.type {
+            case "thread.started": threadId = event.threadId ?? threadId
+            case "turn.completed":
+                turns += 1
+                usage = event.usage ?? usage
+            case "item.completed":
+                if event.item?.type == "agent_message", let text = event.item?.text {
+                    lastMessage = text
+                }
+            default: break
+            }
+        }
+
+        if let errorMessage {
+            return .failure(.agentError(errorMessage))
+        }
+
+        // The file is authoritative; the stream is the fallback.
+        let fromFile = request.engine.lastMessageURL(in: request.workDir)
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        let markdown = (fromFile ?? lastMessage ?? raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if markdown.isEmpty {
+            return .failure(.agentError("Codex produced no report."))
+        }
+        return .success(AnalysisOutcome(
+            markdown: markdown,
+            costUSD: usage.map { cost(of: $0, model: request.model) },
+            agentSessionId: threadId,
+            numTurns: turns > 0 ? turns : nil,
+            durationSec: nil,
+            // False when nothing decoded as an event — the body is then raw
+            // output, which is exactly what the flag means for Claude too.
+            parsedJSON: sawEvent && fromFile != nil))
+    }
+
+    // The reason a Codex run failed, if its stream carried one. Separate from
+    // the full parse because it is needed on both paths: a run can fail with a
+    // non-zero exit, or announce the failure and still exit 0.
+    nonisolated private static func codexStreamError(stdout: Data) -> String? {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let raw = String(data: stdout, encoding: .utf8) ?? ""
+        var found: String?
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let data = line.data(using: .utf8),
+                  let event = try? decoder.decode(CodexEvent.self, from: data),
+                  event.type == "error" || event.type == "turn.failed"
+            else { continue }
+            if let message = event.message ?? event.error?.message, !message.isEmpty {
+                found = unwrapCodexError(message)
+            }
+        }
+        return found
+    }
+
+    // Codex hands the upstream API error through verbatim, so the message is
+    // itself a JSON document: {"type":"error","status":400,"error":{"message":…}}.
+    // Shown raw it is a wall of escaped braces, and the one sentence that tells
+    // the user what to do ("that model needs a newer Codex") is buried in it.
+    nonisolated private static func unwrapCodexError(_ message: String) -> String {
+        guard let data = message.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let inner = obj["error"] as? [String: Any],
+              let text = inner["message"] as? String, !text.isEmpty
+        else { return message }
+        return text
+    }
+
+    // Codex reports cumulative input with cache reads folded in, the same shape
+    // the index already normalises, so the split is done the same way here.
+    // The CLI names models without a vendor prefix; the pricing table keys on
+    // one, hence `openai-`.
+    nonisolated private static func cost(of usage: CodexEvent.Usage, model: String) -> Double {
+        let total = max(0, usage.inputTokens ?? 0)
+        let cacheRead = min(total, max(0, usage.cachedInputTokens ?? 0))
+        let input = total - cacheRead
+        let output = max(0, usage.outputTokens ?? 0) + max(0, usage.reasoningOutputTokens ?? 0)
+        let p = SessionIndex.pricing(for: model.hasPrefix("openai-") ? model : "openai-" + model)
+        return (Double(input) * p.input
+            + Double(cacheRead) * p.cacheRead
+            + Double(output) * p.output) / 1_000_000
     }
 }

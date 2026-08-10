@@ -154,6 +154,506 @@ final class TokenChartView: NSView {
     var session5hStarts: [Date] = [] { didSet { needsDisplay = true } }
     var weeklyStarts: [Date] = [] { didSet { needsDisplay = true } }
 
+    // MARK: - Time-range brush
+
+    // Dragging across the chart asks "who was working then". This is the only
+    // time axis over the whole fleet, so the answer comes from the buckets
+    // already drawn rather than from any new scan: a session is in the range
+    // if it billed tokens in a bucket the range touches, which is exactly the
+    // segments the drag covered.
+    struct Selection {
+        let range: ClosedRange<Date>
+        let sessionIds: Set<String>
+    }
+
+    // Called on every committed change: a finished drag, an edge move, or a
+    // click that clears (nil).
+    var onSelectionChange: ((Selection?) -> Void)?
+
+    // A click on the chart that was not a drag. Kept separate from
+    // onSelectionChange(nil), which also fires when the range is dropped for
+    // reasons the user did not click for — switching the chart away from
+    // tokens, say. Only the click means "clear what I am looking through",
+    // and only it should reach the table's selection.
+    var onBackgroundClick: (() -> Void)?
+
+    // Buckets are keyed by session id (or by cwd when grouping by directory),
+    // and neither is readable. The controller owns the index, so it names them;
+    // an unknown key falls back to itself rather than vanishing from the list.
+    var seriesLabel: ((String) -> String)?
+
+    private(set) var selection: ClosedRange<Date>?
+    // Live drag state, in epoch seconds; nil when not dragging.
+    private var dragAnchor: TimeInterval?
+    private var dragCurrent: TimeInterval?
+    private var dragStartX: CGFloat?
+    // Whether the press has travelled far enough to count as a range drag.
+    // Until it has, the in-flight range is held but never drawn.
+    private var dragArmed = false
+    // A drag shorter than this is a click, and a click clears.
+    // A press only becomes a range drag once it has travelled this far. Below
+    // it nothing is drawn and nothing is committed, so a plain click on the
+    // chart stays a click — the gesture people use to clear things — instead of
+    // flashing a one-pixel range under the cursor.
+    private static let dragThreshold: CGFloat = 10
+    // How close to an edge you must press to move it instead of starting over.
+    private static let edgeGrab: CGFloat = 6
+
+    // Everything outside the range is dimmed rather than the inside tinted, so
+    // the bars that matter keep their real per-session colours.
+    private static let dimColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(white: 0, alpha: 0.5)
+            : NSColor(white: 1, alpha: 0.62)
+    }
+
+    private static let rangeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("MMMd HH:mm")
+        return f
+    }()
+
+    private var windowStartEpoch: TimeInterval {
+        let end = windowEnd == .distantPast ? Date() : windowEnd
+        return end.timeIntervalSince1970 - config.windowSeconds
+    }
+
+    private func epoch(atX x: CGFloat) -> TimeInterval {
+        let r = plotRect
+        let frac = Double(min(max(x - r.minX, 0), r.width) / max(r.width, 1))
+        return windowStartEpoch + frac * config.windowSeconds
+    }
+
+    private func x(forEpoch epoch: TimeInterval) -> CGFloat {
+        let r = plotRect
+        let frac = (epoch - windowStartEpoch) / config.windowSeconds
+        return r.minX + CGFloat(min(max(frac, 0), 1)) * r.width
+    }
+
+    // Sessions that billed tokens in a bucket the range touches. Bucket
+    // granularity is the chart's own, so the answer can never disagree with
+    // the bars the drag covered.
+    private func sessionIds(inEpochs range: ClosedRange<TimeInterval>) -> Set<String> {
+        let slot = config.bucketSeconds
+        guard slot > 0 else { return [] }
+        let origin = windowStartEpoch
+        var ids: Set<String> = []
+        for (i, bucket) in buckets.enumerated() {
+            let start = origin + Double(i) * slot
+            guard start + slot > range.lowerBound, start < range.upperBound else { continue }
+            ids.formUnion(bucket.bySession.keys)
+        }
+        return ids
+    }
+
+    func clearSelection() {
+        guard selection != nil else { return }
+        commitSelection(nil)
+    }
+
+    private func commitSelection(_ range: ClosedRange<Date>?) {
+        selection = range
+        needsDisplay = true
+        onSelectionChange?(range.map {
+            Selection(range: $0,
+                      sessionIds: sessionIds(inEpochs: $0.lowerBound.timeIntervalSince1970
+                                                     ... $0.upperBound.timeIntervalSince1970))
+        })
+    }
+
+    // Which bar the pointer is over, if it is over one with anything in it.
+    // The panel is drawn by the chart rather than handed to the system tooltip:
+    // it has to appear at once and sit beside the bar it describes, while a
+    // tooltip arrives after a delay wherever the pointer happens to be.
+    private var hoverIndex: Int? {
+        didSet { if hoverIndex != oldValue { needsDisplay = true } }
+    }
+
+    private func refreshHoverTracking() {
+        trackingAreas.forEach(removeTrackingArea)
+        guard hasData else { hoverIndex = nil; return }
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Only over the plot, and not while a drag is in flight — the range's
+        // own caption already sits in that corner.
+        guard hasData, dragAnchor == nil, plotRect.contains(point) else {
+            hoverIndex = nil
+            return
+        }
+        hoverIndex = bucketIndex(atX: point.x)
+            .flatMap { breakdown(at: $0).isEmpty ? nil : $0 }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverIndex = nil
+    }
+
+    // Bars are a few pixels wide and stack several sessions, so the numbers
+    // behind one are unreadable by eye. The tooltip answers for the bar under
+    // the pointer, in whatever the chart is currently measuring — asking about
+    // tokens while it draws cost would be a different chart's answer.
+    // Lines for one bar: a heading with its interval and total, then the
+    // sessions stacked inside it. Empty when the bar holds nothing.
+    // One line of the hover panel. `key` is the series it belongs to — nil for
+    // the heading and the "+N more" tail, which stand for no single colour.
+    private struct Row {
+        let key: String?
+        // The number this row is about. Carried apart from the label so the
+        // panel can lead with it and align it into a column — the figures are
+        // what the panel is read for, and a ragged left edge buries them.
+        let value: String?
+        let text: String
+    }
+
+    private func breakdown(at index: Int) -> [Row] {
+        guard buckets.indices.contains(index) else { return [] }
+        let slot = config.bucketSeconds
+        let start = windowStartEpoch
+        let bucket = buckets[index]
+
+        let from = Date(timeIntervalSince1970: start + Double(index) * slot)
+        let to = from.addingTimeInterval(slot)
+        let when = "\(Self.rangeFormatter.string(from: from)) – \(Self.timeOnlyFormatter.string(from: to))"
+
+        // The stack is what the bar is: one segment per session (or project).
+        // Its height alone cannot say which of them spent the tokens, and that
+        // is the question a bar this wide actually raises.
+        let parts: [(key: String, text: String, weight: Double)]
+        switch mode {
+        case .tokens:
+            parts = bucket.bySession.map {
+                ($0.key, "\(Self.formatTokenCount($0.value)) tokens", Double($0.value))
+            }
+        case .cost:
+            parts = bucket.bySessionCost.map {
+                ($0.key, Self.formatCostLabel($0.value), $0.value)
+            }
+        case .lines:
+            let keys = Set(bucket.bySessionAdded.keys).union(bucket.bySessionRemoved.keys)
+            parts = keys.map { key in
+                let added = bucket.bySessionAdded[key] ?? 0
+                let removed = bucket.bySessionRemoved[key] ?? 0
+                // Both directions: at this width a bar of deletions reads the
+                // same as one of additions.
+                return (key, "+\(added) / −\(removed)", Double(added + removed))
+            }
+        }
+
+        let total: String
+        switch mode {
+        case .tokens: total = "\(Self.formatTokenCount(bucket.total)) tokens"
+        case .cost: total = Self.formatCostLabel(bucket.totalCost)
+        case .lines: total = "+\(bucket.totalAdded) / −\(bucket.totalRemoved) lines"
+        }
+
+        let ranked = parts.filter { $0.weight > 0 }.sorted { $0.weight > $1.weight }
+        guard !ranked.isEmpty else { return [] }
+
+        // The key travels with the line so the panel can carry each row's own
+        // swatch. Without it the reader has to match a name to a colour by
+        // guessing, which is the whole thing a stacked bar makes hard.
+        // The heading goes through the same value column as the rows, so the
+        // bar's total sits above the figures that add up to it.
+        var lines: [Row] = [Row(key: nil, value: total, text: when)]
+        for part in ranked.prefix(Self.hoverRows) {
+            lines.append(Row(key: part.key, value: part.text,
+                             text: seriesLabel?(part.key) ?? part.key))
+        }
+        // The tail is summed rather than merely counted: "+12 more" without a
+        // figure leaves the rows visible not adding up to the total, and no way
+        // to tell whether the rest is a rounding error or half the bar.
+        let tail = ranked.dropFirst(Self.hoverRows).map(\.key)
+        if !tail.isEmpty {
+            lines.append(Row(key: nil, value: aggregate(of: tail, in: bucket),
+                             text: "+\(tail.count) more"))
+        }
+        return lines
+    }
+
+    private static let hoverRows = 5
+
+    // What the folded-away series add up to, in the units on screen. Summed
+    // from the bucket rather than from the formatted rows, so it stays exact.
+    private func aggregate(of keys: [String], in bucket: BucketData) -> String {
+        switch mode {
+        case .tokens:
+            let n = keys.reduce(Int64(0)) { $0 + (bucket.bySession[$1] ?? 0) }
+            return "\(Self.formatTokenCount(n)) tokens"
+        case .cost:
+            return Self.formatCostLabel(keys.reduce(0) { $0 + (bucket.bySessionCost[$1] ?? 0) })
+        case .lines:
+            let added = keys.reduce(Int64(0)) { $0 + (bucket.bySessionAdded[$1] ?? 0) }
+            let removed = keys.reduce(Int64(0)) { $0 + (bucket.bySessionRemoved[$1] ?? 0) }
+            return "+\(added) / −\(removed)"
+        }
+    }
+
+    // Marks which bar the panel is about. Drawn with the background bands and
+    // before the bars, so the column stays on top of its own marker — a line
+    // painted over a bar hides the very thing being described.
+    private func drawHoverGuide(in plotRect: NSRect) {
+        guard let index = hoverIndex else { return }
+        // Rounded to the pixel grid: a half-pixel line renders as two grey ones
+        // and reads as misaligned however exact the maths was.
+        let barX = barCenterX(index, in: plotRect)
+        NSColor.labelColor.withAlphaComponent(0.35).setFill()
+        NSRect(x: (barX - 0.5).rounded(), y: plotRect.minY,
+               width: 1, height: plotRect.height).fill()
+    }
+
+    // The breakdown panel, beside the bar it belongs to. Same materials as the
+    // range caption above it — translucent window background, 3 pt corners —
+    // so it reads as part of the chart rather than a system popover.
+    private func drawHoverPanel(in plotRect: NSRect) {
+        guard let index = hoverIndex else { return }
+        let rows = breakdown(at: index)
+        guard !rows.isEmpty else { return }
+
+        let headAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        // The value carries the weight; the name is context for it.
+        let valueAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let labelAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let values = rows.map { row in
+            row.value.map { NSAttributedString(string: $0, attributes: valueAttrs) }
+        }
+        let texts = rows.enumerated().map { i, row in
+            NSAttributedString(string: row.text,
+                               attributes: i == 0 ? headAttrs : labelAttrs)
+        }
+
+        let padding: CGFloat = 6
+        let leading: CGFloat = 2
+        // Every row is indented by the swatch column, heading included, so the
+        // text starts on one line down the panel.
+        let swatch: CGFloat = 7
+        let swatchGap: CGFloat = 5
+        let valueGap: CGFloat = 8
+        let textInset = swatch + swatchGap
+        // Values share one right-aligned column, so the eye runs down the
+        // numbers instead of hunting for them at the end of each name.
+        let valueWidth = values.compactMap { $0?.size().width }.max() ?? 0
+        let valueColumn = valueWidth > 0 ? valueWidth + valueGap : 0
+        let bodyWidth = zip(rows, texts).map { row, text in
+            (row.value == nil ? 0 : valueColumn) + text.size().width
+        }.max() ?? 0
+        let width = bodyWidth + 2 * padding + textInset
+        let lineHeight = (texts.first?.size().height ?? 11) + leading
+        let height = lineHeight * CGFloat(texts.count) + 2 * padding - leading
+
+        // Prefer the right of the bar; flip to its left when that would run off
+        // the plot, so the panel never covers the axis or leaves the view.
+        let barX = barCenterX(index, in: plotRect)
+        var origin = NSPoint(x: barX + 8, y: plotRect.maxY - height)
+        if origin.x + width > plotRect.maxX { origin.x = barX - 8 - width }
+        origin.x = min(max(origin.x, plotRect.minX), max(plotRect.minX, plotRect.maxX - width))
+        origin.y = max(origin.y, plotRect.minY)
+
+        let box = NSRect(origin: origin, size: NSSize(width: width, height: height))
+        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+        NSColor.separatorColor.setStroke()
+        NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), xRadius: 3, yRadius: 3).stroke()
+
+
+        var y = box.maxY - padding
+        let textX = box.minX + padding + textInset
+        for (i, row) in rows.enumerated() {
+            let text = texts[i]
+            y -= lineHeight
+            // The same colour the segment is drawn in, from the same function —
+            // a legend that could drift from the bars would be worse than none.
+            if let key = row.key {
+                let chip = NSRect(x: box.minX + padding,
+                                  y: y + (text.size().height - swatch) / 2,
+                                  width: swatch, height: swatch)
+                Self.color(for: key).setFill()
+                NSBezierPath(roundedRect: chip, xRadius: 1.5, yRadius: 1.5).fill()
+            }
+            if let value = values[i] {
+                value.draw(at: NSPoint(x: textX + valueWidth - value.size().width, y: y))
+                text.draw(at: NSPoint(x: textX + valueColumn, y: y))
+            } else {
+                text.draw(at: NSPoint(x: textX, y: y))
+            }
+        }
+    }
+
+    // Middle of the bar, computed the way the bars themselves are laid out
+    // (slot per bucket, 1 pt gap) rather than from the time axis — the axis
+    // maps a bucket's *start*, which put the marker on the bar's left edge.
+    private func barCenterX(_ index: Int, in plotRect: NSRect) -> CGFloat {
+        let slot = plotRect.width / CGFloat(max(buckets.count, 1))
+        return plotRect.minX + CGFloat(index) * slot + max(1, slot - 1) / 2
+    }
+
+    private func bucketIndex(atX x: CGFloat) -> Int? {
+        let index = Int((epoch(atX: x) - windowStartEpoch) / config.bucketSeconds)
+        return buckets.indices.contains(index) ? index : nil
+    }
+
+    // The end of a bucket only needs its time: the date is already in the start.
+    private static let timeOnlyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("HH:mm")
+        return f
+    }()
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        refreshHoverTracking()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard hasData else { return }
+        addCursorRect(plotRect, cursor: .crosshair)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let r = plotRect
+        guard hasData, r.width > 30,
+              point.x >= r.minX - Self.edgeGrab, point.x <= r.maxX + Self.edgeGrab,
+              point.y >= r.minY, point.y <= r.maxY
+        else { super.mouseDown(with: event); return }
+
+        dragStartX = point.x
+        // Pressing near an edge of the current range moves that edge, anchoring
+        // the drag on the opposite one.
+        if let selection {
+            let low = x(forEpoch: selection.lowerBound.timeIntervalSince1970)
+            let high = x(forEpoch: selection.upperBound.timeIntervalSince1970)
+            // Grabbing an edge is unambiguous — there is a range on screen and
+            // the cursor is on its handle — so it arms at once and the edge
+            // tracks the pointer from the first pixel.
+            if abs(point.x - low) <= Self.edgeGrab {
+                dragAnchor = selection.upperBound.timeIntervalSince1970
+                dragCurrent = epoch(atX: point.x)
+                dragArmed = true
+                needsDisplay = true
+                return
+            }
+            if abs(point.x - high) <= Self.edgeGrab {
+                dragAnchor = selection.lowerBound.timeIntervalSince1970
+                dragCurrent = epoch(atX: point.x)
+                dragArmed = true
+                needsDisplay = true
+                return
+            }
+        }
+        // A fresh press is still just a press: remember where it started, draw
+        // nothing, and let mouseDragged decide whether it becomes a range.
+        dragAnchor = epoch(atX: point.x)
+        dragCurrent = dragAnchor
+        dragArmed = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard dragAnchor != nil else { super.mouseDragged(with: event); return }
+        let x = convert(event.locationInWindow, from: nil).x
+        if !dragArmed {
+            guard let startX = dragStartX,
+                  abs(x - startX) >= Self.dragThreshold
+            else { return }
+            dragArmed = true
+        }
+        dragCurrent = epoch(atX: x)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let anchor = dragAnchor else { super.mouseUp(with: event); return }
+        let point = convert(event.locationInWindow, from: nil)
+        let armed = dragArmed
+        dragAnchor = nil
+        dragCurrent = nil
+        dragStartX = nil
+        dragArmed = false
+        // Never travelled far enough to be a range, so it was a click — and a
+        // click clears. One test, the same one that decides whether to draw.
+        if !armed {
+            commitSelection(nil)
+            onBackgroundClick?()
+            return
+        }
+        let current = epoch(atX: point.x)
+        commitSelection(Date(timeIntervalSince1970: min(anchor, current))
+                        ... Date(timeIntervalSince1970: max(anchor, current)))
+    }
+
+    private func drawSelection(in plotRect: NSRect) {
+        let active: ClosedRange<TimeInterval>?
+        // Only an armed drag paints; an unarmed one is still a click in
+        // progress and must leave the chart exactly as it was.
+        if dragArmed, let anchor = dragAnchor, let current = dragCurrent {
+            active = min(anchor, current)...max(anchor, current)
+        } else if let selection {
+            active = selection.lowerBound.timeIntervalSince1970
+                ... selection.upperBound.timeIntervalSince1970
+        } else {
+            active = nil
+        }
+        guard let active else { return }
+
+        let x0 = x(forEpoch: active.lowerBound)
+        let x1 = max(x(forEpoch: active.upperBound), x0 + 1)
+
+        Self.dimColor.setFill()
+        NSRect(x: plotRect.minX, y: plotRect.minY,
+               width: x0 - plotRect.minX, height: plotRect.height).fill()
+        NSRect(x: x1, y: plotRect.minY,
+               width: plotRect.maxX - x1, height: plotRect.height).fill()
+
+        NSColor.controlAccentColor.setFill()
+        NSRect(x: x0, y: plotRect.minY, width: 1, height: plotRect.height).fill()
+        NSRect(x: x1 - 1, y: plotRect.minY, width: 1, height: plotRect.height).fill()
+
+        let count = sessionIds(inEpochs: active).count
+        let span = active.upperBound - active.lowerBound
+        let text = Self.rangeFormatter.string(from: Date(timeIntervalSince1970: active.lowerBound))
+            + " – "
+            + Self.rangeFormatter.string(from: Date(timeIntervalSince1970: active.upperBound))
+            + " · " + Self.spanLabel(span)
+            + " · \(count) session" + (count == 1 ? "" : "s")
+        let label = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        let size = label.size()
+        let padding: CGFloat = 5
+        var box = NSRect(x: (x0 + x1) / 2 - size.width / 2 - padding,
+                         y: plotRect.maxY - size.height - 2 * padding,
+                         width: size.width + 2 * padding,
+                         height: size.height + padding)
+        box.origin.x = min(max(box.minX, plotRect.minX), plotRect.maxX - box.width)
+        NSColor.windowBackgroundColor.withAlphaComponent(0.92).setFill()
+        NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+        label.draw(at: NSPoint(x: box.minX + padding, y: box.minY + padding / 2))
+    }
+
+    private static func spanLabel(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        if hours > 0 { return minutes > 0 ? "\(hours)h \(minutes)m" : "\(hours)h" }
+        return "\(minutes)m"
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -170,6 +670,13 @@ final class TokenChartView: NSView {
         self.windowEnd = windowEnd
         self.hasData = true
         needsDisplay = true
+        // Cursor rects are computed once and cached by the window. The chart is
+        // still empty when that first happens — the buckets are folded on a
+        // background queue — so without asking for a recount here the crosshair
+        // never appears at all. Tooltip rects are cached the same way and are
+        // gated on the same `hasData`.
+        window?.invalidateCursorRects(for: self)
+        refreshHoverTracking()
     }
 
     // Switch back to the "Computing…" placeholder until the next
@@ -178,7 +685,27 @@ final class TokenChartView: NSView {
         self.config = Self.currentConfig()
         self.hasData = false
         self.buckets = Array(repeating: BucketData(), count: config.bucketCount)
+        // The brush answers a question about buckets that are about to be
+        // thrown away; keeping it would filter the table by a stale set.
+        clearSelection()
         needsDisplay = true
+        // And back to an arrow, with nothing to describe, while there is
+        // nothing to brush.
+        window?.invalidateCursorRects(for: self)
+        refreshHoverTracking()
+    }
+
+    // The rect is in view coordinates, so every geometry change invalidates it:
+    // the chart spans the window's width and its height switches with the
+    // Details chart, and a stale rect leaves the crosshair over the wrong band.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: - Palette
@@ -223,6 +750,15 @@ final class TokenChartView: NSView {
     private static let topMargin: CGFloat = 6
     private static let bottomMargin: CGFloat = 16
 
+    private var plotRect: NSRect {
+        NSRect(
+            x: Self.leftMargin,
+            y: Self.bottomMargin,
+            width: bounds.width - Self.leftMargin - Self.rightMargin,
+            height: bounds.height - Self.topMargin - Self.bottomMargin
+        )
+    }
+
     // Each 5h session window is shaded as a faint, semi-transparent
     // grey band (adaptive: a touch of black in light mode, of white in
     // dark) rather than a marker line.
@@ -234,15 +770,17 @@ final class TokenChartView: NSView {
     private static let tickFont = NSFont.systemFont(ofSize: 9)
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-
-        let plotRect = NSRect(
-            x: Self.leftMargin,
-            y: Self.bottomMargin,
-            width: bounds.width - Self.leftMargin - Self.rightMargin,
-            height: bounds.height - Self.topMargin - Self.bottomMargin
-        )
+        let plotRect = self.plotRect
         guard plotRect.width > 30 && plotRect.height > 20 else { return }
+        drawChart(in: plotRect)
+        // Last, over every variant of the chart body — each of which returns
+        // early on its own placeholder path.
+        drawSelection(in: plotRect)
+        drawHoverPanel(in: plotRect)
+    }
+
+    private func drawChart(in plotRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
         // Axis lines: bottom (X) + left (Y).
         ctx.saveGState()
@@ -293,6 +831,7 @@ final class TokenChartView: NSView {
 
         // Markers first → bars paint over them (lines sit under bars).
         drawWindowMarkers(in: plotRect)
+        drawHoverGuide(in: plotRect)
 
         let gap: CGFloat = 1
         let slot = plotRect.width / CGFloat(buckets.count)
@@ -415,6 +954,7 @@ final class TokenChartView: NSView {
         // Markers first → the bars paint over the lines (lines sit under
         // the bars; the baseline notches stay visible below them).
         drawWindowMarkers(in: plotRect)
+        drawHoverGuide(in: plotRect)
 
         let count = buckets.count
         let gap: CGFloat = 1
@@ -738,7 +1278,8 @@ final class TokenChartView: NSView {
         return out
     }
 
-    static func computeBuckets(completion: @escaping ([BucketData], Date) -> Void) {
+    static func computeBuckets(externalEntries: [SessionIndexEntry] = [],
+                               completion: @escaping ([BucketData], Date) -> Void) {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let projectsDir = home
             .appending(path: ".claude/projects", directoryHint: .isDirectory)
@@ -759,6 +1300,10 @@ final class TokenChartView: NSView {
         let windowStart = windowEnd.addingTimeInterval(-cfg.windowSeconds)
         let bucketCount = cfg.bucketCount
 
+        // Deliberately NOT staged. The chart keys its series by session id, and
+        // the demo entries keep the real ones, so the ordinary fold already
+        // draws the real thing — including the nights and the gaps between
+        // sessions that any synthesised version smears over.
         WorkScheduler.shared.run(.init(id: "chart-buckets", priority: .interactive, deferrable: false)) {
             let fm = FileManager.default
             var counts = Array(repeating: BucketData(), count: bucketCount)
@@ -938,6 +1483,80 @@ final class TokenChartView: NSView {
                 }
             }
 
+            // Custom sources are already local snapshots. Fold their files
+            // after the built-in roots so the aggregate chart includes the
+            // same fleet as the table without ever touching a mounted path.
+            for entry in externalEntries where entry.isExternalSource {
+                guard entry.provider != .claudeDesktop,
+                      let jsonl = SessionIndexer.transcriptURL(for: entry),
+                      let attrs = try? fm.attributesOfItem(atPath: jsonl.path),
+                      let mtime = attrs[.modificationDate] as? Date,
+                      let size = (attrs[.size] as? NSNumber)?.int64Value,
+                      mtime >= windowStart else { continue }
+                let path = jsonl.path
+                guard !visited.contains(path) else { continue }
+                visited.insert(path)
+
+                var cached: CachedFile
+                if let existing = fileCache[path], existing.parsedSize == size,
+                   existing.mtime == mtime {
+                    cached = existing
+                } else if var existing = fileCache[path], size > existing.parsedSize {
+                    switch entry.provider {
+                    case .claude:
+                        existing.parsedSize = parseClaudePoints(
+                            at: jsonl, fromOffset: existing.parsedSize,
+                            decoder: decoder, fallbackSessionId: entry.sessionId,
+                            notBefore: windowStartEpoch,
+                            seenRequestIds: &existing.seenRequestIds, into: &existing.points)
+                    case .codex:
+                        existing.parsedSize = parseCodexPoints(
+                            at: jsonl, fromOffset: existing.parsedSize,
+                            decoder: decoder, fallbackSessionId: entry.sessionId,
+                            notBefore: windowStartEpoch, cache: &existing)
+                    case .claudeDesktop: break
+                    }
+                    existing.mtime = mtime
+                    cached = existing
+                } else {
+                    var fresh = CachedFile(
+                        parsedSize: 0, mtime: mtime, points: [], seenRequestIds: [],
+                        codexLastUsage: nil, codexModel: nil, codexCwd: nil,
+                        codexSessionId: nil)
+                    switch entry.provider {
+                    case .claude:
+                        fresh.parsedSize = parseClaudePoints(
+                            at: jsonl, fromOffset: 0, decoder: decoder,
+                            fallbackSessionId: entry.sessionId,
+                            notBefore: windowStartEpoch,
+                            seenRequestIds: &fresh.seenRequestIds, into: &fresh.points)
+                    case .codex:
+                        fresh.parsedSize = parseCodexPoints(
+                            at: jsonl, fromOffset: 0, decoder: decoder,
+                            fallbackSessionId: entry.sessionId,
+                            notBefore: windowStartEpoch, cache: &fresh)
+                    case .claudeDesktop: break
+                    }
+                    cached = fresh
+                }
+
+                cached.points.removeAll { $0.ts < windowStartEpoch }
+                fileCache[path] = cached
+                for point in cached.points where point.ts <= windowEndEpoch {
+                    var idx = Int((point.ts - windowStartEpoch) / bucketSize)
+                    if idx < 0 { idx = 0 }
+                    if idx >= bucketCount { idx = bucketCount - 1 }
+                    let cwd = point.cwd ?? cached.codexCwd ?? entry.cwd
+                    let foldTemporary = !includeTemporary
+                        && (cwd.hasPrefix("/private/tmp/") || cwd.hasPrefix("/private/var/"))
+                    let key = foldTemporary ? Self.temporaryKey
+                        : (groupByDir ? cwd : point.sessionId)
+                    counts[idx].add(
+                        sessionId: key, tokens: point.tokens, cost: point.cost,
+                        linesAdded: point.linesAdded, linesRemoved: point.linesRemoved)
+                }
+            }
+
             // Deleted files / files whose mtime left the window.
             fileCache = fileCache.filter { visited.contains($0.key) }
 
@@ -998,8 +1617,11 @@ final class TokenChartView: NSView {
             guard epoch >= windowStartEpoch else { return }
             var added: Int64 = 0
             var removed: Int64 = 0
+            // Claude Code 2.1 stopped labelling Edit results: an update now
+            // carries oldString / newString / structuredPatch and no `type` at
+            // all. Older transcripts still say "update", so both shapes count.
             switch result.type {
-            case "update":
+            case "update", nil:
                 for hunk in result.structuredPatch ?? [] {
                     for line in hunk.lines ?? [] {
                         if line.hasPrefix("+") { added += 1 }

@@ -6,7 +6,7 @@ observable signs** mean the case is covered.
 
 Related technical docs: [`file-io.md`](file-io.md) (what we read and write),
 [`insights-lab.md`](insights-lab.md) (the analytics layer),
-[`agterm.md`](agterm.md), [`homebrew.md`](homebrew.md).
+[`agterm.md`](agterm.md).
 
 ## How to read and extend this file
 
@@ -99,7 +99,7 @@ without checking tabs.
 
 ### Requirement: Show the fleet in the menu bar
 
-The app SHALL draw the fleet in the menu bar as six fixed slots, one slot per
+The app SHALL draw the fleet in the menu bar as five fixed slots, one slot per
 session that is busy or needs the operator, so what the machine is doing is
 readable at a glance and the chart never changes width.
 
@@ -114,14 +114,14 @@ readable at a glance and the chart never changes width.
 - **THEN** it takes no slot
 
 #### Scenario: More sessions than slots
-- **GIVEN** more than six sessions want a slot
+- **GIVEN** more than five sessions want a slot
 - **WHEN** the chart is drawn
 - **THEN** the slots go to the sessions that need attention first, and the rest are dropped
 - **AND** the status-bar menu still lists every session that needs attention
 
 #### Scenario: Nothing is happening
 - **WHEN** no session is busy or waiting on the operator
-- **THEN** all six slots are faint and nothing animates
+- **THEN** all five slots are faint and nothing animates
 
 ### Requirement: Signal a pending prompt
 
@@ -137,16 +137,40 @@ without the operator switching to the terminal tab.
 - **WHEN** a session finishes a step and waits on the operator
 - **THEN** its bar turns amber, stops scrolling and blinks at 0.5 Hz
 
+#### Scenario: An API failure ends a turn
+- **WHEN** Claude or Codex ends a turn with a terminal API or stream error
+- **THEN** its bar turns amber, stops scrolling and blinks at 0.5 Hz
+- **AND** the dropdown lists it under `Needs attention` with a yellow Error icon
+- **AND** opening the session through EpiScope acknowledges that alarm like a finished step
+
 #### Scenario: Nothing is waiting any more
 - **WHEN** the last waiting session is served
 - **THEN** its bar stops blinking and goes back to scrolling
 
 #### Scenario: The fleet dropdown
 - **WHEN** the operator opens the status-bar menu
-- **THEN** `Needs attention` lists every blocking request and finished step
-- **AND** `Active` lists every busy session, including sessions beyond the six visible slots
-- **AND** every session has a coloured circular state icon: blue play for active, yellow checkmark for turn end, red exclamation mark for permission or question requests
+- **THEN** `Needs attention` lists every blocking request, finished step and failed turn
+- **AND** `Active` lists every busy session, including sessions beyond the five visible slots
+- **AND** every session has a coloured circular state icon: blue six-section donut loader for active, yellow checkmark for turn end, yellow exclamation mark for Error, red exclamation mark for permission or question requests
+- **AND** each row shows the AI-generated task description on its first line
+- **AND** its second line shows the project directory name and time since the last status change
+- **AND** no text duplicates the status already conveyed by the icon
+- **AND** long text truncates instead of widening the menu beyond the limit gauges
 - **AND** the menu shows `No active sessions` when neither section has entries
+
+#### Scenario: A Claude Desktop session has its own name
+- **GIVEN** a Claude Desktop Code session has a name shown in Claude's sidebar
+- **WHEN** EpiScope shows that session in the fleet dropdown
+- **THEN** the same name is used as its task description
+- **AND** a technical tracker label never replaces it
+
+#### Scenario: The fleet dropdown stays alive while open
+- **GIVEN** the status-bar menu remains open
+- **WHEN** elapsed time advances
+- **THEN** every visible session's `ago` label updates once per second without rebuilding or moving rows
+- **AND** active icons show a large, clearly separated six-section donut whose active section rises through medium and full brightness on consecutive 10 fps ticks
+- **AND** red blocking icons blink at 1 Hz and amber reaction icons blink at 0.5 Hz, matching the menu-bar bars
+- **AND** the animation clock stops as soon as the menu closes
 
 #### Scenario: A session that never prompts
 - **GIVEN** the session runs in `bypassPermissions`, `auto` or `plan` mode
@@ -189,7 +213,7 @@ space on its model, terminal, answer options or notification grouping.
 
 #### Scenario: An AI description exists
 - **GIVEN** the session index has an AI-generated description
-- **WHEN** EpiScope posts a `Finished` or `Needs permission` notification
+- **WHEN** EpiScope posts a `Finished`, `Error` or `Needs permission` notification
 - **THEN** the first body line starts with `✨ ` and contains that description
 - **AND** whitespace is collapsed and descriptions longer than 36 Unicode characters are truncated with `…`
 - **AND** a blocking request's state message follows on a new line
@@ -200,11 +224,16 @@ space on its model, terminal, answer options or notification grouping.
 - **THEN** the title is `~/tmp · Finished`
 - **AND** the body does not repeat `Finished` or say `waiting for your input`
 
+#### Scenario: An error notification title
+- **WHEN** EpiScope posts a failed-turn notification
+- **THEN** its title ends with ` · Error`
+- **AND** its interruption level is `active`
+
 #### Scenario: No AI description exists
 - **GIVEN** the session index has no AI-generated description
 - **WHEN** EpiScope posts a session notification
 - **THEN** a blocking-request body contains only the state message and no empty context line
-- **AND** a finished notification needs no body because its state is in the title
+- **AND** a finished or failed-turn notification needs no body because its state is in the title
 
 #### Scenario: Finished notification urgency
 - **WHEN** EpiScope posts a finished-step notification
@@ -281,6 +310,36 @@ product only brings the person to the hosting terminal or app.
 The app SHALL bring forward the exact terminal window or tab that hosts the
 session.
 
+#### Scenario: The selected session has a known hosting application
+- **GIVEN** a session is selected in the list or shown in details
+- **AND** EpiScope can resolve the hosting application's icon
+- **WHEN** the operator looks at the session action in the window toolbar
+- **THEN** the action shows that application icon instead of a generic terminal
+- **AND** clicking it opens the session through the same exact-session route
+
+#### Scenario: No hosting application icon is available
+- **GIVEN** the selected row has no resolvable application icon
+- **WHEN** the toolbar shows its placeholder
+- **THEN** the placeholder uses the same square footprint as an application icon
+- **AND** the action does not shift when the selection changes
+
+#### Scenario: Toolbar action icons
+- **WHEN** the operator moves between list and details modes
+- **THEN** every action icon uses the same square footprint
+- **AND** system symbols share one point size and stroke weight
+- **AND** navigation and document actions use the same unfilled outline style
+- **AND** Insights uses the distinct `sparkles` mark rather than a Favorites star
+- **AND** the Insights glyph uses the same animated pearlescent palette as an active-session badge
+- **AND** non-square glyphs are fitted proportionally rather than stretched
+- **AND** custom Refresh and Insights controls use the same square hover container
+
+#### Scenario: Fleet and session toolbar actions
+- **GIVEN** a session is selected in the list
+- **WHEN** the operator looks at the toolbar action groups
+- **THEN** Copy, Messages and Open session app stay in the session group
+- **AND** Insights is grouped with Full Search as a fleet-level action
+- **AND** the custom Insights button has the same circular hover size as adjacent actions
+
 #### Scenario: A terminal with exact binding
 - **GIVEN** the session runs in kitty, iTerm2, Terminal.app, Ghostty or Agterm
 - **WHEN** the operator double-clicks the session row
@@ -292,6 +351,13 @@ session.
 - **THEN** `cc-open` resolves that terminal directly by id and focuses it
 - **AND** Ghostty selects the native tab containing that surface
 - **AND** app activation happens before terminal focus, so Ghostty cannot restore the previously selected tab over the target
+
+#### Scenario: Ghostty sessions share an AI title
+- **GIVEN** two live sessions have the same AI-generated task title
+- **AND** a Ghostty tab title exactly matches one session's live name
+- **WHEN** the tracker assigns that terminal surface
+- **THEN** it binds the surface to the exact live-name match
+- **AND** the other session cannot claim it through the shared AI title
 
 #### Scenario: Ghostty scripting stalls
 - **GIVEN** Ghostty does not complete the focus Apple Event
@@ -307,7 +373,10 @@ session.
 #### Scenario: An IDE terminal
 - **GIVEN** the session runs in a JetBrains IDE terminal
 - **WHEN** the operator opens the session
-- **THEN** the app brings that application forward, because it exposes no per-tab focus API
+- **THEN** the app passes the nearest project root through the running IDE's command-line launcher
+- **AND** the IDE selects the corresponding macOS project tab
+- **AND** it reuses the open project instead of initializing and disposing a duplicate
+- **AND** the app does not attempt to select a terminal tab inside the project
 
 #### Scenario: A previously unknown application host
 - **GIVEN** the session runs inside an application for which EpiScope has no adapter
@@ -324,8 +393,15 @@ session.
 #### Scenario: A session belongs to Claude App
 - **GIVEN** the table identifies a Claude App Code or local-agent session
 - **WHEN** the operator opens it from the table, menu or notification
-- **THEN** the bundled opener follows `claude://code/<session-id>`
+- **THEN** the bundled opener follows that session type's exact Claude deep link
 - **AND** Claude App shows that exact session instead of its last visible one
+
+#### Scenario: A Claude Desktop Code tab mirrors a CLI transcript
+- **GIVEN** the table session id matches `cliSessionId` in Claude Desktop's `claude-code-sessions` metadata
+- **AND** that metadata identifies the tab as `local_<uuid>`
+- **WHEN** the operator opens the session from the table, menu or notification
+- **THEN** EpiScope follows `claude://claude.ai/epitaxy/local_<uuid>`
+- **AND** this works while the session is waiting in plan mode as well as during a normal turn
 
 #### Scenario: Claude local metadata uses two ids
 - **GIVEN** the indexed metadata filename uses `local_<uuid>` and contains a different `cliSessionId`
@@ -353,6 +429,13 @@ session.
 - **WHEN** the operator taps the banner or the menu row for such a session
 - **THEN** the app reveals the session in the table
 - **AND** it does not spawn a stray terminal
+
+#### Scenario: Reveal a detached session while Insights is open
+- **GIVEN** the main window is showing Insights
+- **AND** a session has no terminal or desktop app EpiScope can focus
+- **WHEN** the operator opens that session from the menu or a notification
+- **THEN** the window changes to the session list before it comes forward
+- **AND** the target session is selected without retaining the Insights title or state
 
 ### Requirement: Show details for a dead session
 
@@ -390,7 +473,25 @@ chart.
 #### Scenario: The main window opens
 - **WHEN** the operator opens the main window
 - **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Path, Title, Input, Changes and Last Activity
-- **AND** Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until `Settings → Columns` turns them on
+- **AND** Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
+
+#### Scenario: Dropping every narrowing at once
+- **GIVEN** a dragged range, filter text or a selected session is narrowing the table
+- **WHEN** the operator looks at the rows area
+- **THEN** a `Show all` button floats over it; the count stays in the title bar, which already reads "N of M"
+- **AND** pressing it drops the range, the filter text and the selection together
+- **AND** it is absent whenever there is nothing to undo, so an unfiltered table looks exactly as before
+
+#### Scenario: The table has nothing to show
+- **WHEN** no session survives whatever is narrowing the table
+- **THEN** the rows area says so in place of the rows, and names the narrowing responsible: the dragged range, the filter text, the hidden temporary sessions, or nothing indexed yet
+- **AND** where the narrowing is undone elsewhere, the message says where — a range clears by clicking the chart, temporary sessions come back from Settings
+- **AND** the header, the chart and the layout are untouched: it is a placeholder over the rows, not a row
+
+#### Scenario: Choosing which columns to show
+- **WHEN** the operator right-clicks the table's header
+- **THEN** a menu lists every named column with a tick against the visible ones, and choosing one toggles it
+- **AND** `Settings → Columns` offers the same list and the same ticks — both act on the one setting, so neither can show a state the table does not have
 
 #### Scenario: Sorting by a column
 - **WHEN** the operator clicks a sortable column's header
@@ -415,12 +516,14 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **GIVEN** Claude's API stream fails and no Stop hook fires
 - **WHEN** Claude's live session status returns from `busy` to `idle`
 - **THEN** the table shows a neutral `Error` badge instead of `Idle` or `Busy`
-- **AND** the error causes no menu-bar highlight, blink, sound or notification
+- **AND** the failed turn drives the amber reaction alarm and notification until the operator opens it through EpiScope
+- **AND** acknowledging the alarm leaves the neutral `Error` badge visible until a later turn clears the error
 
 #### Scenario: A Codex turn fails
 - **GIVEN** a live Codex rollout ends with a terminal `error`
 - **WHEN** the table refreshes
 - **THEN** the table shows a neutral `Error` badge
+- **AND** the failed turn drives the same amber reaction alarm as a Claude failure
 - **AND** a retryable `stream_error` alone does not count as a failed turn
 - **AND** a user-interrupted turn does not count as an error
 - **AND** starting or completing a later turn clears the error
@@ -441,6 +544,39 @@ The app SHALL highlight the selected session's segment in the chart.
 #### Scenario: The selection is cleared
 - **WHEN** the operator presses Esc or clicks outside the table
 - **THEN** the selection clears and the chart returns to its normal look
+
+### Requirement: Narrow the table to a time range
+
+The chart is the only time axis over the whole fleet. The app SHALL let the
+operator drag a range across it and SHALL keep in the table only the sessions
+that billed tokens inside that range.
+
+#### Scenario: A range is dragged
+- **WHEN** the pointer is over a chart that has data
+- **THEN** it is a crosshair, so the chart reads as something to drag across rather than a picture
+- **AND** hovering a bar draws a panel beside it, at once and without a tooltip's delay, marking the bar it belongs to
+- **AND** that panel names the bar's interval and total, then breaks the total down by the sessions (or projects) stacked in it, largest first
+- **AND** each line carries the swatch its segment is drawn in, so a name can be matched to a band of the bar without guessing
+- **AND** the figures are whatever the chart is currently measuring — tokens, cost or lines — and a bar with more segments than fit says how many were left out
+- **AND** it does not appear while a range is being dragged, where the range's own caption already sits
+- **WHEN** the operator presses on the chart and travels less than 10 pt
+- **THEN** nothing is marked and the chart looks untouched — the press is still a click, not a range
+- **WHEN** the operator drags across the chart past that distance
+- **THEN** the range is marked and everything outside it dims, with its bounds, length and session count named above it
+- **AND** the table keeps only the sessions that billed tokens in that range
+- **AND** the title bar subtitle counts them as "N of M"
+
+#### Scenario: The range is adjusted or dropped
+- **WHEN** the operator drags an edge of the range
+- **THEN** the range and the table follow that edge from the first pixel, since grabbing a handle is unambiguous
+- **WHEN** the operator clicks the chart without dragging
+- **THEN** the range clears, any selected session is deselected, and the whole fleet returns
+- **AND** clearing is reachable regardless through the button over the table; Esc and a click below the last row still clear the selection alone
+
+#### Scenario: The chart the range belongs to goes away
+- **WHEN** the operator switches to Limits, or the index is rebuilt
+- **THEN** the range clears rather than filtering the table from behind a chart that no longer shows it
+- **AND** the selected session survives it — only a click on the chart means the operator asked for everything back
 
 ### Requirement: Group by project
 
@@ -719,7 +855,43 @@ mode.
 - **WHEN** the operator double-clicks a finished session, or presses Messages on a live one
 - **THEN** the chart above covers only that session — 15-minute bars that skip empty windows, with Input / Cache / Output checkboxes
 - **AND** `Your messages` and `AI responses` independently toggle the orange user-message and purple assistant-response markers
+- **AND** the lifecycle strip sits under the curves on the same time axis
 - **AND** the conversation is shown below it
+
+### Requirement: Show where a session's time went
+
+The app SHALL show, on the usage chart's own time axis, the phases a session
+passed through and the moments worth seeing against them. It SHALL keep what it
+observed apart from what a transcript merely implies: a stall no record can
+explain is never labelled as an approval prompt.
+
+#### Scenario: A session with several turns
+- **WHEN** details open
+- **THEN** a strip under the curves gives each turn a Working block, from its prompt to the last record of that turn
+- **AND** the silence before the next prompt is Idle, or Away once it passes twenty minutes
+- **AND** the totals beside the checkboxes name each phase in its own colour and give its duration
+
+#### Scenario: A permission prompt EpiScope watched
+- **GIVEN** EpiScope was running while the session sat on an approval
+- **WHEN** that session's details open
+- **THEN** the wait is a Permission block at the moment it happened
+- **AND** past fifteen minutes it continues as Away, the same split the `Waited` column counts
+
+#### Scenario: A session that ran before its waits were recorded
+- **WHEN** details open for such a session
+- **THEN** the strip shows Working, Idle and Away only
+- **AND** nothing in it is labelled Permission
+
+#### Scenario: Point events on the axis
+- **WHEN** the session contains errors, interrupts, compactions, edits or resumes
+- **THEN** errors, interrupts and compactions strike the strip as coloured ticks at their moment
+- **AND** every Edit or Write raises a tick in the lane above it, taller for more lines changed
+- **AND** a resume is a hairline — exact for Codex, inferred from a long silence for Claude Code
+
+#### Scenario: A session with no usage records
+- **WHEN** such a session opens
+- **THEN** the strip still draws
+- **AND** the plot above it says that no usage data was recorded
 
 #### Scenario: What the transcript contains
 - **WHEN** the transcript renders
@@ -740,26 +912,44 @@ The app SHALL render the model's Markdown without an external dependency.
 - **THEN** that table scrolls horizontally without wrapping or breaking its grid
 - **AND** prose around the table continues to wrap to the conversation pane
 
-### Requirement: Never let rendered text launch anything
+### Requirement: Never let model-supplied links launch local targets
 
 Reports and transcripts are model output, and a clicked link goes straight to
-the system opener. The app SHALL make only web links clickable and SHALL render
-every other target as ordinary text.
+the system opener. The app SHALL make only web links from Markdown clickable
+and SHALL render every other model-supplied target as ordinary text. Trusted
+session links may be added by EpiScope only after validating them against the
+saved report scope and local index.
 
 #### Scenario: A link to a local file
 - **WHEN** a report or a message contains `[label](file:///…/x.command)`, a custom app scheme or a relative path
 - **THEN** the label renders as ordinary text and clicking it does nothing
 - **AND** only `http`, `https` and `mailto` targets stay clickable
 
+#### Scenario: Insights cites a session
+- **GIVEN** an Insights report contains a full session id or an unambiguous short form
+- **AND** that session belongs to the report's saved scope and still exists in the index
+- **WHEN** the report is rendered
+- **THEN** EpiScope turns that reference into a trusted internal link
+- **AND** clicking it uses the same opening path as double-clicking the session in the table
+- **AND** a detached session opens in details and Back returns to Insights
+- **AND** the model still cannot create a clickable custom-scheme or local-file link
+
 ### Requirement: Keep a large transcript from blocking the window
 
 The app SHALL load a transcript off the main thread and SHALL cap how much of it
-is shown.
+is shown. The cap SHALL apply to the conversation alone: the chart and the strip
+above it measure the whole session, whatever its size.
 
 #### Scenario: A transcript of tens of megabytes
 - **WHEN** such a session opens
 - **THEN** the load runs off the main thread and the early history is dropped
 - **AND** a line at the top says that earlier history was omitted
+- **AND** the curves, the markers and the lifecycle strip still span the session from its first record to its last, on one axis
+
+#### Scenario: Cumulative usage of a capped session
+- **WHEN** the curves are drawn for a session whose conversation was truncated
+- **THEN** they accumulate from the session's own beginning, not from where the shown history starts
+- **AND** they count each API call once, so they agree with the table's token columns
 
 ### Requirement: Search inside the open transcript
 
@@ -895,6 +1085,11 @@ the operator is in the window.
 
 The app SHALL keep Insights mode free of run controls.
 
+#### Scenario: Compare run metadata
+- **WHEN** the operator scans the Cost and Date columns in the runs list
+- **THEN** their digits use tabular fixed-width figures
+- **AND** values align without changing the surrounding system typeface
+
 #### Scenario: Right click on a run
 - **WHEN** the operator right-clicks a row in the runs list
 - **THEN** Copy Report, Reveal in Finder and Delete are offered
@@ -906,7 +1101,25 @@ The app SHALL run the analysis locally.
 
 #### Scenario: A run starts
 - **WHEN** a run starts
-- **THEN** it runs a local headless `claude -p` and sends the data nowhere else
+- **THEN** it runs a local headless CLI — `claude -p` or `codex exec`, whichever
+  the chosen model belongs to — and sends the data nowhere else
+- **AND** that CLI is confined to reading: no shell, no writes, no network tools
+  and none of the operator's own MCP servers
+
+#### Scenario: The chosen engine's CLI is missing
+- **GIVEN** the chosen model belongs to an engine whose CLI is not installed
+- **WHEN** a run starts
+- **THEN** the run fails with a message naming that CLI, not the other one
+- **AND** this is the one failure that opens a dialog, because it offers to
+  locate the binary
+
+#### Scenario: A run fails
+- **WHEN** a run fails for any other reason, including before it started
+- **THEN** it appears in the runs list as a failed report carrying the reason
+- **AND** no alert interrupts the operator — the runs are scheduled, so a modal
+  would land over unrelated work
+- **AND** when the CLI reported the reason in its own output, that is what the
+  report shows rather than an exit code
 
 ### Requirement: Expose exactly two controls
 
@@ -914,7 +1127,12 @@ The app SHALL limit the Insights settings to a switch and a model choice.
 
 #### Scenario: The settings for Insights
 - **WHEN** the operator opens Settings
-- **THEN** only `Automatic Insights` (on/off) and `Analysis Model` (Sonnet 4.6 by default, Sonnet 5, Opus 4.8, Haiku 4.5) are offered
+- **THEN** only `Automatic Insights` (on/off) and `Analysis Model` are offered
+- **AND** `Analysis Model` groups its choices by the CLI that runs them: Claude
+  Code (Sonnet 4.6 by default, Sonnet 5, Opus 5, Opus 4.8, Haiku 4.5) and Codex
+- **AND** the Codex choice names no model of its own — it runs whatever
+  `~/.codex/config.toml` selects, because which models a CLI accepts depends on
+  its version and the account's plan
 
 **Out of scope:** a manual run over an arbitrary scope, and an ask-a-question
 field. Both were removed on purpose — the surface stays automatic.
@@ -981,6 +1199,40 @@ files owned by other tools.
 #### Scenario: Writing our own data
 - **WHEN** the index or a report is saved
 - **THEN** it is written under `~/Library/Application Support/EpiScope/` (`sessions.json`, `search.sqlite`, `reports/`)
+
+### Requirement: Index additional session sources
+
+The app SHALL keep the built-in Claude Code, Codex and Claude Desktop roots
+working without configuration and SHALL let the operator add read-only session
+directories from `Settings → Session Sources…`.
+
+#### Scenario: Add a mounted agent home
+- **GIVEN** a directory contains a recognised Claude Code, Codex or Claude Desktop layout
+- **WHEN** the operator adds it as a session source
+- **THEN** EpiScope synchronises recognised transcript files into its own local snapshot
+- **AND** never mounts, writes to or deletes from the selected directory
+- **AND** sessions keep their original globally unique `sessionId`
+
+#### Scenario: An external source becomes unavailable
+- **GIVEN** the source has completed at least one successful synchronisation
+- **WHEN** its directory disappears, blocks or returns an error
+- **THEN** its last successful snapshot and indexed sessions remain available
+- **AND** the source is labelled Offline with its last successful sync time
+- **AND** full search, transcript viewing and Insights read the local snapshot
+- **AND** the failed sync never publishes an empty generation
+
+#### Scenario: A cached source is offline
+- **GIVEN** an indexed session belongs to an unavailable external source
+- **THEN** its App column uses the square cached-source icon
+- **AND** Open Application, Resume and Delete are unavailable
+- **AND** Reveal Transcript targets the local snapshot
+
+#### Scenario: The main session list covers every source
+- **WHEN** the Sessions window opens
+- **THEN** the table shows sessions from every enabled source together, with no
+  per-source picker in the toolbar
+- **AND** which sources count at all is decided in `Settings → Session Sources…`,
+  the one place that governs them
 
 ---
 

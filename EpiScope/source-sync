@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Mirror recognized agent transcripts into EpiScope's local source snapshot.
+
+The source may be an unreliable FUSE/SSHFS mount. This process is disposable:
+EpiScope terminates it on a deadline and only indexes files atomically published
+under the destination. Existing snapshot files are deliberately never deleted.
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+
+
+def copy_changed(source, destination):
+    for base, dirs, files in os.walk(source):
+        relative = os.path.relpath(base, source)
+        target_dir = destination if relative == "." else os.path.join(destination, relative)
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+        for filename in files:
+            if not (filename.endswith(".jsonl") or filename.endswith(".json")):
+                continue
+            src = os.path.join(base, filename)
+            dst = os.path.join(target_dir, filename)
+            try:
+                if os.path.islink(src):
+                    continue
+                src_stat = os.stat(src)
+                dst_stat = os.stat(dst) if os.path.exists(dst) else None
+                if dst_stat and dst_stat.st_size == src_stat.st_size \
+                        and int(dst_stat.st_mtime_ns) == int(src_stat.st_mtime_ns):
+                    continue
+                fd, temporary = tempfile.mkstemp(prefix=".episcope-", dir=target_dir)
+                os.close(fd)
+                try:
+                    shutil.copy2(src, temporary)
+                    os.chmod(temporary, 0o600)
+                    os.replace(temporary, dst)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            except OSError:
+                raise
+
+
+def looks_like_claude(root):
+    try:
+        for child in os.scandir(root):
+            if child.is_dir(follow_symlinks=False):
+                with os.scandir(child.path) as nested:
+                    if any(item.name.endswith(".jsonl") for item in nested):
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def looks_like_codex(root):
+    for base, _, files in os.walk(root):
+        if any(name.startswith("rollout-") and name.endswith(".jsonl") for name in files):
+            return True
+        if os.path.relpath(base, root).count(os.sep) >= 3:
+            break
+    return False
+
+
+def looks_like_desktop(root):
+    try:
+        for base, _, files in os.walk(root):
+            if any(name.startswith("local_") and name.endswith(".json") for name in files):
+                return True
+            if os.path.relpath(base, root).count(os.sep) >= 2:
+                continue
+    except OSError:
+        return False
+    return False
+
+
+def roots_for(source, layout):
+    if layout == "claude":
+        return [(source, "claude")]
+    if layout == "codex":
+        return [(source, "codex")]
+    if layout == "claudeDesktop":
+        return [(source, "claude-desktop")]
+
+    known = [
+        (os.path.join(source, ".claude", "projects"), "claude"),
+        (os.path.join(source, ".codex", "sessions"), "codex"),
+        (os.path.join(source, "Library", "Application Support", "Claude",
+                      "local-agent-mode-sessions"), "claude-desktop"),
+    ]
+    found = [(path, kind) for path, kind in known if os.path.isdir(path)]
+    if found:
+        return found
+    if looks_like_claude(source):
+        return [(source, "claude")]
+    if looks_like_codex(source):
+        return [(source, "codex")]
+    if looks_like_desktop(source):
+        return [(source, "claude-desktop")]
+    return []
+
+
+def main():
+    if len(sys.argv) != 4:
+        return 2
+    source, destination, layout = sys.argv[1:]
+    if not os.path.isdir(source):
+        return 3
+    roots = roots_for(source, layout)
+    if not roots:
+        return 4
+    os.makedirs(destination, mode=0o700, exist_ok=True)
+    for root, kind in roots:
+        copy_changed(root, os.path.join(destination, kind))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

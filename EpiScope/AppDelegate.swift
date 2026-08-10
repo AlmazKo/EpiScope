@@ -4,16 +4,22 @@ import UserNotifications
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private let statusMenu = NSMenu()
     private let monitor = SessionMonitor()
     private let indexer = SessionIndexer()
     private let searchIndex = SearchIndex()
     private lazy var mainWindow = MainWindowController(indexer: indexer, monitor: monitor, searchIndex: searchIndex, reports: reportsWindow)
     private let reportStore = ReportStore()
     private let analysisRunner = AnalysisRunner()
+    private lazy var sourcesWindow = SessionSourcesWindowController()
     private lazy var reportsWindow = ReportsWindowController(
         indexer: indexer, searchIndex: searchIndex,
         store: reportStore, runner: analysisRunner)
     private let chart = MenuBarChart()
+    // Live menu rows use the indexer's provider-normalised task description
+    // as their primary label. Claude Desktop keeps the name shown in its own
+    // sidebar; CLI Claude and Codex use their automatic descriptions.
+    private var sessionDescriptions: [String: String] = [:]
     // TEMPORARY — see MenuBarChartDemo.swift, delete with it.
     private let chartDemo = MenuBarChartDemo()
     // The set of live session ids at the last reindex. A live-state flip
@@ -25,6 +31,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // session present at launch doesn't fire the "new permission"
     // chime.
     private var lastWaitingCount: Int?
+
+    // The dropdown gets a lightweight frame clock only while it is visible.
+    // Icons animate at 10 fps; elapsed labels share that clock but update only
+    // once per second. Rows are retained for the whole tracking session so an
+    // update never moves the highlighted item underneath the pointer.
+    private static let menuIconFPS = 10
+    private static let menuIconFrameInterval: TimeInterval = 0.1
+    private var isStatusMenuOpen = false
+    private var menuAnimationTimer: Timer?
+    private var menuAnimationFrame = 0
+    private var fleetMenuItems: [String: NSMenuItem] = [:]
+    private var fleetMenuStates: [String: FleetState] = [:]
+    private var fleetIconCache: [FleetIconCacheKey: NSImage] = [:]
 
     // Sound shown in the menu under "Sound ▶". "None" disables the
     // chime entirely. Persisted in UserDefaults under chimeSoundKey.
@@ -48,6 +67,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // session rows truncate their path to fit, so a long cwd can't blow the
     // menu out and everything lines up against one right edge.
     private static let menuContentWidth: CGFloat = 300
+    // Native menu items add an image column and their own horizontal insets
+    // around attributedTitle. Keep the text inside the remainder so a long AI
+    // description cannot make a fleet row wider than the 300-point gauge rows.
+    private static let fleetTextWidth = menuContentWidth - 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single instance only: a second EpiScope would race the first
@@ -67,12 +90,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.mainMenu = makeMainMenu()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let menu = NSMenu()
-        menu.delegate = self
+        statusMenu.delegate = self
         // Don't let AppKit auto-dim action-less items — the limit gauges
         // are display-only but must render at full strength.
-        menu.autoenablesItems = false
-        statusItem.menu = menu
+        statusMenu.autoenablesItems = false
+        statusItem.menu = statusMenu
         chart.attach(to: statusItem)
         chartDemo.start(chart: chart, statusItem: statusItem)   // TEMPORARY
 
@@ -113,19 +135,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         indexer.onEntriesUpdated = { [weak self] entries in
             self?.searchIndex.reconcile(entries: entries)
             // Feed the tracker each session's terminal label for Ghostty
-            // binding, plus the AI-generated description used as notification
-            // context. Keep them separate: a custom name can bind a tab, but it
-            // must not masquerade as an AI description in a banner.
+            // binding, plus the description used as notification/menu context.
+            // Claude Desktop's sidebar name is its canonical user-facing task
+            // identity; CLI custom names remain binding-only metadata.
             var titles: [String: String] = [:]
             var descriptions: [String: String] = [:]
             for e in entries {
                 if let label = e.title ?? e.name, !label.isEmpty {
                     titles[e.sessionId] = label
                 }
-                if let description = e.title, !description.isEmpty {
+                let description = e.isClaudeDesktop ? (e.name ?? e.title) : e.title
+                if let description, !description.isEmpty {
                     descriptions[e.sessionId] = description
                 }
             }
+            self?.sessionDescriptions = descriptions
             TerminalTracker.shared.updateSessionMetadata(
                 titles: titles, descriptions: descriptions)
         }
@@ -137,6 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         searchIndex.open()
 
         monitor.start()
+        SessionSourceStore.shared.start()
         indexer.start()
         // EpiScope is the tracker now: publishes cc-states.json (consumed
         // by kitty-painter.py, cc-open and SessionMonitor) and owns the
@@ -196,6 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopMenuAnimation()
         // Index saves are debounced — push the last snapshot out
         // before the process dies.
         indexer.flushIndexToDisk()
@@ -214,57 +240,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         chart.update(bars: currentBars())
     }
 
-    private enum FleetState: Equatable {
+    private enum FleetState: Hashable {
         case request
+        case error
         case finished
         case active
 
         var rank: Int {
             switch self {
             case .request: 0
-            case .finished: 1
-            case .active: 2
+            case .error: 1
+            case .finished: 2
+            case .active: 3
             }
         }
 
         var bar: MenuBarChart.Bar {
             switch self {
             case .request: .permission
-            case .finished: .question
+            case .error, .finished: .question
             case .active: .active
             }
         }
 
-        var statusText: String? {
-            switch self {
-            case .request: nil       // Use the concrete waitingFor description.
-            case .finished: "Finished"
-            case .active: "Busy"
-            }
-        }
-
-        var symbolName: String {
+        var symbolName: String? {
             switch self {
             case .request: "exclamationmark"
+            case .error: "exclamationmark"
             case .finished: "checkmark"
-            case .active: "play.fill"
+            case .active: nil
             }
         }
 
         var iconBackgroundColor: NSColor {
             switch self {
             case .request: .systemRed
-            case .finished: .systemYellow
+            case .error, .finished: .systemYellow
             case .active: .systemBlue
             }
         }
 
         var iconForegroundColor: NSColor {
             switch self {
-            case .finished: .black
+            case .error, .finished: .black
             case .request, .active: .white
             }
         }
+    }
+
+    private struct FleetIconCacheKey: Hashable {
+        let state: FleetState
+        let phase: Int
     }
 
     private struct FleetSession {
@@ -283,9 +309,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // verdict the table uses — the session file's own `busy`, or the
     // tracker's `thinking`.
     //
-    // Permission and question requests remain urgent until Claude reports that
-    // the session has actually left `waiting` / `done`. Merely opening or
-    // focusing its terminal does not acknowledge the request.
+    // Permission requests remain urgent until Claude reports that the session
+    // has actually left `waiting`. Finished and failed turns use the amber
+    // reaction alarm and are acknowledged by opening them through EpiScope.
     private func currentFleet() -> [FleetSession] {
         let waitingIds = Set(monitor.waiting.map(\.sessionId))
         var fleet: [FleetSession] = []
@@ -293,6 +319,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let state: FleetState?
             if waitingIds.contains(sid) {
                 state = .request
+            } else if monitor.kittyStates[sid] == "error" {
+                state = .error
             } else if monitor.kittyStates[sid] == "done" {
                 state = .finished
             } else if info.status == "busy" || monitor.kittyStates[sid] == "thinking" {
@@ -372,6 +400,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshSoundsMenu(menu)
         default:
             rebuildMenu(menu)
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
+        isStatusMenuOpen = true
+        startMenuAnimation()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
+        isStatusMenuOpen = false
+        stopMenuAnimation()
+    }
+
+    private func startMenuAnimation() {
+        stopMenuAnimation()
+        guard !fleetMenuItems.isEmpty else { return }
+        menuAnimationFrame = 0
+        refreshOpenMenuTimes()
+        refreshOpenMenuIcons()
+
+        let timer = Timer(timeInterval: Self.menuIconFrameInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickOpenMenu() }
+        }
+        timer.tolerance = Self.menuIconFrameInterval * 0.2
+        // Menu tracking runs a nested event loop; common mode keeps the clock
+        // alive there without running it while the dropdown is closed.
+        RunLoop.main.add(timer, forMode: .common)
+        menuAnimationTimer = timer
+    }
+
+    private func stopMenuAnimation() {
+        menuAnimationTimer?.invalidate()
+        menuAnimationTimer = nil
+        menuAnimationFrame = 0
+    }
+
+    private func tickOpenMenu() {
+        menuAnimationFrame &+= 1
+        refreshOpenMenuIcons()
+        if menuAnimationFrame % Self.menuIconFPS == 0 {
+            refreshOpenMenuTimes()
+        }
+    }
+
+    private func refreshOpenMenuTimes() {
+        for item in fleetMenuItems.values {
+            guard let session = item.representedObject as? SessionInfo else { continue }
+            let title = formattedTitle(for: session)
+            if item.attributedTitle?.isEqual(to: title) != true {
+                item.attributedTitle = title
+            }
+        }
+    }
+
+    private func refreshOpenMenuIcons() {
+        for (sessionId, item) in fleetMenuItems {
+            guard let state = fleetMenuStates[sessionId] else { continue }
+            let image = fleetIcon(for: state, frame: menuAnimationFrame)
+            if item.image !== image {
+                item.image = image
+            }
         }
     }
 
@@ -757,11 +848,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
+        fleetMenuItems.removeAll(keepingCapacity: true)
+        fleetMenuStates.removeAll(keepingCapacity: true)
 
         if limitGaugesEnabled { addLimitGauges(to: menu) }
 
         // Use the exact same fleet verdict as the fixed menu-bar slots. The
-        // chart cuts at six; the dropdown deliberately lists the whole fleet.
+        // chart cuts at five; the dropdown deliberately lists the whole fleet.
         let fleet = currentFleet()
         let attention = fleet.filter { $0.state != .active }
         let active = fleet.filter { $0.state == .active }
@@ -774,13 +867,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !attention.isEmpty {
                 menu.addItem(headerItem("Needs attention"))
                 for entry in attention {
-                    menu.addItem(makeItem(for: entry.session, state: entry.state))
+                    let item = makeItem(for: entry.session, state: entry.state)
+                    registerFleetItem(item, session: entry.session, state: entry.state)
+                    menu.addItem(item)
                 }
             }
             if !active.isEmpty {
                 menu.addItem(headerItem("Active"))
                 for entry in active {
-                    menu.addItem(makeItem(for: entry.session, state: entry.state))
+                    let item = makeItem(for: entry.session, state: entry.state)
+                    registerFleetItem(item, session: entry.session, state: entry.state)
+                    menu.addItem(item)
                 }
             }
         }
@@ -802,6 +899,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         searchItem.target = self
         menu.addItem(searchItem)
+
+        // AppKit normally asks for content before menuWillOpen, but starting
+        // here too makes the clock independent of delegate callback order.
+        if menu === statusMenu, isStatusMenuOpen, menuAnimationTimer == nil {
+            startMenuAnimation()
+        }
+    }
+
+    private func registerFleetItem(_ item: NSMenuItem,
+                                   session: SessionInfo,
+                                   state: FleetState) {
+        fleetMenuItems[session.sessionId] = item
+        fleetMenuStates[session.sessionId] = state
     }
 
     private func makeItem(for session: SessionInfo, state: FleetState) -> NSMenuItem {
@@ -810,59 +920,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               keyEquivalent: "")
         item.target = self
         item.representedObject = session
-        item.attributedTitle = formattedTitle(for: session, statusText: state.statusText)
-        item.image = fleetIcon(for: state)
+        item.attributedTitle = formattedTitle(for: session)
+        item.image = fleetIcon(for: state, frame: menuAnimationFrame)
         return item
     }
 
-    private func fleetIcon(for state: FleetState) -> NSImage? {
-        let symbolConfiguration = NSImage.SymbolConfiguration(
-            pointSize: 10,
-            weight: .semibold
-        ).applying(.init(paletteColors: [state.iconForegroundColor]))
-        guard let symbol = NSImage(
-            systemSymbolName: state.symbolName,
-            accessibilityDescription: nil
-        )?
-            .withSymbolConfiguration(symbolConfiguration)
-        else { return nil }
+    private func fleetIcon(for state: FleetState, frame: Int) -> NSImage? {
+        let (phase, opacity) = iconAnimation(state: state, frame: frame)
+        let key = FleetIconCacheKey(state: state, phase: phase)
+        if let cached = fleetIconCache[key] { return cached }
+
+        let symbol: NSImage?
+        if state == .active {
+            symbol = nil
+        } else {
+            guard let symbolName = state.symbolName else { return nil }
+            let configuration = NSImage.SymbolConfiguration(
+                pointSize: 10,
+                weight: .semibold
+            ).applying(.init(paletteColors: [state.iconForegroundColor]))
+            guard let configured = NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: nil
+            )?.withSymbolConfiguration(configuration) else { return nil }
+            symbol = configured
+        }
 
         let size = NSSize(width: 22, height: 22)
         let image = NSImage(size: size, flipped: false) { rect in
+            let context = NSGraphicsContext.current?.cgContext
+            context?.saveGState()
+            context?.setAlpha(opacity)
+            defer { context?.restoreGState() }
+
             state.iconBackgroundColor.setFill()
             NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1)).fill()
 
-            let symbolRect = NSRect(
-                x: rect.midX - symbol.size.width / 2,
-                y: rect.midY - symbol.size.height / 2,
-                width: symbol.size.width,
-                height: symbol.size.height
-            )
-            symbol.draw(in: symbolRect)
+            if state == .active {
+                Self.drawSegmentedLoader(in: rect, phase: phase)
+            } else if let symbol {
+                let symbolRect = NSRect(
+                    x: rect.midX - symbol.size.width / 2,
+                    y: rect.midY - symbol.size.height / 2,
+                    width: symbol.size.width,
+                    height: symbol.size.height
+                )
+                symbol.draw(in: symbolRect)
+            }
             return true
         }
         // Keep semantic state colours in the menu instead of letting AppKit
         // turn the whole image into a label-coloured template.
         image.isTemplate = false
+        fleetIconCache[key] = image
         return image
     }
 
-    private func formattedTitle(for session: SessionInfo, statusText: String? = nil) -> NSAttributedString {
-        let waitFor = statusText ?? session.waitingFor ?? "waiting"
-        let duration = Self.formatElapsed(since: session.updatedAtDate)
+    private static func drawSegmentedLoader(in rect: NSRect, phase: Int) {
+        let center = NSPoint(x: rect.midX, y: rect.midY)
+        let activeSegment = phase / 2
+        let activeOpacity: CGFloat = phase.isMultiple(of: 2) ? 0.58 : 1
+
+        for segment in 0..<6 {
+            let path = NSBezierPath()
+            let startAngle = 69 + CGFloat(segment) * 60
+            path.appendArc(
+                withCenter: center,
+                radius: 6.5,
+                startAngle: startAngle,
+                endAngle: startAngle + 42
+            )
+            path.lineWidth = 2.6
+            path.lineCapStyle = .butt
+
+            let opacity: CGFloat = segment == activeSegment ? activeOpacity : 0.16
+            NSColor.white.withAlphaComponent(opacity).setStroke()
+            path.stroke()
+        }
+    }
+
+    private func iconAnimation(state: FleetState, frame: Int) -> (phase: Int, opacity: CGFloat) {
+        switch state {
+        case .active:
+            // Twelve cached frames illuminate the six donut sections in turn.
+            // Nothing moves geometrically: only the brightness advances on
+            // every clock tick. Each section gets a medium and a bright frame.
+            return (frame % 12, 1)
+        case .request:
+            // Full cycle 1 Hz, matching the red menu-bar permission bar.
+            let phase = (frame / (Self.menuIconFPS / 2)) % 2
+            return (phase, phase == 0 ? 1 : 0.4)
+        case .error, .finished:
+            // Full cycle 0.5 Hz, matching the amber reaction bar.
+            let phase = (frame / Self.menuIconFPS) % 2
+            return (phase, phase == 0 ? 1 : 0.4)
+        }
+    }
+
+    private func formattedTitle(for session: SessionInfo) -> NSAttributedString {
+        let mainFont = NSFont.menuFont(ofSize: 0)
+        let rawDescription = sessionDescriptions[session.sessionId]
+            ?? session.name
+            ?? session.folderName
+        let oneLineDescription = rawDescription
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        let description = Self.truncatedTail(
+            oneLineDescription, font: mainFont, maxWidth: Self.fleetTextWidth)
         let result = NSMutableAttributedString(
-            string: "\(session.folderName) — \(waitFor)",
-            attributes: [.font: NSFont.menuFont(ofSize: 0)]
+            string: description,
+            attributes: [.font: mainFont]
         )
-        // Keep the path's tail (its most specific part) and head-truncate so a
-        // long cwd can't widen the menu past menuContentWidth.
+
+        // Status is already unambiguous in the coloured icon. Keep the second
+        // line for location and time since the underlying session status last
+        // changed; updatedAt is the provider fallback when no dedicated status
+        // timestamp exists (notably Codex and SDK-driven sessions).
         let subFont = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
-        let suffix = " · \(duration) ago"
+        let suffix = session.statusChangedAtDate.map {
+            " · \(Self.formatElapsed(since: $0)) ago"
+        } ?? ""
         let suffixW = (suffix as NSString).size(withAttributes: [.font: subFont]).width
-        let budget = Self.menuContentWidth - 28 - suffixW
-        let path = Self.truncatedHead(Self.homeRelative(session.cwd), font: subFont, maxWidth: max(60, budget))
+        let budget = Self.fleetTextWidth - suffixW
+        let directory = Self.truncatedTail(
+            session.folderName, font: subFont, maxWidth: max(60, budget))
         result.append(NSAttributedString(
-            string: "\n\(path)\(suffix)",
+            string: "\n\(directory)\(suffix)",
             attributes: [
                 .font: subFont,
                 .foregroundColor: NSColor.secondaryLabelColor,
@@ -871,22 +1054,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
-    private static func homeRelative(_ path: String) -> String {
-        let home = NSHomeDirectory()
-        if path == home { return "~" }
-        if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
-        return path
-    }
-
-    // Drop characters from the front (with a leading ellipsis) until the string
-    // fits maxWidth — keeps the tail, the most useful part of a path.
-    private static func truncatedHead(_ s: String, font: NSFont, maxWidth: CGFloat) -> String {
+    // Keep the start of an AI description or directory name; unlike a path,
+    // its leading words carry the useful identity.
+    private static func truncatedTail(_ s: String, font: NSFont, maxWidth: CGFloat) -> String {
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
         if (s as NSString).size(withAttributes: attrs).width <= maxWidth { return s }
         var chars = Array(s)
         while chars.count > 1 {
-            chars.removeFirst()
-            let candidate = "…" + String(chars)
+            chars.removeLast()
+            let candidate = String(chars) + "…"
             if (candidate as NSString).size(withAttributes: attrs).width <= maxWidth {
                 return candidate
             }
@@ -968,7 +1144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let defaults = UserDefaults.standard
         guard defaults.string(forKey: Self.lastDailyInsightsKey) != today,
               !reportsWindow.isAnalysisRunning,
-              ClaudeCLI.locate() != nil
+              AnalysisModelChoice.named(ReportsWindowController.defaultModel)
+                  .engine.locate() != nil
         else { return }
         // Mark the day only once a run actually started. The old order marked
         // first, so either refusal — a run already in flight, or nothing worth
@@ -995,7 +1172,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let defaults = UserDefaults.standard
         guard defaults.string(forKey: Self.lastWeeklyInsightsKey) != week,
               !reportsWindow.isAnalysisRunning,
-              ClaudeCLI.locate() != nil
+              AnalysisModelChoice.named(ReportsWindowController.defaultModel)
+                  .engine.locate() != nil
         else { return }
         // Monday fires both runs in the same tick, and the daily one wins the
         // race: `runner.isRunning` is still false during its prep phase, so the
@@ -1280,6 +1458,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         groupByDir.identifier = NSUserInterfaceItemIdentifier("view.groupByDir")
         viewMenu.addItem(groupByDir)
 
+        let sessionSources = NSMenuItem(
+            title: "Session Sources…",
+            action: #selector(showSessionSources),
+            keyEquivalent: ""
+        )
+        sessionSources.target = self
+        viewMenu.addItem(sessionSources)
+
         // Off by default — the limit gauges in the status-bar dropdown are
         // opt-in, since not everyone wants them taking up the menu.
         let limitGauges = NSMenuItem(
@@ -1432,6 +1618,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         indexer.kickReindex()
     }
 
+    @objc private func showSessionSources() {
+        if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
+        NSApp.activate(ignoringOtherApps: true)
+        sourcesWindow.window?.center()
+        sourcesWindow.showWindow(nil)
+        sourcesWindow.window?.makeKeyAndOrderFront(nil)
+    }
+
     // On by default; the toggle persists an explicit choice. The status-bar
     // menu rebuilds on open, so flipping the pref is enough.
     private static let limitGaugesKey = "menuLimitGauges"
@@ -1463,12 +1657,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reportsWindow.runDailyInsights()
     }
 
-    static let analysisModelChoices: [(id: String, name: String)] = [
-        ("claude-sonnet-4-6", "Sonnet 4.6"),
-        ("claude-sonnet-5", "Sonnet 5"),
-        ("claude-opus-4-8", "Opus 4.8"),
-        ("claude-haiku-4-5", "Haiku 4.5"),
-    ]
     @objc private func setAnalysisModel(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         UserDefaults.standard.set(id, forKey: "analysisModel")
@@ -1476,13 +1664,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshAnalysisModelMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let current = ReportsWindowController.defaultModel
-        for choice in Self.analysisModelChoices {
-            let item = NSMenuItem(title: choice.name,
-                                  action: #selector(setAnalysisModel(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = choice.id
-            item.state = choice.id == current ? .on : .off
-            menu.addItem(item)
+        // Grouped by engine and labelled with it: which CLI a run shells out to
+        // decides whose plan pays for it and which login has to be there, so it
+        // is not an implementation detail the menu can hide. Derived from
+        // allCases, so adding an engine cannot leave its models unlisted.
+        for engine in AnalysisEngine.allCases {
+            let models = AnalysisModelChoice.all.filter { $0.engine == engine }
+            guard !models.isEmpty else { continue }
+            if menu.numberOfItems > 0 { menu.addItem(.separator()) }
+            let header = NSMenuItem(title: engine.menuHeading, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for choice in models {
+                let item = NSMenuItem(title: choice.name,
+                                      action: #selector(setAnalysisModel(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = choice.id
+                item.state = choice.id == current ? .on : .off
+                menu.addItem(item)
+            }
         }
     }
 

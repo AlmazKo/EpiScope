@@ -124,10 +124,10 @@ Break these and the product stops being what it is:
 
 ## Release
 
-`release.sh` builds a universal binary, signs it with hardened runtime, notarizes
-it and staples both the `.app` and the DMG. Releasing, notarizing, tagging and
-pushing are **outward actions**: never run them unless explicitly asked.
-`docs/homebrew.md` covers the cask.
+This repository publishes **code only**. Building, signing, notarizing and
+distributing live in untracked local files — `CLAUDE.local.md` is the entry
+point. Releasing, notarizing, tagging and pushing are **outward actions**:
+never run them unless explicitly asked.
 
 ## Notes that are easy to get wrong
 
@@ -141,4 +141,13 @@ pushing are **outward actions**: never run them unless explicitly asked.
 - The report text view builds a **TextKit 1** stack on purpose — a plain
   `NSTextView()` comes up on TextKit 2, and the code-chip layout manager cannot be
   installed there.
+- **Only the bundled `cc-open` ever runs** (`TerminalIntegration.bundledCCOpenPath`):
+  it and the `cc-states.json` producer are one protocol, so an older user script
+  silently drops new fields and takes the wrong fallback. Patch `EpiScope/cc-open`
+  — the copy in `~/dotfiles/bin/cc-open` is the user's own CLI and never reaches
+  the app.
+- **An unpriced model bills at $3/$15** (`SessionIndex.defaultPricing`) with no
+  warning; an unknown `openai-*` one falls back to the flagship Codex tier. When a
+  new model ships, add it to `SessionIndex.pricingTable` in the same change, or
+  every cost in the table and in the reports is quietly wrong.
 - `.claude/` is gitignored; local settings never belong in a commit.

@@ -7,3 +7,12 @@ DerivedData/
 *.dmg
 insights-lab-results/
 .claude/
+release.sh
+*.local.md
+Casks/
+
+# Credentials never belong in a public repo, not even untracked in the tree.
+github
+github.pub
+id_*
+*.pem

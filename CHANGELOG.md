@@ -4,6 +4,53 @@ All notable changes to EpiScope are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/); versions track the app's
 `MARKETING_VERSION` and the `vX.Y` release tags.
 
+## [0.8] — 2026-08-09
+
+### Added
+- **Codex as an analysis engine** — Insights can run through `codex exec` as
+  well as `claude -p`. The Codex entry names no model: `~/.codex/config.toml`
+  already holds one, and which names a CLI accepts moves faster than a menu can
+  track. Containment matches the Claude run — a read-only sandbox, no inherited
+  MCP servers, and nothing persisted to the operator's Codex history.
+- **A time range dragged on the chart** narrows the table to the sessions that
+  billed tokens inside it. A drag has to travel 10 pt before it counts, so a
+  plain click stays a click; clicking the chart clears the range and the
+  selection together.
+- **A bar explains itself on hover** — a panel beside it names the interval and
+  the total, then breaks the total down by the sessions stacked in it, largest
+  first, each line leading with its figure and carrying the swatch its segment
+  is drawn in.
+- **A session's lifecycle on the usage chart's axis.**
+- **Columns are picked by right-clicking the table header**, the same list
+  Settings offers.
+- **An empty table says why it is empty** and names the narrowing responsible,
+  with a `Show all` button that drops range, filter text and selection at once.
+- **Resilient session sources**, and Insights runs link back to the sessions
+  they were built from.
+- **Claude Desktop Code tabs open by their own route** — recent builds mirror a
+  tab's transcript under the CLI id while addressing the tab as `local_<uuid>`,
+  and `claude://code/<cli-id>` was accepted and then silently dropped.
+
+### Changed
+- **Analysis failures appear in the runs list, not in a dialog.** The runs are
+  scheduled, so a modal landed over unrelated work to report something already
+  on screen. A failure that never started is recorded too, rather than only
+  raising the alert that used to be its sole trace.
+- **The Sources picker leaves the toolbar** — which sources count is decided in
+  `Settings → Session Sources…`, the one place that governs them.
+- The README leads with what the app is for, and shows it.
+
+### Fixed
+- The chart's crosshair never appeared: cursor rects are computed once and
+  cached, and the chart is still empty when that first happens.
+- A press painted a one-pixel range before travelling anywhere, so a click meant
+  to clear things flashed a selection.
+- The hover marker sat against the bar's left edge — it was placed from the time
+  axis, which maps a bucket's start rather than the bar's middle.
+- Codex runs reported their reason as an exit code and a stderr warning it
+  prints on healthy runs too; the actual message arrives in the event stream.
+- Line churn is counted from unlabelled Edit results.
+
 ## [0.7] — 2026-08-04
 
 ### Added
@@ -164,8 +211,7 @@ All notable changes to EpiScope are documented here. The format is based on
   excerpts; clicking one opens that session's Messages, scrolls to the exact
   message and briefly washes it. The index builds incrementally and survives
   relaunches.
-- **Homebrew distribution.** Install and update via a `brew` cask; `release.sh`
-  notarizes the DMG and refreshes the cask automatically (`docs/homebrew.md`).
+- **Homebrew distribution.** Install and update via a `brew` cask.
 - **Animated busy badge** — a pearlescent fill with elapsed `mm:ss` while a
   session is thinking.
 - **Group sessions by directory** (Settings → Group by Directory): a

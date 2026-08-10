@@ -25,7 +25,8 @@ runs-list right-click menu (Copy / Reveal / Delete); entering the mode lands on
 the latest run.
 
 - **Controls — only two, by design:** Settings → *Automatic Insights* (on/off)
-  and *Analysis Model* (Sonnet 4.6 [default] / Sonnet 5 / Opus 4.8 / Haiku 4.5).
+  and *Analysis Model* (Sonnet 4.6 [default] / Sonnet 5 / Opus 5 / Opus 4.8 /
+  Haiku 4.5).
   No other customization.
 - Debug: Settings → *Run Recalculation* forces a run now
   (`defaults write almazko.EpiScope debugMode -bool YES`).

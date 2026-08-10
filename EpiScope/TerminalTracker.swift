@@ -17,15 +17,15 @@ import UserNotifications
 //      no known terminal are published with term = null.
 //   3. State per session: hook signal (~/.claude/state/sig-<session_id>)
 //      complements CC status (busy → thinking, idle → done); transcript
-//      terminal events add a table-only `error` state. A focused window
-//      acknowledges `done`, while permission requests stay active until CC
-//      leaves `waiting`.
+//      terminal events add `error` / `error_attended` states. Opening a done or
+//      failed turn through EpiScope acknowledges it, while permission requests
+//      stay active until CC leaves `waiting`.
 //   4. Snapshot goes to cc-states.json (v1 envelope, atomic rename,
 //      mtime is the heartbeat).
 //
-// It also owns user notifications: a banner on the done /
-// needs_permission transitions. Finished is removed once attended; a
-// permission banner remains until Claude or Codex leaves `waiting`.
+// It also owns user notifications: a banner on the done / error /
+// needs_permission transitions. Finished and Error are removed once attended;
+// a permission banner remains until Claude or Codex leaves `waiting`.
 // Clicking a banner focuses the hosting terminal/app via cc-open — the
 // exact same path as a double-click in the sessions table.
 final class TerminalTracker: NSObject {
@@ -301,8 +301,13 @@ final class TerminalTracker: NSObject {
                 if codexWaitingSessionIds.contains(s.sessionId) {
                     state = "needs_permission"
                 } else if let info = codexInfoCache[s.pid], codexTurnErrored(at: info.rolloutPath) {
-                    state = "error"
+                    state = errorState(sid: s.sessionId)
                 } else {
+                    // Codex has no busy status that would clear this marker for
+                    // us. A later non-error rollout outcome starts a fresh
+                    // acknowledgment cycle for the next failed turn.
+                    try? FileManager.default.removeItem(
+                        atPath: stateDir + "/attended-" + s.sessionId)
                     state = "idle"
                 }
             } else {
@@ -656,10 +661,10 @@ final class TerminalTracker: NSObject {
     }
 
     // Assign Ghostty surfaces to sessions. Ghostty exposes no tty, so binding is
-    // by title / cwd. Pass 1: named sessions bind to the surface whose title
-    // matches their name (Claude titles the tab with the session name) — done
-    // first so a same-cwd nameless session can't steal it via the cwd fallback.
-    // Pass 2: the rest take the first unused surface with a matching cwd.
+    // by title / cwd. Exact session names bind first, before the secondary
+    // ai-title: two sessions may inherit the same task title, while only the
+    // session actually hosted by the tab has that title as its live name.
+    // The rest take the first unused surface with a matching cwd.
     // A session no other adapter (kitty / iTerm / Terminal) located → a Ghostty
     // candidate. Split out so the tick's filter type-checks quickly.
     private func ghosttyCandidate(_ s: SessionInfo, kitty: [Int: Located],
@@ -673,20 +678,25 @@ final class TerminalTracker: NSObject {
     private func assignGhostty(_ candidates: [SessionInfo]) -> [Int: String] {
         var out: [Int: String] = [:]
         var used = Set<String>()
-        for s in candidates {
-            // Labels Claude may show in the tab title: the session name and its
-            // ai-title (task). Match either against the surface title.
-            let labels = [s.name, sessionTitles[s.sessionId]].compactMap { $0 }.filter { !$0.isEmpty }
-            guard !labels.isEmpty else { continue }
+
+        func bind(_ s: SessionInfo, label: String?) {
+            guard out[s.pid] == nil, let label, !label.isEmpty else { return }
             if let surf = ghosttyCache.surfaces.first(where: { surf in
                 guard !used.contains(surf.ref) else { return false }
                 let stripped = String(surf.title.drop { !$0.isLetter && !$0.isNumber })
-                return labels.contains { stripped.caseInsensitiveCompare($0) == .orderedSame }
+                return stripped.caseInsensitiveCompare(label) == .orderedSame
             }) {
                 out[s.pid] = surf.ref
                 used.insert(surf.ref)
             }
         }
+
+        // A live session name is the label Claude assigned to this particular
+        // process. Reserve those exact matches before consulting historical
+        // ai-titles, which are commonly shared by related or resumed sessions.
+        for s in candidates { bind(s, label: s.name) }
+        for s in candidates { bind(s, label: sessionTitles[s.sessionId]) }
+
         for s in candidates where out[s.pid] == nil {
             let free = ghosttyCache.surfaces.filter { $0.wd == s.cwd && !used.contains($0.ref) }
             // Prefer a surface a program titled (a running Claude tab) over a
@@ -1040,11 +1050,11 @@ final class TerminalTracker: NSObject {
             }
         }
 
-        // A terminal API/stream failure is an outcome, not an attention state:
-        // keep it visible in the table, but do not create an attended marker or
-        // turn it into Finished merely because its host is focused.
+        // A terminal API/stream failure ended the turn and needs the same kind
+        // of user reaction as a completed step. Keep its distinct Error label,
+        // but let navigation through EpiScope acknowledge its amber alarm.
         if status != "waiting" && status != "busy" && turnErrored {
-            return "error"
+            return errorState(sid: sid)
         }
 
         if !located {
@@ -1086,6 +1096,12 @@ final class TerminalTracker: NSObject {
         return state
     }
 
+    private func errorState(sid: String) -> String {
+        FileManager.default.fileExists(atPath: stateDir + "/attended-" + sid)
+            ? "error_attended"
+            : "error"
+    }
+
     // The index knows each session's ai-title (which Claude uses as the Ghostty
     // tab title); AppDelegate pushes it here so assignGhostty can bind by title.
     func updateSessionMetadata(titles: [String: String],
@@ -1108,8 +1124,9 @@ final class TerminalTracker: NSObject {
     // The user opened this session's home via EpiScope. Window focus can't
     // always be detected (notably the Claude desktop app), so acknowledge
     // explicitly: record the attended mark and wipe a pending `done` signal so
-    // "Finished" clears on the next tick. Permission/question requests are not
-    // acknowledged by navigation; they remain active until CC leaves waiting.
+    // Finished or Error attention clears on the next tick. Permission/question
+    // requests are not acknowledged by navigation; they remain active until CC
+    // leaves waiting.
     func acknowledge(sessionId sid: String) {
         // The id names two files here, one of which we delete. It reaches us
         // from the session index (a transcript filename) as well as from a
@@ -1235,13 +1252,17 @@ final class TerminalTracker: NSObject {
             let hadPriorState = settledStates[sid] != nil
             settledStates[sid] = state
             switch state {
-            case "done", "needs_permission":
+            case "done", "error", "needs_permission":
                 // Suppress launch noise: only notify once we've settled on some
                 // earlier state, not on whatever existed at startup.
                 guard hadPriorState else { continue }
                 let content = UNMutableNotificationContent()
                 let path = notificationDisplayPath(entry.cwd)
-                content.title = state == "done" ? path + " · Finished" : path
+                switch state {
+                case "done": content.title = path + " · Finished"
+                case "error": content.title = path + " · Error"
+                default: content.title = path
+                }
                 let status = state == "needs_permission" ? "Needs permission" : nil
                 if let raw = sessionDescriptions[sid],
                    let description = Self.compactNotificationDescription(raw) {

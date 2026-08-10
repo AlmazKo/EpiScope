@@ -37,7 +37,7 @@ enum ClaudeCLI {
     // A binary sitting in a directory anyone can write to (say /tmp) can be
     // swapped out between the check and the launch, so treat both the file and
     // its directory as part of the identity.
-    private static func ownerOnlyWritable(_ path: String) -> Bool {
+    static func ownerOnlyWritable(_ path: String) -> Bool {
         let fm = FileManager.default
         for p in [path, (path as NSString).deletingLastPathComponent] {
             guard let attrs = try? fm.attributesOfItem(atPath: p),
@@ -48,20 +48,4 @@ enum ClaudeCLI {
         return true
     }
 
-    // PATH for spawned CLI runs. Finder-launched apps inherit a bare
-    // /usr/bin:/bin PATH; the CLI (or the node its wrapper execs) may live
-    // in Homebrew or ~/.local, so prepend the usual suspects plus the
-    // resolved binary's own directory.
-    static func environment(for cli: URL) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let extra = [
-            cli.deletingLastPathComponent().path,
-            home + "/.local/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-        ]
-        env["PATH"] = (extra + [env["PATH"] ?? "/usr/bin:/bin"]).joined(separator: ":")
-        return env
-    }
 }
