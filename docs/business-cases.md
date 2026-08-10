@@ -373,9 +373,11 @@ session.
 #### Scenario: An IDE terminal
 - **GIVEN** the session runs in a JetBrains IDE terminal
 - **WHEN** the operator opens the session
-- **THEN** the app passes the nearest project root through the running IDE's command-line launcher
+- **THEN** the project path comes from the session transcript rather than the IDE agent process cwd
+- **AND** the app passes the nearest project root through the running IDE's command-line launcher
 - **AND** the IDE selects the corresponding macOS project tab
 - **AND** it reuses the open project instead of initializing and disposing a duplicate
+- **AND** an unrecognised or stale cwd only activates the IDE and is never opened as a project
 - **AND** the app does not attempt to select a terminal tab inside the project
 
 #### Scenario: A previously unknown application host

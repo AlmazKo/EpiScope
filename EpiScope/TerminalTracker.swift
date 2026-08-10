@@ -424,7 +424,9 @@ final class TerminalTracker: NSObject {
         return (alive, ttys)
     }
 
-    // lsof the codex pid → its open rollout jsonl (→ session uuid) + cwd.
+    // lsof the codex pid → its open rollout jsonl (→ session uuid). The
+    // process cwd is only a fallback: IDE-hosted ACP agents execute from their
+    // installation cache, while session_meta keeps the actual project cwd.
     private func codexLsof(pid: Int) -> (sessionId: String, cwd: String, rolloutPath: String)? {
         guard let out = runShell(["/usr/sbin/lsof", "-p", String(pid), "-Fn"]) else { return nil }
         var sessionId: String?
@@ -444,7 +446,40 @@ final class TerminalTracker: NSObject {
             }
         }
         guard let sid = sessionId, let rolloutPath else { return nil }
-        return (sid, cwd, rolloutPath)
+        let projectCwd = Self.codexSessionCwd(at: rolloutPath) ?? cwd
+        return (sid, projectCwd, rolloutPath)
+    }
+
+    // Read only the first complete JSONL record. Codex writes session_meta
+    // first; bounding this read keeps an untrusted or half-written rollout
+    // from making the 1 s tracker load the whole transcript.
+    nonisolated private static func codexSessionCwd(at path: String) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        else { return nil }
+        defer { try? handle.close() }
+
+        var line = Data()
+        let chunkSize = 64 << 10
+        let maxFirstLineBytes = 8 << 20
+        while line.count <= maxFirstLineBytes,
+              let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            line.append(chunk)
+            if let newline = line.firstIndex(of: 0x0a) {
+                line = Data(line[..<newline])
+                break
+            }
+        }
+        guard !line.isEmpty, line.count <= maxFirstLineBytes else { return nil }
+
+        struct MetaRecord: Decodable {
+            let type: String?
+            let payload: Payload?
+            struct Payload: Decodable { let cwd: String? }
+        }
+        guard let record = try? JSONDecoder().decode(MetaRecord.self, from: line),
+              record.type == "session_meta",
+              let cwd = record.payload?.cwd, cwd.hasPrefix("/") else { return nil }
+        return cwd
     }
 
     // MARK: - kitty adapter

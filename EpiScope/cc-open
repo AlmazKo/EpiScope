@@ -250,38 +250,43 @@ EOF
   # merged project tabs jump and flash. Resolve the executable from the running
   # LaunchServices entry instead of guessing which product/version is installed.
   # A terminal may start below the root, so prefer its nearest .idea ancestor.
+  # Never pass an unrecognised cwd to the launcher: IDE-hosted ACP agents can
+  # execute from their installation cache, which IDEA would create as a new
+  # project. The tracker normally replaces that cwd from rollout session_meta;
+  # this check also makes stale snapshots safe.
   jetbrains)
     if ok_bundle "$REF" && [[ "$REF" == com.jetbrains.* ]]; then
       PROJECT="${CWD%/}"
       case "$PROJECT" in
         /*)
           [ -n "$PROJECT" ] || PROJECT="/"
-          ORIGINAL_PROJECT="$PROJECT"
           while [ "$PROJECT" != "/" ] && [ ! -d "$PROJECT/.idea" ]; do
             PROJECT="${PROJECT%/*}"
             [ -n "$PROJECT" ] || PROJECT="/"
           done
-          [ -d "$PROJECT/.idea" ] || PROJECT="$ORIGINAL_PROJECT"
-          LAUNCHER="$(lsappinfo list 2>/dev/null | /usr/bin/awk -v bid="$REF" '
-            index($0, "bundleID=\"" bid "\"") { found=1; next }
-            found && /^[[:space:]]*executable path="/ {
-              sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
-            }
-            found && /^[0-9]+\)/ { exit }
-          ')"
-          case "$LAUNCHER" in
-            /*)
-              if [ -x "$LAUNCHER" ]; then
-                # IDEA 2026.1 can call AppIcon.requestAttention off the EDT when
-                # a launcher command arrives while it is in the background.
-                # Activate first; the short grace period lets that event land
-                # before the launcher asks ProjectUtil to focus the project.
-                open -b "$REF" >/dev/null 2>&1
-                sleep 0.2
-                "$LAUNCHER" "$PROJECT" >/dev/null 2>&1 && exit 0
-              fi
-              ;;
-          esac
+          [ -d "$PROJECT/.idea" ] || PROJECT=""
+          if [ -n "$PROJECT" ]; then
+            LAUNCHER="$(lsappinfo list 2>/dev/null | /usr/bin/awk -v bid="$REF" '
+              index($0, "bundleID=\"" bid "\"") { found=1; next }
+              found && /^[[:space:]]*executable path="/ {
+                sub(/^[^"]*"/, ""); sub(/".*$/, ""); print; exit
+              }
+              found && /^[0-9]+\)/ { exit }
+            ')"
+            case "$LAUNCHER" in
+              /*)
+                if [ -x "$LAUNCHER" ]; then
+                  # IDEA 2026.1 can call AppIcon.requestAttention off the EDT when
+                  # a launcher command arrives while it is in the background.
+                  # Activate first; the short grace period lets that event land
+                  # before the launcher asks ProjectUtil to focus the project.
+                  open -b "$REF" >/dev/null 2>&1
+                  sleep 0.2
+                  "$LAUNCHER" "$PROJECT" >/dev/null 2>&1 && exit 0
+                fi
+                ;;
+            esac
+          fi
           ;;
       esac
       # Launcher discovery can fail if LaunchServices is briefly unavailable.
