@@ -667,8 +667,9 @@ SHALL price them from the model price table.
 The app SHALL let the operator pick the chart window and the bucket size.
 
 #### Scenario: Choosing the window
-- **WHEN** `Settings → Chart Window` is set to 1, 2, 5 or 7 days
+- **WHEN** `Settings → Chart Window` is set to 1, 2, 5, 7 or 30 days
 - **THEN** the bars rebuild for that window
+- **AND** the axis widens its tick spacing so the labels stay apart
 
 #### Scenario: Choosing the bucket size
 - **WHEN** `Settings → Chart Bars` is set to Auto, 5 min, 15 min or 1 hour

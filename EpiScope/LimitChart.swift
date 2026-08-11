@@ -782,7 +782,7 @@ final class LimitChartView: NSView {
         let dateAttrs: [NSAttributedString.Key: Any] = [
             .font: Self.tickFont, .foregroundColor: NSColor.labelColor,
         ]
-        let tickHours = days <= 1 ? 2 : (days == 2 ? 4 : 12)
+        let tickHours = TokenChartView.WindowConfig(days: days).tickHours
         let cal = Calendar.current
         let df = DateFormatter()
         df.setLocalizedDateFormatFromTemplate("MMMd")
