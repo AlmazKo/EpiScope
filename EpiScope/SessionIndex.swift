@@ -117,6 +117,22 @@ nonisolated enum SessionProvider: String, Codable, Sendable, CaseIterable {
         case .codex, .claudeDesktop: return false
         }
     }
+
+    // The program a Stop is allowed to signal, matched against the process
+    // behind the session's pid. nil where the session has no process of its
+    // own to end: a Claude Desktop session lives inside the app, and its pid
+    // is the app's — ending it would close every other tab with it.
+    //
+    // A switch, not a lookup: the pid comes out of a file any local process can
+    // write, so a provider added without an answer here must fail to compile
+    // rather than inherit permission to signal whatever that file names.
+    var stoppableProcess: String? {
+        switch self {
+        case .claude: return "claude"
+        case .codex: return "codex"
+        case .claudeDesktop: return nil
+        }
+    }
 }
 
 nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {

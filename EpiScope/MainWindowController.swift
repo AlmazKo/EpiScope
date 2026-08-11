@@ -2602,6 +2602,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return item
     }()
 
+    // Ends the session's process the way `/exit` does from inside it. Shown
+    // only while it is running — see menuNeedsUpdate.
+    private lazy var stopMenuItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Stop Session",
+                              action: #selector(stopClickedSession), keyEquivalent: "")
+        item.target = self
+        return item
+    }()
+
     private func makeRowContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -2614,6 +2623,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         analyze.target = self
         menu.addItem(analyze)
         menu.addItem(resumeMenuItem)
+        menu.addItem(stopMenuItem)
         menu.addItem(deleteSeparator)
         menu.addItem(deleteMenuItem)
         return menu
@@ -2632,6 +2642,18 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         resumeMenuItem.isHidden = !cli
         deleteMenuItem.isHidden = !cli
         deleteSeparator.isHidden = !cli
+        stopMenuItem.isHidden = !(clickedSession().map(canStop) ?? false)
+    }
+
+    // Stoppable: a session of ours that is running right now, under a pid we
+    // are allowed to signal. An external source's session runs on another
+    // machine, and a Claude Desktop one has no process of its own.
+    private func canStop(_ entry: SessionIndexEntry) -> Bool {
+        guard !entry.isExternalSource, !isDesktopSession(entry),
+              entry.provider.stoppableProcess != nil,
+              let live = monitor.liveSessions[entry.sessionId]
+        else { return false }
+        return live.pid > 1
     }
 
     // A Claude / Codex CLI session: one EpiScope can resume from a shell and
@@ -2665,17 +2687,71 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    // Stop a session — the shutdown `/exit` performs, asked for from the table.
+    // An idle session goes straight through: that is the /exit the operator
+    // would have typed. One mid-turn or holding a permission prompt is
+    // confirmed first, because the answer being written ends with it.
+    @objc private func stopClickedSession() {
+        guard let entry = actionSession(), canStop(entry),
+              let live = monitor.liveSessions[entry.sessionId] else { return }
+        let working = live.isWaiting || monitor.busyDuration(for: entry.sessionId) != nil
+        guard working else {
+            performStop(entry, pid: live.pid)
+            return
+        }
+        let name = entry.name ?? entry.title ?? entry.folderName
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Stop “\(name)”?"
+        alert.informativeText = live.isWaiting
+            ? "\(entry.relativePath)\n\nIt is waiting for you; the request it is holding ends with it."
+            : "\(entry.relativePath)\n\nIt is working right now; the turn in progress ends with it."
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard resp == .alertFirstButtonReturn else { return }
+            self?.performStop(entry, pid: live.pid)
+        }
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: confirm)
+        } else {
+            confirm(alert.runModal())
+        }
+    }
+
+    private func performStop(_ entry: SessionIndexEntry, pid: Int) {
+        switch SessionControl.stop(pid: pid, provider: entry.provider) {
+        case .stopped:
+            // The monitor polls liveness every second, so the row leaves the
+            // live set on its own — nothing to refresh here.
+            break
+        case .notRunning, .failed:
+            NSSound.beep()
+        }
+    }
+
     // Delete a session: confirm, then move its transcript to the Trash
     // (recoverable) and reindex so the row drops.
+    //
+    // Deleting a running session stops it first — there is no version of this
+    // that leaves the process alive. The CLI does not hold the transcript open,
+    // so a session that keeps running recreates the file at the same path on its
+    // next message: "delete" would land as a truncation nobody asked for.
     @objc private func deleteClickedSession() {
         guard let entry = actionSession(), isCliSession(entry),
               let url = SessionIndexer.transcriptURL(for: entry) else { return }
         let name = entry.name ?? entry.title ?? entry.folderName
+        let stoppablePid = canStop(entry) ? monitor.liveSessions[entry.sessionId]?.pid : nil
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete “\(name)”?"
         var info = "\(entry.relativePath)\n\nIts transcript will be moved to the Trash."
-        if monitor.liveSessions[entry.sessionId] != nil {
+        if stoppablePid != nil {
+            info += "\n\nThis session is running and will be stopped first."
+        } else if monitor.liveSessions[entry.sessionId] != nil {
+            // Live but not ours to signal (an external source, Claude Desktop):
+            // the warning is all we can offer.
             info += "\n\nThis session is still running."
         }
         alert.informativeText = info
@@ -2683,13 +2759,53 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
         let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-            guard resp == .alertFirstButtonReturn else { return }
-            self?.performDelete(entry, url: url)
+            guard let self, resp == .alertFirstButtonReturn else { return }
+            if let pid = stoppablePid {
+                self.stopThenDelete(entry, url: url, pid: pid)
+            } else {
+                self.performDelete(entry, url: url)
+            }
         }
         if let window {
             alert.beginSheetModal(for: window, completionHandler: confirm)
         } else {
             confirm(alert.runModal())
+        }
+    }
+
+    // The delete waits for the process to actually be gone: a shutting-down CLI
+    // still writes its last records, and trashing the file under it would leave
+    // those records in a recreated transcript.
+    private func stopThenDelete(_ entry: SessionIndexEntry, url: URL, pid: Int) {
+        guard SessionControl.stop(pid: pid, provider: entry.provider) == .stopped else {
+            // Already gone, or the pid is not this session's process after all —
+            // either way there is nothing running to wait for.
+            performDelete(entry, url: url)
+            return
+        }
+        SessionControl.waitForExit(pid: pid, timeout: 5) { [weak self] exited in
+            guard let self else { return }
+            guard exited else {
+                self.reportStopFailed(name: entry.name ?? entry.title ?? entry.folderName)
+                return
+            }
+            self.performDelete(entry, url: url)
+        }
+    }
+
+    // Nothing was deleted, so say so rather than beeping: the operator asked for
+    // two things and got neither.
+    private func reportStopFailed(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” did not stop"
+        alert.informativeText = "Its transcript was left in place. Stop the session "
+            + "from its terminal, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
         }
     }
 
@@ -2743,6 +2859,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if item.action == #selector(copyResumeCommand)
             || item.action == #selector(deleteClickedSession) {
             return clickedSession().map(isCliSession) ?? false
+        }
+        if item.action == #selector(stopClickedSession) {
+            return clickedSession().map(canStop) ?? false
         }
         return true
     }

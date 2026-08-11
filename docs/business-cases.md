@@ -1169,6 +1169,33 @@ The app SHALL reveal the session's own file without copying or changing it.
 - **WHEN** the operator runs `Reveal Transcript in Finder`
 - **THEN** Finder opens the session's `.jsonl`
 
+### Requirement: End a running session from the table
+
+The app SHALL let the operator stop a running session, performing the shutdown
+`/exit` performs inside it, and SHALL signal only the provider's own process.
+
+#### Scenario: Stop an idle session
+- **GIVEN** the session is running and neither working nor waiting on the operator
+- **WHEN** the operator runs `Stop Session`
+- **THEN** its process is asked to terminate, with no confirmation
+- **AND** the row leaves the live set on the next monitor tick
+
+#### Scenario: Stop a session mid-turn
+- **GIVEN** the session is working or holding a permission prompt
+- **WHEN** the operator runs `Stop Session`
+- **THEN** a confirmation names what ends with it
+- **AND** nothing is signalled unless it is confirmed
+
+#### Scenario: The pid does not belong to the session
+- **GIVEN** the published pid is stale, forged or reused by another program
+- **WHEN** the operator runs `Stop Session`
+- **THEN** nothing is signalled
+
+#### Scenario: Sessions that cannot be stopped
+- **GIVEN** the session belongs to an external source, to Claude Desktop, or is
+  not running
+- **THEN** `Stop Session` is not offered
+
 ### Requirement: Make deletion reversible and confirmed
 
 The app SHALL delete a session only after a confirmation and only to the Trash.
@@ -1179,9 +1206,18 @@ The app SHALL delete a session only after a confirmation and only to the Trash.
 - **AND** the details of that session close if they are open
 
 #### Scenario: Deleting a running session
-- **GIVEN** the session is still running
+- **GIVEN** the session is still running and the app may signal its process
+- **WHEN** the operator confirms the delete
+- **THEN** the session is stopped first, and the sheet said so
+- **AND** the transcript moves to the Trash only once the process has exited, so
+  its shutdown records go with it
+- **AND** a session that has not exited within the wait is left alone —
+  transcript in place — and says so
+
+#### Scenario: Deleting a running session the app cannot stop
+- **GIVEN** the session runs under a process that is not ours to signal
 - **WHEN** the confirmation sheet appears
-- **THEN** it says that the session is still running
+- **THEN** it says that the session is still running and only offers the delete
 
 ### Requirement: Keep temporary sessions out of the index
 
