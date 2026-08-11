@@ -43,6 +43,26 @@ def copy_changed(source, destination):
                 raise
 
 
+MAX_DEPTH = 6
+
+# Directories a transcript root is never inside. A mounted home is mostly noise
+# and every descent is a round trip over a network filesystem.
+SKIP_DIRS = {
+    ".git", ".svn", ".hg", "node_modules", "__pycache__", ".venv", "venv",
+    ".cache", ".npm", ".cargo", ".rustup", ".gradle", ".m2", ".Trash",
+    "Applications", "Downloads", "Pictures", "Movies", "Music", "Library",
+}
+
+# Probed at every level instead of walked into, so `Library` and the dot
+# directories stay pruned above.
+KNOWN_SUFFIXES = [
+    (os.path.join(".claude", "projects"), "claude"),
+    (os.path.join(".codex", "sessions"), "codex"),
+    (os.path.join("Library", "Application Support", "Claude",
+                  "local-agent-mode-sessions"), "claude-desktop"),
+]
+
+
 def looks_like_claude(root):
     try:
         for child in os.scandir(root):
@@ -76,23 +96,73 @@ def looks_like_desktop(root):
     return False
 
 
+def classify(path, files):
+    name = os.path.basename(path)
+    if name == "projects" and looks_like_claude(path):
+        return "claude"
+    if name == "local-agent-mode-sessions":
+        return "claude-desktop"
+    if name == "sessions" and os.path.basename(os.path.dirname(path)) == ".codex":
+        return "codex"
+    if any(f.startswith("rollout-") and f.endswith(".jsonl") for f in files):
+        return "codex"
+    return None
+
+
+def discover(source, kinds):
+    """Locate every transcript root under the chosen directory.
+
+    A synced machine is rarely a bare `~/.claude/projects`: it is a mounted home,
+    or a backup holding several agent homes side by side. The snapshot has to end
+    up in the three layouts the indexer knows, so we find the real roots and copy
+    their contents, not the shape of whatever directory was picked.
+    """
+    roots = []
+    for base, dirs, files in os.walk(source, topdown=True):
+        relative = os.path.relpath(base, source)
+        depth = 0 if relative == "." else relative.count(os.sep) + 1
+
+        for suffix, kind in KNOWN_SUFFIXES:
+            candidate = os.path.join(base, suffix)
+            if kind in kinds and os.path.isdir(candidate):
+                roots.append((candidate, kind))
+
+        kind = classify(base, files)
+        if kind:
+            if kind in kinds:
+                roots.append((base, kind))
+            dirs[:] = []
+            continue
+
+        dirs[:] = [] if depth >= MAX_DEPTH else [
+            d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+    return roots
+
+
 def roots_for(source, layout):
+    kinds = {
+        "claude": {"claude"},
+        "codex": {"codex"},
+        "claudeDesktop": {"claude-desktop"},
+    }.get(layout, {"claude", "codex", "claude-desktop"})
+
+    found = discover(source, kinds)
+    if found:
+        # Two agent homes can hold the same project directory name; the copies
+        # merge and session ids stay unique, so order only decides who writes first.
+        seen = set()
+        return [(path, kind) for path, kind in found
+                if not (path in seen or seen.add(path))]
+
+    # Nothing carried a recognised name — trust an explicit layout, and sniff
+    # the directory itself when the operator asked for auto detection.
     if layout == "claude":
         return [(source, "claude")]
     if layout == "codex":
         return [(source, "codex")]
     if layout == "claudeDesktop":
         return [(source, "claude-desktop")]
-
-    known = [
-        (os.path.join(source, ".claude", "projects"), "claude"),
-        (os.path.join(source, ".codex", "sessions"), "codex"),
-        (os.path.join(source, "Library", "Application Support", "Claude",
-                      "local-agent-mode-sessions"), "claude-desktop"),
-    ]
-    found = [(path, kind) for path, kind in known if os.path.isdir(path)]
-    if found:
-        return found
     if looks_like_claude(source):
         return [(source, "claude")]
     if looks_like_codex(source):

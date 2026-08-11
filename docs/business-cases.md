@@ -1215,6 +1215,13 @@ directories from `Settings → Session Sources…`.
 - **AND** never mounts, writes to or deletes from the selected directory
 - **AND** sessions keep their original globally unique `sessionId`
 
+#### Scenario: The layout sits below the selected directory
+- **GIVEN** the selected directory is a mounted home, a backup, or holds several agent homes side by side
+- **WHEN** the source synchronises
+- **THEN** every recognised root below it is found, whatever its depth
+- **AND** their transcripts merge into one snapshot per provider
+- **AND** the sessions appear in the main table like any other source
+
 #### Scenario: An external source becomes unavailable
 - **GIVEN** the source has completed at least one successful synchronisation
 - **WHEN** its directory disappears, blocks or returns an error
