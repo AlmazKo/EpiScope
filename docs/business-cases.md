@@ -1238,10 +1238,18 @@ directories from `Settings → Session Sources…`.
 
 #### Scenario: The main session list covers every source
 - **WHEN** the Sessions window opens
-- **THEN** the table shows sessions from every enabled source together, with no
-  per-source picker in the toolbar
+- **THEN** the table shows sessions from every enabled source together
 - **AND** which sources count at all is decided in `Settings → Session Sources…`,
   the one place that governs them
+
+#### Scenario: Narrowing the table to one source
+- **WHEN** the operator picks a source in the toolbar
+- **THEN** the table shows only that source's sessions
+- **AND** an offline source is offered too, labelled Offline, because its
+  snapshot is still indexed
+- **AND** `Show all` drops the source along with the range, the filter text and
+  the selection
+- **AND** disabling the selected source in Settings returns the table to All Sources
 
 ---
 
