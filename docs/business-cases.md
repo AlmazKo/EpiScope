@@ -1161,6 +1161,13 @@ by hand.
 - **WHEN** the operator runs `Copy Resume Command` on a Codex session
 - **THEN** the clipboard holds `codex resume <id>`
 
+#### Scenario: A Claude Desktop Code tab
+- **GIVEN** the session ran in the Claude app's Code tab
+- **THEN** `Copy Resume Command` and `Delete Session…` are offered, because it is
+  ordinary Claude Code and its transcript is the CLI's own
+- **AND** a local-agent-mode session is offered neither: the CLI cannot address a
+  session it never wrote
+
 ### Requirement: Reach the original transcript
 
 The app SHALL reveal the session's own file without copying or changing it.
@@ -1192,9 +1199,10 @@ The app SHALL let the operator stop a running session, performing the shutdown
 - **THEN** nothing is signalled
 
 #### Scenario: Sessions that cannot be stopped
-- **GIVEN** the session belongs to an external source, to Claude Desktop, or is
-  not running
-- **THEN** `Stop Session` is not offered
+- **GIVEN** the session is finished, or runs as a Claude Desktop Code tab
+- **THEN** `Stop Session` is listed with the other session actions but disabled
+- **AND** it is not listed at all where no session action applies — an external
+  source's session, or the local-agent-mode store
 
 ### Requirement: Make deletion reversible and confirmed
 
@@ -1214,10 +1222,10 @@ The app SHALL delete a session only after a confirmation and only to the Trash.
 - **AND** a session that has not exited within the wait is left alone —
   transcript in place — and says so
 
-#### Scenario: Deleting a running session the app cannot stop
-- **GIVEN** the session runs under a process that is not ours to signal
+#### Scenario: Deleting a running Claude Desktop Code tab
+- **GIVEN** the session runs in the Claude app, which the app does not stop
 - **WHEN** the confirmation sheet appears
-- **THEN** it says that the session is still running and only offers the delete
+- **THEN** it says so, and says the delete removes only what has been written so far
 
 ### Requirement: Keep temporary sessions out of the index
 

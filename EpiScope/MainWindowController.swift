@@ -29,7 +29,10 @@ extension Notification.Name {
 // Expansion state is preserved across reloads keyed by cwd.
 
 @MainActor
-final class MainWindowController: NSWindowController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate {
+// NSMenuItemValidation is declared here rather than left implicit: without the
+// conformance validateMenuItem is not @objc, AppKit never finds it, and every
+// row action stays enabled on a row it does not apply to.
+final class MainWindowController: NSWindowController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let indexer: SessionIndexer
     private let monitor: SessionMonitor
     private let searchIndex: SearchIndex
@@ -2642,12 +2645,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         resumeMenuItem.isHidden = !cli
         deleteMenuItem.isHidden = !cli
         deleteSeparator.isHidden = !cli
-        stopMenuItem.isHidden = !(clickedSession().map(canStop) ?? false)
+        // Stop rides with the other session actions and greys out instead of
+        // vanishing: a row that cannot be stopped — finished, or a Code tab the
+        // app owns — should say the action exists and does not apply, not leave
+        // the menu a different shape each time it opens. validateMenuItem
+        // decides enablement.
+        stopMenuItem.isHidden = !cli
     }
 
     // Stoppable: a session of ours that is running right now, under a pid we
     // are allowed to signal. An external source's session runs on another
-    // machine, and a Claude Desktop one has no process of its own.
+    // machine. A Claude Desktop one is excluded even where it has a process of
+    // its own — a Code tab does — because ending it closes a tab in the app
+    // rather than performing the /exit that was typed into it.
     private func canStop(_ entry: SessionIndexEntry) -> Bool {
         guard !entry.isExternalSource, !isDesktopSession(entry),
               entry.provider.stoppableProcess != nil,
@@ -2657,12 +2667,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     // A Claude / Codex CLI session: one EpiScope can resume from a shell and
-    // whose transcript it owns (so can move to the Trash). Excludes the
-    // app-managed Claude desktop store.
+    // whose transcript it owns (so can move to the Trash).
+    //
+    // A Claude Desktop *Code tab* qualifies: it is ordinary Claude Code, and its
+    // transcript sits in ~/.claude/projects, exactly where `claude --resume`
+    // looks. Only the local-agent-mode store is out — it is the app's own, and
+    // the CLI cannot address a session it never wrote.
     private func isCliSession(_ entry: SessionIndexEntry) -> Bool {
         !entry.isExternalSource
             && (entry.provider == .claude || entry.provider == .codex)
-            && !isDesktopSession(entry)
     }
 
     // `cd '<cwd>' && claude --resume <id>` (codex: `codex resume <id>`),
@@ -2750,9 +2763,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if stoppablePid != nil {
             info += "\n\nThis session is running and will be stopped first."
         } else if monitor.liveSessions[entry.sessionId] != nil {
-            // Live but not ours to signal (an external source, Claude Desktop):
-            // the warning is all we can offer.
-            info += "\n\nThis session is still running."
+            // Live and not ours to stop — a Claude Desktop Code tab. It writes
+            // an ordinary CLI transcript, so it recreates the file on its next
+            // message; say what the delete actually leaves behind.
+            info += "\n\nThis session runs in the Claude app, which EpiScope cannot "
+                + "stop. Deleting now removes only what it has written so far."
         }
         alert.informativeText = info
         alert.addButton(withTitle: "Delete")
