@@ -1093,10 +1093,18 @@ final class TerminalTracker: NSObject {
         }
 
         if !located {
-            // No focus signal exists for this session, so the attended
-            // dance can't apply — never derive an unacknowledgeable "done".
             if sig == "needs_permission" || status == "waiting" { return "needs_permission" }
             if sig == "thinking" || status == "busy" { return "thinking" }
+            // A Stop hook is a fact the session reported, and it can be cleared
+            // without focus: opening the session through EpiScope deletes the
+            // signal, and the next turn overwrites it. What must not happen for
+            // a session with no focus signal is *deriving* done from an idle
+            // status — that guess has nothing to delete, so it would stick.
+            //
+            // A JetBrains-hosted session is exactly this case (ancestry finds
+            // its app, no adapter finds its window), and it spent a long time
+            // reporting Idle when the turn had actually finished.
+            if sig == "done" { return "done" }
             return "idle"
         }
 

@@ -514,6 +514,15 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **WHEN** the operator opens its window
 - **THEN** the status resets
 
+#### Scenario: A finished turn in a host whose focus cannot be watched
+- **GIVEN** the session runs somewhere no adapter reports window focus — a
+  JetBrains terminal, the Claude app
+- **WHEN** its Stop hook reports the turn finished
+- **THEN** the status still reads `Finished`, because opening the session
+  through EpiScope clears it and the next turn overwrites it
+- **AND** an idle status alone never becomes `Finished` there: that guess leaves
+  nothing to clear, so it would never go away
+
 #### Scenario: A failed stream ends a live turn
 - **GIVEN** Claude's API stream fails and no Stop hook fires
 - **WHEN** Claude's live session status returns from `busy` to `idle`
