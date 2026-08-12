@@ -596,6 +596,27 @@ that billed tokens inside that range.
 - **THEN** the range clears rather than filtering the table from behind a chart that no longer shows it
 - **AND** the selected session survives it — only a click on the chart means the operator asked for everything back
 
+### Requirement: Limit the table to the chart window
+
+The app SHALL offer a setting that keeps in the table only sessions last active
+inside the chart window, and it SHALL be off by default.
+
+#### Scenario: The toggle is on
+- **GIVEN** `Settings → Chart Window Only` is on
+- **WHEN** the table rebuilds
+- **THEN** it holds only sessions whose last activity falls inside the chart window
+- **AND** the count, the grouping and the chart all read that same set
+- **AND** changing `Settings → Chart Window` changes which sessions those are
+
+#### Scenario: The window holds nothing
+- **GIVEN** the setting is on and the index is not empty
+- **WHEN** no session was active inside the window
+- **THEN** the empty table names the window and the setting responsible
+
+#### Scenario: The toggle is off
+- **WHEN** the app is first run
+- **THEN** the setting is off and the table is the whole history
+
 ### Requirement: Group by project
 
 The app SHALL be able to group the table and the chart by working directory.

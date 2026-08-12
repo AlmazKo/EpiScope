@@ -1367,6 +1367,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Main menu (top-of-screen menu bar)
 
     private static let showTemporaryKey = "showTemporarySessions"
+    // Mirrors MainWindowController.chartWindowOnlyKey — the toggle lives here,
+    // the filtering lives there.
+    private static let chartWindowOnlyKey = "limitTableToChartWindow"
 
     private func makeMainMenu() -> NSMenu {
         let main = NSMenu()
@@ -1482,6 +1485,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         chartWindowMenu.delegate = self
         chartWindowItem.submenu = chartWindowMenu
         viewMenu.addItem(chartWindowItem)
+
+        // Sits under Chart Window because it is that setting's reach: the same
+        // span, applied to the table instead of only to the bars.
+        let chartWindowOnly = NSMenuItem(
+            title: "Chart Window Only",
+            action: #selector(toggleChartWindowOnly),
+            keyEquivalent: ""
+        )
+        chartWindowOnly.target = self
+        chartWindowOnly.identifier = NSUserInterfaceItemIdentifier("view.chartWindowOnly")
+        chartWindowOnly.toolTip = "Show only sessions last active inside the chart window"
+        viewMenu.addItem(chartWindowOnly)
 
         let chartBarsItem = NSMenuItem(title: "Chart Bars", action: nil, keyEquivalent: "")
         let chartBarsMenu = NSMenu(title: "Chart Bars")
@@ -1606,6 +1621,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.windowsMenu = windowMenu
 
         return main
+    }
+
+    @objc private func toggleChartWindowOnly() {
+        let key = Self.chartWindowOnlyKey
+        UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: key), forKey: key)
+        NotificationCenter.default.post(name: .signalChartWindowOnlyChanged, object: nil)
     }
 
     @objc private func toggleShowTemporary() {

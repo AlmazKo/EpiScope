@@ -9,6 +9,8 @@ extension Notification.Name {
     // Fired by AppDelegate when the user toggles Show Temporary in the
     // Settings submenu. MainWindowController reapplies the filter.
     static let signalShowTemporaryChanged = Notification.Name("episcope.showTemporaryChanged")
+    // Same, for the toggle that ties the table to the chart window.
+    static let signalChartWindowOnlyChanged = Notification.Name("episcope.chartWindowOnlyChanged")
     // Fired by ReportStore.save() whenever an analysis report is written (a
     // background daily/weekly insight, or a user-run retro/question).
     // MainWindowController refreshes the unread badge on the Insights item.
@@ -207,6 +209,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         set { UserDefaults.standard.set(newValue, forKey: Self.showTempKey) }
     }
 
+    // Off by default: the table is the whole history, and the chart window is a
+    // reading of the recent part of it. Turning this on makes them one view.
+    private static let chartWindowOnlyKey = "limitTableToChartWindow"
+    private var chartWindowOnly: Bool {
+        UserDefaults.standard.bool(forKey: Self.chartWindowOnlyKey)
+    }
+
     private enum ColumnID {
         static let colorDot = NSUserInterfaceItemIdentifier("col.colorDot")
         static let permWait = NSUserInterfaceItemIdentifier("col.permWait")
@@ -279,6 +288,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             self,
             selector: #selector(handleShowTemporaryChanged),
             name: .signalShowTemporaryChanged,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleChartWindowOnlyChanged),
+            name: .signalChartWindowOnlyChanged,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -909,7 +924,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // pipeline. The indexer itself is also told to skip them (so
         // they don't contribute to the loading indicator either).
         let raw = indexer.entries
-        allEntries = showTemporary ? raw : raw.filter { !$0.isTemporary }
+        var kept = showTemporary ? raw : raw.filter { !$0.isTemporary }
+        // Same footing as Show Temporary: a setting, applied before the table
+        // counts anything, rather than a narrowing the operator undoes here.
+        if chartWindowOnly {
+            let start = Date().addingTimeInterval(-Double(TokenChartView.windowDays) * 24 * 3600)
+            kept = kept.filter { $0.lastActivity >= start }
+        }
+        allEntries = kept
         claudeEffort = Self.readClaudeEffort()
         applyFilter()
     }
@@ -1011,9 +1033,18 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         let text: String
         switch (allEntries.isEmpty, ranged, term.isEmpty) {
         case (true, _, _):
-            text = indexer.pendingDeepScan > 0
-                ? "Reading sessions…"
-                : "No sessions yet. Start one in Claude Code or Codex and it shows up here."
+            let days = TokenChartView.windowDays
+            if indexer.pendingDeepScan > 0 {
+                text = "Reading sessions…"
+            } else if chartWindowOnly, !indexer.entries.isEmpty {
+                // The index is not empty — the window is. Name it, since the
+                // sessions are there and nothing on this screen says why they
+                // are not.
+                text = "No sessions in the last \(days == 1 ? "day" : "\(days) days")"
+                    + " — Settings → Chart Window Only."
+            } else {
+                text = "No sessions yet. Start one in Claude Code or Codex and it shows up here."
+            }
         case (false, true, false):
             text = "Nothing matching “\(term)” in the selected range."
         case (false, true, true):
@@ -1532,7 +1563,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // window) and recompute against the new range.
     func chartWindowChanged() {
         guard window?.isVisible == true else { return }
+        // With the table tied to the window, changing the window changes which
+        // sessions exist as far as the table is concerned.
+        if chartWindowOnly { refreshFromIndex() }
         reloadChart()
+    }
+
+    @objc func handleChartWindowOnlyChanged() {
+        guard window?.isVisible == true else { return }
+        refreshFromIndex()
+        refreshStatusLabel()
     }
 
     @objc private func chartModeChanged() {
