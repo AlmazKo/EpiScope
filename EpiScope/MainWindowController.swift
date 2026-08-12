@@ -108,8 +108,6 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let listSearchItem = NSSearchToolbarItem(itemIdentifier: .search)
     private let detailsSearchItem = NSSearchToolbarItem(itemIdentifier: .search)
     private let deepSearchItem = NSSearchToolbarItem(itemIdentifier: .deepSearchField)
-    private let sourceFilterButton = NSPopUpButton(frame: .zero, pullsDown: false)
-    private var selectedSourceID: String?
     // The copy items (one per toolbar) flip to a checkmark for a beat
     // after copying — toolbar labels are hidden in icon mode, so the
     // feedback has to live in the image.
@@ -932,7 +930,6 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         let term = searchTerm.lowercased()
         let brushed = chartSelection?.sessionIds
         filteredEntries = allEntries.filter { e in
-            if let selectedSourceID, e.sourceID != selectedSourceID { return false }
             if let brushed, !brushed.contains(e.sessionId) { return false }
             if term.isEmpty { return true }
             return e.relativePath.lowercased().contains(term)
@@ -979,7 +976,6 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // filter someone set on this screen and expects to drop again.
     private var hasActiveFilters: Bool {
         chartSelection != nil
-            || selectedSourceID != nil
             || !searchTerm.trimmingCharacters(in: .whitespaces).isEmpty
             || outlineView.selectedRow >= 0
     }
@@ -998,10 +994,6 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if !searchTerm.isEmpty {
             listSearchItem.searchField.stringValue = ""
             searchTerm = ""
-        }
-        if selectedSourceID != nil {
-            selectedSourceID = nil
-            sourceFilterButton.selectItem(at: 0)
         }
         outlineView.deselectAll(nil)
         applyFilter(forceReorder: true)
@@ -1030,62 +1022,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             text = "Nothing matching “\(term)”."
         case (false, false, true):
             // Every session is filtered out by something that is not on this
-            // screen at all, so the setting has to be named. The source picker
-            // is on screen, but its name is what makes the emptiness readable.
-            if let selectedSourceID,
-               let source = SessionSourceStore.shared.source(id: selectedSourceID) {
-                text = "No sessions from “\(source.name)”."
-            } else {
-                text = showTemporary
-                    ? "No sessions to show."
-                    : "No sessions to show. Temporary ones are hidden — Settings → Show Temporary."
-            }
+            // screen at all, so the setting has to be named.
+            text = showTemporary
+                ? "No sessions to show."
+                : "No sessions to show. Temporary ones are hidden — Settings → Show Temporary."
         }
         emptyLabel.stringValue = text
         emptyLabel.isHidden = false
     }
 
     @objc private func sessionSourcesChanged() {
-        rebuildSourceFilter()
         refreshFromIndex()
         updateOpenSessionToolbarItems()
         outlineView.reloadData()
-    }
-
-    // The picker lists what the index can actually hold: the three built-ins
-    // and every enabled custom source, offline ones included — their snapshot
-    // is still indexed, so filtering to them still shows sessions.
-    private func rebuildSourceFilter() {
-        let previous = selectedSourceID
-        sourceFilterButton.removeAllItems()
-        sourceFilterButton.addItem(withTitle: "All Sources")
-        sourceFilterButton.lastItem?.representedObject = nil
-        let sources = SessionSourceStore.shared.allSources.filter {
-            $0.id.hasPrefix("builtin.") || $0.enabled
-        }
-        if !sources.isEmpty { sourceFilterButton.menu?.addItem(.separator()) }
-        for source in sources {
-            let suffix = SessionSourceStore.shared.isOffline(sourceID: source.id) ? " · Offline" : ""
-            let item = NSMenuItem(title: source.name + suffix, action: nil, keyEquivalent: "")
-            item.representedObject = source.id
-            sourceFilterButton.menu?.addItem(item)
-        }
-        // A source that was disabled while selected takes the filter with it,
-        // rather than leaving a value nothing on screen can reset.
-        if let previous,
-           let item = sourceFilterButton.itemArray.first(where: {
-               ($0.representedObject as? String) == previous
-           }) {
-            sourceFilterButton.select(item)
-        } else {
-            selectedSourceID = nil
-            sourceFilterButton.selectItem(at: 0)
-        }
-    }
-
-    @objc private func selectSourceFilter(_ sender: NSPopUpButton) {
-        selectedSourceID = sender.selectedItem?.representedObject as? String
-        applyFilter(forceReorder: true)
     }
 
     // True when both trees hold the same sessions and the same groups —
@@ -3885,7 +3834,6 @@ extension NSToolbarItem.Identifier {
     static let expandAll = NSToolbarItem.Identifier("episcope.expandAll")
     static let back = NSToolbarItem.Identifier("episcope.back")
     static let chartMode = NSToolbarItem.Identifier("episcope.chartMode")
-    static let sourceFilter = NSToolbarItem.Identifier("episcope.sourceFilter")
     static let search = NSToolbarItem.Identifier("episcope.search")
     static let deepSearch = NSToolbarItem.Identifier("episcope.deepSearch")
     static let deepSearchField = NSToolbarItem.Identifier("episcope.deepSearchField")
@@ -3943,8 +3891,7 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
         // island with full search rather than beside session-scoped actions.
         var ids: [NSToolbarItem.Identifier] = [.reindex, .space, .copySession, .messages, .openTerminal]
         if groupByDir { ids += [.collapseAll, .expandAll] }
-        ids += [.flexibleSpace, .chartMode, .flexibleSpace, .analyze, .deepSearch,
-                .sourceFilter, .search]
+        ids += [.flexibleSpace, .chartMode, .flexibleSpace, .analyze, .deepSearch, .search]
         return ids
     }
 
@@ -3998,18 +3945,6 @@ extension MainWindowController: NSToolbarDelegate, NSToolbarItemValidation {
             let item = NSToolbarItem(itemIdentifier: id)
             item.view = chartModeControl
             item.label = "Chart mode"
-            return item
-        case .sourceFilter:
-            sourceFilterButton.target = self
-            sourceFilterButton.action = #selector(selectSourceFilter(_:))
-            sourceFilterButton.controlSize = .regular
-            sourceFilterButton.toolTip = "Filter sessions by source"
-            sourceFilterButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
-            sourceFilterButton.widthAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
-            rebuildSourceFilter()
-            let item = NSToolbarItem(itemIdentifier: id)
-            item.label = "Sources"
-            item.view = sourceFilterButton
             return item
         case .search:
             return toolbar === detailsToolbar ? detailsSearchItem : listSearchItem
