@@ -131,7 +131,7 @@ without the operator switching to the terminal tab.
 #### Scenario: A session stops on a prompt
 - **WHEN** any session enters the waiting-for-permission state
 - **THEN** its bar turns red, stops scrolling and blinks at 1 Hz
-- **AND** the selected system sound plays if `Settings → Sound` is on
+- **AND** the sound picked in `Settings → Alerts` plays, unless it is None
 
 #### Scenario: A session waits for an answer
 - **WHEN** a session finishes a step and waits on the operator
@@ -655,6 +655,38 @@ The app SHALL index incrementally and show progress while it works.
 - **THEN** the row keeps the numbers from the previous pass
 - **AND** it never blanks its title, project and cost between ticks
 
+### Requirement: Keep settings in one window with sections
+
+The app SHALL offer a settings window shaped like System Settings — a sidebar of
+sections, each shown as islands — and SHALL keep the settings that need more
+than a menu item there.
+
+#### Scenario: Opening Settings
+- **WHEN** the operator presses ⌘, or picks `EpiScope → Settings…`
+- **THEN** a settings window opens with a source-list sidebar naming its
+  sections — `Alerts`, `Sources` and `Insights` — each with its own tinted icon
+- **AND** the section on screen is titled above its content
+- **AND** its controls sit in rounded islands, one row per control, with the
+  explanation under the island rather than beside the control
+
+#### Scenario: One place per setting
+- **WHEN** a setting has a section in this window
+- **THEN** the menu bar does not carry a second way to reach it
+
+#### Scenario: The banner permission
+- **WHEN** `Settings → Alerts` appears
+- **THEN** it reads the current notification grant from the system rather than a
+  pref of its own, and says which of the three states it is in
+- **WHEN** the grant has never been asked for
+- **THEN** the button asks for it, and the state updates on the answer
+- **WHEN** it was granted or refused
+- **THEN** the button opens System Settings, which owns the switch from then on
+
+#### Scenario: Choosing the alert sound
+- **WHEN** the operator picks a sound in `Settings → Alerts`
+- **THEN** it plays once, through the same player the alarm itself uses
+- **AND** `None` silences the alarm without touching the banner
+
 ### Requirement: Keep the filter across navigation
 
 The app SHALL keep the table's quick filter when the operator moves into a
@@ -1175,13 +1207,35 @@ The app SHALL run the analysis locally.
 The app SHALL limit the Insights settings to a switch and a model choice.
 
 #### Scenario: The settings for Insights
-- **WHEN** the operator opens Settings
-- **THEN** only `Automatic Insights` (on/off) and `Analysis Model` are offered
+- **WHEN** the operator opens `Settings → Insights`
+- **THEN** only automatic runs (on/off) and the analysis model are offered
 - **AND** `Analysis Model` groups its choices by the CLI that runs them: Claude
   Code (Sonnet 4.6 by default, Sonnet 5, Opus 5, Opus 4.8, Haiku 4.5) and Codex
 - **AND** the Codex choice names no model of its own — it runs whatever
   `~/.codex/config.toml` selects, because which models a CLI accepts depends on
   its version and the account's plan
+
+### Requirement: Let the prompts be edited and put back
+
+The analysis prompts already ship as files an override can replace. The app
+SHALL make that override editable under `Settings → Insights` — the run, its
+model and its prompt are one subject — and SHALL keep the way back.
+
+#### Scenario: Editing a prompt
+- **GIVEN** `Settings → Insights` is open on one of the prompt templates
+- **WHEN** the operator edits it
+- **THEN** the edit is saved as the user copy that runs from then on, and the
+  pane says the bundled default is no longer followed
+- **AND** the placeholders the run fills in are listed, read from the bundled copy
+
+#### Scenario: Restoring a default
+- **WHEN** the operator restores the default and confirms
+- **THEN** the user copy moves to the Trash and the bundled prompt runs again,
+  including whatever later releases change in it
+
+#### Scenario: A prompt that was never edited
+- **WHEN** the pane opens on a template with no user copy
+- **THEN** it shows the bundled text and offers nothing to restore
 
 **Out of scope:** a manual run over an arbitrary scope, and an ask-a-question
 field. Both were removed on purpose — the surface stays automatic.
@@ -1297,7 +1351,7 @@ files owned by other tools.
 
 The app SHALL keep the built-in Claude Code, Codex and Claude Desktop roots
 working without configuration and SHALL let the operator add read-only session
-directories from `Settings → Session Sources…`.
+directories from `Settings → Sources`.
 
 #### Scenario: Add a mounted agent home
 - **GIVEN** a directory contains a recognised Claude Code, Codex or Claude Desktop layout

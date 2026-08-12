@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var mainWindow = MainWindowController(indexer: indexer, monitor: monitor, searchIndex: searchIndex, reports: reportsWindow)
     private let reportStore = ReportStore()
     private let analysisRunner = AnalysisRunner()
-    private lazy var sourcesWindow = SessionSourcesWindowController()
+    private lazy var settingsWindow = SettingsWindowController()
     private lazy var reportsWindow = ReportsWindowController(
         indexer: indexer, searchIndex: searchIndex,
         store: reportStore, runner: analysisRunner)
@@ -44,22 +44,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var fleetMenuItems: [String: NSMenuItem] = [:]
     private var fleetMenuStates: [String: FleetState] = [:]
     private var fleetIconCache: [FleetIconCacheKey: NSImage] = [:]
-
-    // Sound shown in the menu under "Sound ▶". "None" disables the
-    // chime entirely. Persisted in UserDefaults under chimeSoundKey.
-    private static let chimeSoundKey = "chimeSound"
-    private static let chimeNone = "None"
-    private static let chimeDefault = "Glass"
-    private static let chimeChoices: [String] = [
-        chimeNone,
-        "Basso", "Blow", "Bottle", "Frog", "Funk", "Glass",
-        "Hero", "Morse", "Ping", "Pop", "Purr",
-        "Sosumi", "Submarine", "Tink",
-    ]
-
-    private var chimeSoundName: String {
-        UserDefaults.standard.string(forKey: Self.chimeSoundKey) ?? Self.chimeDefault
-    }
 
 
     // Shared content width for the status-bar dropdown: the limit gauges are
@@ -342,41 +326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentFleet().map { $0.state.bar }
     }
 
-    private func playChime() {
-        let name = chimeSoundName
-        guard name != Self.chimeNone else { return }
-        playSystemSound(named: name)
-    }
-
-    // Short alert chime via /usr/bin/afplay — a throwaway child process plays
-    // the file (on the main output, i.e. master volume) and exits. Any in-process
-    // audio API (AVAudioPlayer, AudioServices, NSSound) initialises CoreAudio in
-    // *our* process and leaves its threads warm; afplay keeps all of that in the
-    // child, so EpiScope spins up no audio threads at all. Falls back to NSSound
-    // if afplay is somehow unavailable.
-    private func playSystemSound(named name: String) {
-        let path = "/System/Library/Sounds/\(name).aiff"
-        guard FileManager.default.fileExists(atPath: path) else {
-            NSSound(named: name)?.play()
-            return
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        p.arguments = [path]
-        // Hold the Process until it exits so its child is reaped (no zombie);
-        // the handler drops it once afplay finishes.
-        p.terminationHandler = { [weak self] proc in
-            DispatchQueue.main.async { self?.chimeProcs.removeAll { $0 === proc } }
-        }
-        do {
-            try p.run()
-            chimeProcs.append(p)
-        } catch {
-            NSSound(named: name)?.play()
-        }
-    }
-    // afplay children in flight, kept alive until they exit (see above).
-    private var chimeProcs: [Process] = []
+    private func playChime() { Chime.playCurrent() }
 
     // MARK: - Menu
 
@@ -392,12 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshColumnsMenu(menu)
         case "Chart Window":
             refreshChartWindowMenu(menu)
-        case "Analysis Model":
-            refreshAnalysisModelMenu(menu)
         case "Chart Bars":
             refreshChartBarsMenu(menu)
-        case "Sound":
-            refreshSoundsMenu(menu)
         default:
             rebuildMenu(menu)
         }
@@ -558,49 +504,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.state = UserDefaults.standard.bool(
                     forKey: Self.showTemporaryKey
                 ) ? .on : .off
+            case "view.chartWindowOnly":
+                item.state = UserDefaults.standard.bool(
+                    forKey: Self.chartWindowOnlyKey
+                ) ? .on : .off
             case "view.groupByDir":
                 item.state = mainWindow.isGroupByDirEnabled ? .on : .off
             case "view.limitGauges":
                 item.state = limitGaugesEnabled ? .on : .off
-            case "view.dailyInsights":
-                item.state = dailyInsightsEnabled ? .on : .off
             case "view.launchAtLogin":
                 item.state = LoginItem.isEnabled ? .on : .off
-            case "view.notifications":
-                // getNotificationSettings is async — the state lands a
-                // beat after the menu opens, which NSMenu repaints fine.
-                refreshNotificationsItem(item)
             default:
                 break
-            }
-        }
-    }
-
-    private func refreshNotificationsItem(_ item: NSMenuItem) {
-        UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let status = settings.authorizationStatus
-            DispatchQueue.main.async {
-                item.state = (status == .authorized || status == .provisional) ? .on : .off
-            }
-        }
-    }
-
-    @objc private func notificationsRowClicked() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationSettings { settings in
-            DispatchQueue.main.async {
-                switch settings.authorizationStatus {
-                case .notDetermined:
-                    center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-                default:
-                    // Granted or denied — either way the OS owns the
-                    // switch now; take the user straight to it.
-                    let bid = Bundle.main.bundleIdentifier ?? ""
-                    if let url = URL(string:
-                        "x-apple.systempreferences:com.apple.preference.notifications?id=\(bid)") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
             }
         }
     }
@@ -1387,6 +1302,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         aboutItem.target = self
         appMenu.addItem(aboutItem)
         appMenu.addItem(.separator())
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(showSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(
             title: "Hide EpiScope",
             action: #selector(NSApplication.hide(_:)),
@@ -1461,14 +1384,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         groupByDir.identifier = NSUserInterfaceItemIdentifier("view.groupByDir")
         viewMenu.addItem(groupByDir)
 
-        let sessionSources = NSMenuItem(
-            title: "Session Sources…",
-            action: #selector(showSessionSources),
-            keyEquivalent: ""
-        )
-        sessionSources.target = self
-        viewMenu.addItem(sessionSources)
-
         // Off by default — the limit gauges in the status-bar dropdown are
         // opt-in, since not everyone wants them taking up the menu.
         let limitGauges = NSMenuItem(
@@ -1522,45 +1437,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.target = self
         loginItem.identifier = NSUserInterfaceItemIdentifier("view.launchAtLogin")
         viewMenu.addItem(loginItem)
-
-        let soundItem = NSMenuItem(title: "Sound", action: nil, keyEquivalent: "")
-        let soundMenu = NSMenu(title: "Sound")
-        soundMenu.delegate = self
-        soundItem.submenu = soundMenu
-        viewMenu.addItem(soundItem)
-
-        // The tracker requests notification authorization once at launch,
-        // but if the user dismissed/denied that prompt (or the grant got
-        // lost — e.g. the app ran from the DMG instead of /Applications)
-        // there is no UI path back. This row is the recovery: checkmark
-        // mirrors the current grant; clicking either re-requests or jumps
-        // to System Settings → Notifications when only the OS can fix it.
-        let notifications = NSMenuItem(
-            title: "Notifications",
-            action: #selector(notificationsRowClicked),
-            keyEquivalent: ""
-        )
-        notifications.target = self
-        notifications.identifier = NSUserInterfaceItemIdentifier("view.notifications")
-        viewMenu.addItem(notifications)
-
-        viewMenu.addItem(.separator())
-        // Daily Insights — the only two controls (product decision): on/off
-        // and the analysis model. No other customization.
-        let dailyInsights = NSMenuItem(
-            title: "Automatic Insights",
-            action: #selector(toggleDailyInsights),
-            keyEquivalent: ""
-        )
-        dailyInsights.target = self
-        dailyInsights.identifier = NSUserInterfaceItemIdentifier("view.dailyInsights")
-        viewMenu.addItem(dailyInsights)
-
-        let analysisModelItem = NSMenuItem(title: "Analysis Model", action: nil, keyEquivalent: "")
-        let analysisModelMenu = NSMenu(title: "Analysis Model")
-        analysisModelMenu.delegate = self
-        analysisModelItem.submenu = analysisModelMenu
-        viewMenu.addItem(analysisModelItem)
 
         if debugMode {
             let recompute = NSMenuItem(
@@ -1639,12 +1515,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         indexer.kickReindex()
     }
 
-    @objc private func showSessionSources() {
+    // A dock-less run has to become a regular app first, or the window opens
+    // behind everything with no way to reach it.
+    @objc private func showSettings() {
         if NSApp.activationPolicy() != .regular { NSApp.setActivationPolicy(.regular) }
-        NSApp.activate(ignoringOtherApps: true)
-        sourcesWindow.window?.center()
-        sourcesWindow.showWindow(nil)
-        sourcesWindow.window?.makeKeyAndOrderFront(nil)
+        settingsWindow.show()
     }
 
     // On by default; the toggle persists an explicit choice. The status-bar
@@ -1658,14 +1533,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(!limitGaugesEnabled, forKey: Self.limitGaugesKey)
     }
 
-    // Daily Insights runs automatically once a day; per the product decision
-    // the only controls are this on/off and the analysis model below.
+    // Daily Insights runs automatically once a day. Its two controls (on/off
+    // and the analysis model) live in Settings → Insights; this side only reads
+    // the pref to decide whether a scheduled run happens.
     static let dailyInsightsEnabledKey = "dailyInsightsEnabled"
     private var dailyInsightsEnabled: Bool {
         UserDefaults.standard.object(forKey: Self.dailyInsightsEnabledKey) as? Bool ?? true
-    }
-    @objc private func toggleDailyInsights() {
-        UserDefaults.standard.set(!dailyInsightsEnabled, forKey: Self.dailyInsightsEnabledKey)
     }
 
     // Debug affordance (hidden unless `defaults write almazko.EpiScope debugMode
@@ -1678,62 +1551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reportsWindow.runDailyInsights()
     }
 
-    @objc private func setAnalysisModel(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(id, forKey: "analysisModel")
-    }
-    private func refreshAnalysisModelMenu(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let current = ReportsWindowController.defaultModel
-        // Grouped by engine and labelled with it: which CLI a run shells out to
-        // decides whose plan pays for it and which login has to be there, so it
-        // is not an implementation detail the menu can hide. Derived from
-        // allCases, so adding an engine cannot leave its models unlisted.
-        for engine in AnalysisEngine.allCases {
-            let models = AnalysisModelChoice.all.filter { $0.engine == engine }
-            guard !models.isEmpty else { continue }
-            if menu.numberOfItems > 0 { menu.addItem(.separator()) }
-            let header = NSMenuItem(title: engine.menuHeading, action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for choice in models {
-                let item = NSMenuItem(title: choice.name,
-                                      action: #selector(setAnalysisModel(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = choice.id
-                item.state = choice.id == current ? .on : .off
-                menu.addItem(item)
-            }
-        }
-    }
-
     @objc private func toggleColumn(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String else { return }
         mainWindow.toggleColumn(rawIdentifier: raw)
-    }
-
-    private func refreshSoundsMenu(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let current = chimeSoundName
-        for name in Self.chimeChoices {
-            let item = NSMenuItem(
-                title: name,
-                action: #selector(selectSound(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = name
-            item.state = (name == current) ? .on : .off
-            menu.addItem(item)
-        }
-    }
-
-    @objc private func selectSound(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(name, forKey: Self.chimeSoundKey)
-        // Preview so the user hears what they picked.
-        if name != Self.chimeNone {
-            playSystemSound(named: name)
-        }
     }
 }

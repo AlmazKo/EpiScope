@@ -27,6 +27,7 @@ memory, and cache.
 | `~/Library/Application Support/Claude/claude-code-sessions/<acct>/<ws>/local_<uuid>.json` | Claude Desktop Code-tab metadata (`sessionId`, `cliSessionId`) | `cc-open` (only when a Desktop session is opened) | translate the mirrored CLI transcript id to the tab's exact `/epitaxy/local_<uuid>` route |
 | User-selected session source or mounted home | recognised Claude Code, Codex and Claude Desktop transcript layouts | disposable `source-sync` child process (30 s cadence, 120 s deadline) | update an isolated local snapshot without letting an unreliable mount block the app or its local index |
 | `…/Application Support/EpiScope/sessions.json` | **our** index cache | `SessionIndexer` (at launch) | an instant table with no full scan |
+| `…/Application Support/EpiScope/prompts/<name>.md` | **our** analysis prompt override, edited in `Settings → Insights` | `PromptLibrary` (when a run renders a template) | run an edited prompt without a release; absent means the bundled `prompt-<name>.md` is used |
 | `…/Application Support/EpiScope/demo-fleet.json` | staged fleet for screenshots | `DemoFleet` (only when `demoFleet` is set) | show the product without the author's projects; every scanner stays parked so no real data reaches the screen |
 
 ### We write (our own files)
@@ -42,6 +43,7 @@ memory, and cache.
 | `…/Application Support/EpiScope/search.sqlite` | `SearchIndex` | as transcripts grow | FTS5 in WAL mode; rows for sessions that leave the index are pruned on reconcile |
 | `…/Application Support/EpiScope/session-sources.json` | `SessionSourceStore` | when a custom source is added, changed or synced | atomically persisted source configuration and last successful sync time |
 | `…/Application Support/EpiScope/session-sources/<id>/snapshot/**` | disposable `source-sync` child process | when an enabled custom source is available | private, atomic per-file copies of recognised transcripts; previous files are retained on every failure |
+| `…/Application Support/EpiScope/prompts/<name>.md` | `PromptLibrary` (from `Settings → Insights`) | while a prompt is being edited, on a short delay after typing stops | atomically; `Restore Default` moves the file to the Trash so the bundled prompt takes over again |
 | `~/Library/LaunchAgents/<bundleID>.plist` | `LoginItem` | first launch, and on toggle | atomically; removed when Launch-at-Login is turned off |
 | `<temp>/episcope-analysis/<uuid>/**` | `AnalysisRunner`, `TranscriptExtractor` | for the duration of an analysis | the per-user temp root (0700), **not** `/private/tmp` — packets are verbatim conversation text; removed after the run, kept after a failure for a post-mortem. A Codex run also has the CLI write `last-message.md` here, so the result is read before the dir is removed |
 
