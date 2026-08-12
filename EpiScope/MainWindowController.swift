@@ -2176,8 +2176,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 }
             } else if entry.provider == .claudeDesktop,
                       Date().timeIntervalSince(entry.lastActivity) < 360 {
-                // Claude desktop has no live hooks; treat a recently-appended
-                // transcript as the agent actively working.
+                // Claude desktop has no live hooks; treat a record written in
+                // the last few minutes as the agent actively working.
                 badge.configure(text: "Active",
                                 color: .white,
                                 background: NSColor.systemGreen.withAlphaComponent(0.85))

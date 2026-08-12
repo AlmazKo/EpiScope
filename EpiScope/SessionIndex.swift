@@ -198,7 +198,17 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // gitBranch from the last assistant record we saw in the jsonl —
     // approximates what branch the session was last working on.
     var lastGitBranch: String?
-    var lastActivity: Date
+    // Modification time of the transcript. It is the shallow pass's cache key —
+    // stat() is all that pass reads — and nothing else should be read out of it.
+    var fileModified: Date
+    // Time of the newest record that carries one. This is what a reader means by
+    // last activity, and it is not the file's mtime: the CLI keeps writing
+    // bookkeeping records (mode, permission-mode, titles, agent names) and
+    // rewrites transcripts of sessions that are merely open, so mtime moves
+    // long after the conversation stopped — here by more than a day on a
+    // quarter of the index, and by fifty on the worst of it.
+    var lastRecordAt: Date?
+    var lastActivity: Date { lastRecordAt ?? fileModified }
     var startedAt: Date?
     // Cached so we can skip re-parsing on a stat()-only check next
     // time round.
@@ -245,7 +255,7 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
 nonisolated struct SessionIndex: Codable, Sendable {
     // Bump when SessionIndexEntry changes shape or accounting semantics so we
     // discard caches built by older EpiScope versions.
-    static let currentVersion = 16
+    static let currentVersion = 17
 
     var version: Int = SessionIndex.currentVersion
     var entries: [SessionIndexEntry] = []
@@ -668,7 +678,7 @@ final class SessionIndexer {
                     let cached = cacheBySessionId[sessionId]
 
                     if let c = cached,
-                       sameTimestamp(c.lastActivity, mtime),
+                       sameTimestamp(c.fileModified, mtime),
                        c.fileSize == size {
                         // Fully cached — no parse needed at all.
                         found.append(c)
@@ -679,7 +689,7 @@ final class SessionIndexer {
                         // cursor is at the previous EOF. Carry totals
                         // over, deepScan will fold the tail bytes only.
                         c.fileSize = size
-                        c.lastActivity = mtime
+                        c.fileModified = mtime
                         found.append(c)
                         stubIds.insert(sessionId)
                         continue
@@ -694,7 +704,7 @@ final class SessionIndexer {
                         transcriptPath: jsonl.path,
                         userMessageCount: 0,
                         lastGitBranch: nil,
-                        lastActivity: mtime,
+                        fileModified: mtime,
                         startedAt: createdAt,
                         fileSize: size,
                         lastParsedSize: 0
@@ -722,7 +732,7 @@ final class SessionIndexer {
                 guard sessionId.count == 36 else { continue }
 
                 if let cached = cacheBySessionId[sessionId],
-                   sameTimestamp(cached.lastActivity, mtime),
+                   sameTimestamp(cached.fileModified, mtime),
                    cached.fileSize == size {
                     found.append(cached)
                     continue
@@ -736,7 +746,7 @@ final class SessionIndexer {
                     // stub every pass, and since the table sorts by activity it
                     // was always the top row blanking once a second.
                     c.fileSize = size
-                    c.lastActivity = mtime
+                    c.fileModified = mtime
                     found.append(c)
                     stubIds.insert(sessionId)
                     codexPaths[sessionId] = jsonl
@@ -751,7 +761,7 @@ final class SessionIndexer {
                     transcriptPath: jsonl.path,
                     userMessageCount: 0,
                     lastGitBranch: nil,
-                    lastActivity: mtime,
+                    fileModified: mtime,
                     startedAt: nil,
                     fileSize: size
                 ))
@@ -782,7 +792,7 @@ final class SessionIndexer {
                               let size = (attrs[.size] as? NSNumber)?.int64Value
                         else { continue }
                         if let cached = cacheBySessionId[sessionId],
-                           sameTimestamp(cached.lastActivity, mtime),
+                           sameTimestamp(cached.fileModified, mtime),
                            cached.fileSize == size {
                             found.append(cached)
                             continue
@@ -792,7 +802,7 @@ final class SessionIndexer {
                             // Same partial hit as Codex above; the cursor here
                             // counts audit.jsonl bytes.
                             c.fileSize = size
-                            c.lastActivity = mtime
+                            c.fileModified = mtime
                             found.append(c)
                             stubIds.insert(sessionId)
                             codexPaths[sessionId] = meta
@@ -808,7 +818,7 @@ final class SessionIndexer {
                             transcriptPath: audit.path,
                             userMessageCount: 0,
                             lastGitBranch: nil,
-                            lastActivity: mtime,
+                            fileModified: mtime,
                             startedAt: nil,
                             fileSize: size
                         ))
@@ -852,7 +862,7 @@ final class SessionIndexer {
         func cachedEntry(_ id: String, root: SessionIndexRoot, path: URL,
                          mtime: Date, size: Int64) -> SessionIndexEntry? {
             guard var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
-                  sameTimestamp(cached.lastActivity, mtime), cached.fileSize == size
+                  sameTimestamp(cached.fileModified, mtime), cached.fileSize == size
             else { return nil }
             cached.sourceName = root.sourceName
             cached.transcriptPath = path.path
@@ -888,7 +898,7 @@ final class SessionIndexer {
                         if var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
                            cached.fileSize <= size, cached.lastParsedSize == cached.fileSize {
                             cached.fileSize = size
-                            cached.lastActivity = mtime
+                            cached.fileModified = mtime
                             cached.sourceName = root.sourceName
                             cached.transcriptPath = jsonl.path
                             entry = cached
@@ -899,7 +909,7 @@ final class SessionIndexer {
                                 sourceID: root.sourceID, sourceName: root.sourceName,
                                 isExternalSource: true, transcriptPath: jsonl.path,
                                 userMessageCount: 0, lastGitBranch: nil,
-                                lastActivity: mtime,
+                                fileModified: mtime,
                                 startedAt: attrs[.creationDate] as? Date,
                                 fileSize: size, lastParsedSize: 0)
                         }
@@ -932,7 +942,7 @@ final class SessionIndexer {
                     if var cached = cacheBySessionId[id], cached.sourceID == root.sourceID,
                        cached.fileSize <= size, cached.lastParsedSize == cached.fileSize {
                         cached.fileSize = size
-                        cached.lastActivity = mtime
+                        cached.fileModified = mtime
                         cached.sourceName = root.sourceName
                         cached.transcriptPath = jsonl.path
                         entry = cached
@@ -943,7 +953,7 @@ final class SessionIndexer {
                             sourceID: root.sourceID, sourceName: root.sourceName,
                             isExternalSource: true, transcriptPath: jsonl.path,
                             userMessageCount: 0, lastGitBranch: nil,
-                            lastActivity: mtime, startedAt: nil, fileSize: size)
+                            fileModified: mtime, startedAt: nil, fileSize: size)
                     }
                     result.entries.append(entry)
                     result.stubIds.insert(id)
@@ -982,7 +992,7 @@ final class SessionIndexer {
                                cached.fileSize <= size,
                                cached.lastParsedSize == cached.fileSize {
                                 cached.fileSize = size
-                                cached.lastActivity = mtime
+                                cached.fileModified = mtime
                                 cached.sourceName = root.sourceName
                                 cached.transcriptPath = audit.path
                                 entry = cached
@@ -993,7 +1003,7 @@ final class SessionIndexer {
                                     sourceID: root.sourceID, sourceName: root.sourceName,
                                     isExternalSource: true, transcriptPath: audit.path,
                                     userMessageCount: 0, lastGitBranch: nil,
-                                    lastActivity: mtime, startedAt: nil, fileSize: size)
+                                    fileModified: mtime, startedAt: nil, fileSize: size)
                             }
                             result.entries.append(entry)
                             result.stubIds.insert(id)
@@ -1053,6 +1063,10 @@ final class SessionIndexer {
             out.entrypoint = stats.entrypoint
             out.effort = stats.effort
             if let c = stats.cwd, !c.isEmpty { out.cwd = c }
+            // An incremental tail may hold no timestamped record at all, so the
+            // fold's answer is merged with what we already knew, never replaced.
+            out.lastRecordAt = Self.later(entry.lastRecordAt,
+                                          Self.parseTimestamp(stats.lastRecordAt))
             out.lastParsedSize = entry.fileSize
             return out
         case .codex:
@@ -1077,6 +1091,8 @@ final class SessionIndexer {
             out.userMessageCount = codex.userMessageCount
             out.turns = codex.turns
             out.startedAt = codex.startedAt
+            out.lastRecordAt = Self.later(entry.lastRecordAt,
+                                          Self.parseTimestamp(codex.lastRecordAt))
             // The offset the fold actually reached, not the size the shallow
             // pass saw: a file that grew mid-scan would otherwise have its
             // overlap re-counted on the next pass.
@@ -1106,7 +1122,9 @@ final class SessionIndexer {
             out.turns = d.turns
             out.startedAt = d.startedAt ?? entry.startedAt
             out.appSessionId = d.appSessionId
-            // lastActivity stays the transcript mtime set in the shallow pass,
+            out.lastRecordAt = Self.later(entry.lastRecordAt,
+                                          Self.parseTimestamp(d.lastRecordAt))
+            // fileModified stays the transcript mtime set in the shallow pass,
             // so the next shallow comparison still hits the cache.
             out.lastParsedSize = consumed
             return out
@@ -1116,6 +1134,7 @@ final class SessionIndexer {
     // MARK: - Codex scanner
 
     nonisolated private struct CodexFileStats {
+        var lastRecordAt: String?
         var cwd: String?
         var title: String?
         var model: String?
@@ -1181,6 +1200,8 @@ final class SessionIndexer {
         var lastTotalUsage: CodexTokenUsage?
 
         let consumed = JSONLReader.stream(at: url, from: offset) { lineData in
+            stats.lastRecordAt = Self.newerTimestamp(stats.lastRecordAt, in: lineData,
+                                                     key: Self.recordTimestampSig)
             if stats.cwd == nil, lineData.range(of: metaSig) != nil {
                 // First-line session_meta. payload.cwd is the working
                 // directory the codex session was started in;
@@ -1290,7 +1311,46 @@ final class SessionIndexer {
         let customTitle: String?
     }
 
+    // The newest record timestamp seen in a fold, kept as the raw ISO string.
+    // All three providers write the same fixed UTC form
+    // ("2026-06-20T08:47:28.128Z"), so string order is time order, and a fold
+    // that runs over every line of every changed transcript pays no date
+    // parsing — the one string it ends up with is parsed once, by the caller.
+    nonisolated private static let recordTimestampSig = "\"timestamp\":\"".data(using: .utf8)!
+    // Claude Desktop's audit records name the field differently.
+    nonisolated private static let auditTimestampSig = "\"_audit_timestamp\":\"".data(using: .utf8)!
+
+    nonisolated private static func newerTimestamp(
+        _ current: String?, in line: Data, key: Data
+    ) -> String? {
+        guard let found = line.range(of: key) else { return current }
+        let rest = line[found.upperBound...]
+        guard let close = rest.firstIndex(of: 0x22),   // "
+              let value = String(data: rest[..<close], encoding: .utf8),
+              value.hasSuffix("Z")                     // an offset form would not sort
+        else { return current }
+        guard let current else { return value }
+        return value > current ? value : current
+    }
+
+    nonisolated private static func parseTimestamp(_ iso: String?) -> Date? {
+        guard let iso else { return nil }
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return parser.date(from: iso) ?? {
+            parser.formatOptions = [.withInternetDateTime]
+            return parser.date(from: iso)
+        }()
+    }
+
+    nonisolated private static func later(_ a: Date?, _ b: Date?) -> Date? {
+        guard let a else { return b }
+        guard let b else { return a }
+        return a > b ? a : b
+    }
+
     nonisolated private struct UsageStats {
+        var lastRecordAt: String?
         var model: String?
         var inputTokens: Int64 = 0
         var cacheCreationTokens: Int64 = 0
@@ -1414,6 +1474,8 @@ final class SessionIndexer {
         var countedRequests: Set<String> = []
 
         _ = JSONLReader.stream(at: url, from: offset) { lineData in
+            stats.lastRecordAt = Self.newerTimestamp(stats.lastRecordAt, in: lineData,
+                                                     key: Self.recordTimestampSig)
             // Per-session effort override (command output). Latest wins.
             if lineData.range(of: effortSetSig) != nil,
                let s = String(data: lineData, encoding: .utf8),
@@ -1558,6 +1620,7 @@ final class SessionIndexer {
     // MARK: - Claude desktop ("local agent mode") scanner
 
     nonisolated private struct DesktopStats {
+        var lastRecordAt: String?
         var cwd: String?
         var title: String?
         var model: String?
@@ -1645,6 +1708,8 @@ final class SessionIndexer {
         // costs one extra count, which is cheap next to re-reading the file.
         var counted = Set<String>()
         let consumed = JSONLReader.stream(at: audit, from: offset) { line in
+            stats.lastRecordAt = Self.newerTimestamp(stats.lastRecordAt, in: line,
+                                                     key: Self.auditTimestampSig)
             guard let rec = try? decoder.decode(AuditRec.self, from: line) else { return }
             switch rec.type {
             case "user":

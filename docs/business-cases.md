@@ -535,6 +535,22 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **THEN** that row is dimmed
 - **AND** `-p` and Claude Desktop sessions show their own marker instead of a terminal icon
 
+### Requirement: Date a session by its conversation
+
+The app SHALL report last activity as the newest timestamped record in the
+transcript, not as the file's modification time.
+
+#### Scenario: The CLI touches an old transcript
+- **GIVEN** the session's last message is days old
+- **WHEN** the CLI appends bookkeeping records (mode, permission-mode, titles,
+  agent names) or rewrites the file while it merely sits open
+- **THEN** Last Activity keeps naming the last message, and the sort keeps the
+  session where it belongs
+
+#### Scenario: A transcript with no timestamped record
+- **GIVEN** the file carries no record with a time of its own
+- **THEN** the file's modification time is used
+
 ### Requirement: Tie the selection to the chart
 
 The app SHALL highlight the selected session's segment in the chart.
