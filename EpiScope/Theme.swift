@@ -1,5 +1,33 @@
 import AppKit
 
+// The vendor marks bundled with the app, shared by everything that shows which
+// engine something belongs to — the table's AI column and the settings list.
+// One loader so the two cannot drift into different artwork, and templates so
+// the mark takes the colour of whatever draws it.
+@MainActor
+enum ProviderIcon {
+    static func image(for provider: SessionProvider, size: CGFloat) -> NSImage? {
+        let base: NSImage?
+        switch provider {
+        case .codex: base = openai
+        case .claude, .claudeDesktop: base = anthropic
+        }
+        guard let copy = base?.copy() as? NSImage else { return nil }
+        copy.size = NSSize(width: size, height: size)
+        return copy
+    }
+
+    private static let anthropic: NSImage? = load("anthropic")
+    private static let openai: NSImage? = load("openai")
+
+    private static func load(_ name: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
+              let image = NSImage(contentsOf: url) else { return nil }
+        image.isTemplate = true
+        return image
+    }
+}
+
 // Design tokens, one explicit set per appearance. Views reference the
 // dynamic colours (Theme.diffAdded etc.) — those resolve against the
 // current appearance at draw time, so theme switches repaint correctly

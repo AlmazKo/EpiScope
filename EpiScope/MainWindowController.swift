@@ -3893,17 +3893,6 @@ final class ColorDotView: NSView {
         return s
     }()
 
-    private static let anthropicImage: NSImage? = loadIcon(name: "anthropic")
-    private static let openaiImage: NSImage? = loadIcon(name: "openai")
-
-    private static func loadIcon(name: String) -> NSImage? {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
-              let img = NSImage(contentsOf: url) else { return nil }
-        img.size = NSSize(width: 14, height: 14)
-        img.isTemplate = true
-        return img
-    }
-
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         self.identifier = identifier
@@ -3925,9 +3914,7 @@ final class ColorDotView: NSView {
         if self.provider != provider || imageView.image == nil {
             self.provider = provider
             // Codex → OpenAI; Claude (CLI or desktop) → Anthropic.
-            imageView.image = (provider == .codex)
-                ? Self.openaiImage
-                : Self.anthropicImage
+            imageView.image = ProviderIcon.image(for: provider, size: 14)
         }
         if self.isLoading != isLoading {
             self.isLoading = isLoading
