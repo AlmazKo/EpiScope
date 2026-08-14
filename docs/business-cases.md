@@ -605,6 +605,25 @@ that billed tokens inside that range.
 - **THEN** the range clears rather than filtering the table from behind a chart that no longer shows it
 - **AND** the selected session survives it — only a click on the chart means the operator asked for everything back
 
+### Requirement: Add up what the table shows
+
+The app SHALL total the table's numeric columns in a strip under the rows.
+
+#### Scenario: The totals strip
+- **WHEN** the table has rows
+- **THEN** a strip under them totals Input, Cache read, Output, Cost, Turns,
+  User messages, Changes and Perm wait, each under its own column
+- **AND** it names the set it adds up — `Total · N sessions`
+- **AND** columns whose values do not add up (model, status, last activity) stay empty
+
+#### Scenario: The totals follow the table
+- **WHEN** a range is dragged, the filter text changes or a source is narrowed
+- **THEN** the totals describe the filtered set, not the whole index
+- **WHEN** a column is resized, reordered, hidden, or the table is scrolled sideways
+- **THEN** every total stays under the column it belongs to
+- **WHEN** the table is empty, or the window is showing a session, search or Insights
+- **THEN** the strip is not there at all
+
 ### Requirement: Limit the table to the chart window
 
 The app SHALL offer a setting that keeps in the table only sessions last active

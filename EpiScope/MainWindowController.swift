@@ -70,6 +70,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private static let listChartHeight: CGFloat = 110
     private static let detailsChartHeight: CGFloat = 168
     private var chartHeight = NSLayoutConstraint()
+    // Totals for what the table currently shows, under the rows they add up.
+    private let totalsRow = TotalsRowView()
+    private var totalsHeight = NSLayoutConstraint()
     private let limitChartView = LimitChartView()
     // Ticks the limit gauges' reset countdown while a limit mode is on.
     private var limitTickTimer: Timer? { willSet { limitTickTimer?.invalidate() } }
@@ -632,15 +635,23 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
         content.addSubview(transcriptScroll)
 
+        totalsRow.translatesAutoresizingMaskIntoConstraints = false
+        totalsRow.table = outlineView
+        content.addSubview(totalsRow)
+
         configureOutline()
         restoreColumnVisibility()
         scroll.documentView = outlineView
+        totalsRow.observe(scrollView: scroll)
         // Right-click the header to pick columns. The header is where a user
         // looks for this first; Settings → Columns stays as the discoverable
         // path and both drive the same toggle, so their ticks cannot disagree.
         outlineView.headerView?.menu = columnsMenu
 
         chartHeight = chartView.heightAnchor.constraint(equalToConstant: Self.listChartHeight)
+        // Collapsed to nothing outside the list, and while the table is empty:
+        // a strip of zeroes under no rows is noise.
+        totalsHeight = totalsRow.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             chartView.topAnchor.constraint(equalTo: content.topAnchor),
             chartView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -664,7 +675,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: totalsRow.topAnchor),
+
+            totalsRow.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            totalsRow.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            totalsRow.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            totalsHeight,
 
             // Centred on the rows area, below the header the table keeps drawing.
             emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
@@ -987,6 +1003,68 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
         refreshStatusLabel()
         refreshEmptyState()
+        refreshTotals()
+    }
+
+    // Sums of what the table is showing — the filtered set, not the index, so a
+    // dragged range or a search term is answered with its own total rather than
+    // the fleet's. Only columns whose figures add up get one: a sum of models or
+    // of last-activity times would be a number that means nothing.
+    private func refreshTotals() {
+        let visible = windowMode == .list && !filteredEntries.isEmpty
+        totalsHeight.constant = visible ? TotalsRowView.height : 0
+        totalsRow.isHidden = !visible
+        guard visible else { return }
+
+        var input: Int64 = 0, cacheRead: Int64 = 0, output: Int64 = 0
+        var added: Int64 = 0, removed: Int64 = 0
+        var cost = 0.0
+        var turns = 0, userMessages = 0
+        var waited: TimeInterval = 0
+        for e in filteredEntries {
+            input += e.inputTokens + e.cacheCreationTokens
+            cacheRead += e.cacheReadTokens
+            output += e.outputTokens
+            added += e.linesAdded
+            removed += e.linesRemoved
+            cost += e.costUSD
+            turns += e.turns
+            userMessages += e.userMessageCount
+            waited += monitor.permissionWait(for: e.sessionId)
+        }
+
+        let count = filteredEntries.count
+        // The label goes in the first wide column still on screen; with Path
+        // hidden it would otherwise be a strip of figures nobody labelled.
+        let labelColumn = [ColumnID.path, ColumnID.title, ColumnID.name, ColumnID.model]
+            .first { id in
+                outlineView.tableColumns.contains { $0.identifier == id && !$0.isHidden }
+            } ?? ColumnID.path
+        var values: [NSUserInterfaceItemIdentifier: String] = [
+            labelColumn: "Total · \(count) session\(count == 1 ? "" : "s")",
+            ColumnID.inputTokens: Self.formatTokens(input),
+            ColumnID.cacheReadTokens: Self.formatTokens(cacheRead),
+            ColumnID.outputTokens: Self.formatTokens(output),
+            ColumnID.cost: Self.formatCost(cost),
+            ColumnID.turns: turns > 0 ? "\(turns)" : "",
+            ColumnID.userMessages: userMessages > 0 ? "\(userMessages)" : "",
+        ]
+        if added > 0 || removed > 0 {
+            values[ColumnID.changes] = "+\(added) −\(removed)"
+        }
+        if waited >= 1 { values[ColumnID.permWait] = Self.formatWait(waited) }
+
+        totalsRow.setValues(values, alignments: [
+            labelColumn: .left,
+            ColumnID.inputTokens: .right,
+            ColumnID.cacheReadTokens: .right,
+            ColumnID.outputTokens: .right,
+            ColumnID.cost: .right,
+            ColumnID.turns: .right,
+            ColumnID.userMessages: .right,
+            ColumnID.changes: .right,
+            ColumnID.permWait: .right,
+        ])
     }
 
     // What an empty table means, in its own words. Naming the narrowing that
@@ -3077,6 +3155,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             emptyLabel.isHidden = true
             clearFiltersButton.isHidden = true
         }
+        refreshTotals()
         transcriptScroll.isHidden = !isDetails
         sessionChartView.isHidden = !isDetails
         divider.isHidden = isSearch || isInsights
