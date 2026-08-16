@@ -135,6 +135,28 @@ nonisolated enum SessionProvider: String, Codable, Sendable, CaseIterable {
     }
 }
 
+// What a forked session did not spend: the API calls it was born holding,
+// because Claude Code copies the conversation so far into the new transcript.
+// Recorded so the subtraction can be undone and redone when the family changes,
+// and so a row that added nothing of its own can still say it was superseded
+// rather than merely reading as an empty session.
+nonisolated struct InheritedUsage: Codable, Equatable, Sendable {
+    // The family this was computed for — every member's session id, sorted and
+    // joined. A different value means the family changed and the numbers below
+    // have to be undone and recomputed.
+    var familyKey: String
+    var from: String            // the session that holds these calls first
+    var input: Int64 = 0
+    var cacheCreation: Int64 = 0
+    var cacheRead: Int64 = 0
+    var output: Int64 = 0
+    var turns: Int = 0
+
+    var isEmpty: Bool {
+        input == 0 && cacheCreation == 0 && cacheRead == 0 && output == 0 && turns == 0
+    }
+}
+
 nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     let sessionId: String
     // var (not let) so a Codex stub can have its cwd filled in by
@@ -146,6 +168,20 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // via /rename in Claude Code (custom-title record).
     var title: String?
     var name: String?
+    // Claude Code can create a fresh session for /clear while copying the
+    // previous session's ai-title into the new transcript before the clear
+    // boundary. Remember the short interval between that boundary and the
+    // first real prompt so an incremental scan cannot strand the stale title.
+    var awaitingPromptTitleAfterClear: Bool = false
+    // Claude may keep appending that inherited title after every subsequent
+    // turn. Suppress only this exact value; a genuinely regenerated title is
+    // allowed through as soon as it differs.
+    var suppressedInheritedAITitle: String?
+    // A transcript born from /clear carries the previous conversation's id in
+    // its inner `session_id` fields while `sessionId` is the new id. The inverse
+    // relation lets the table mark the previous row as terminally Cleared.
+    var clearedFromSessionId: String?
+    var awaitingClearedFromSessionId: Bool = false
     var model: String?
     // Reasoning-effort knob for Codex sessions ("low" / "medium" /
     // "high" / "xhigh"). nil for Claude or when the rollout doesn't
@@ -219,6 +255,34 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // re-parsing the whole megabyte stream.
     var lastParsedSize: Int64 = 0
 
+    // Some Codex IDE integrations create a rollout containing only
+    // `session_meta` (cwd + instructions) before any conversation exists.
+    // Keep it in the index cache so a later append is incremental, but do not
+    // present it as a session: there is no user task, model response or usage.
+    var isMetadataOnlyCodex: Bool {
+        provider == .codex
+            && userMessageCount == 0
+            && turns == 0
+            && inputTokens == 0
+            && cacheCreationTokens == 0
+            && cacheReadTokens == 0
+            && outputTokens == 0
+            && (title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    // uuid of the transcript's first conversation record. Two transcripts that
+    // share it are the same conversation: Claude Code forks one into another on
+    // ⌃B, on a rewind and on a resume from an earlier point, copying the records
+    // verbatim — uuids included. Optional so an index written before this field
+    // existed still decodes; nil also means "not read yet".
+    var headUuid: String?
+    // Set on every member of a fork family but the one that spent the calls
+    // first. The token counters above are already net of it — see resolveForks.
+    var inherited: InheritedUsage?
+    // A fork that contributed no API call of its own: everything it holds was
+    // already paid for by the session it was forked off.
+    var isSuperseded: Bool { turns == 0 && (inherited?.turns ?? 0) > 0 }
+
     var folderName: String { URL(fileURLWithPath: cwd).lastPathComponent }
     var displayTitle: String {
         let t = title?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
@@ -255,7 +319,15 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
 nonisolated struct SessionIndex: Codable, Sendable {
     // Bump when SessionIndexEntry changes shape or accounting semantics so we
     // discard caches built by older EpiScope versions.
-    static let currentVersion = 17
+    // 18: counters are net of what a fork inherited (resolveForks). An older
+    // build would read them as raw and re-subtract on the next upgrade, so the
+    // two versions must not share a file.
+    // 20: inherited ai-titles written before a /clear boundary — including
+    // identical copies Claude keeps appending — are replaced by the new
+    // session's first real prompt.
+    // 21: /clear continuations retain the previous session id so its row can
+    // carry a terminal Cleared status.
+    static let currentVersion = 21
 
     var version: Int = SessionIndex.currentVersion
     var entries: [SessionIndexEntry] = []
@@ -304,6 +376,12 @@ nonisolated struct SessionIndex: Codable, Sendable {
 @MainActor
 final class SessionIndexer {
     private(set) var entries: [SessionIndexEntry] = []
+    // The raw array also contains metadata-only Codex placeholders so their
+    // files can become real sessions incrementally. Every UI/search/report
+    // consumer uses this filtered surface instead.
+    var userFacingEntries: [SessionIndexEntry] {
+        entries.filter { !$0.isMetadataOnlyCodex }
+    }
     var onUpdate: (() -> Void)?
     // Fired alongside onUpdate with the current entries — the search index
     // reconciles its per-session FTS rows off this (cheap when nothing grew,
@@ -451,7 +529,7 @@ final class SessionIndexer {
     // (onUpdate) and the search indexer (onEntriesUpdated).
     private func publish() {
         onUpdate?()
-        onEntriesUpdated?(entries)
+        onEntriesUpdated?(userFacingEntries)
     }
 
     // A pass over the transcripts is done. That also releases the background
@@ -472,6 +550,7 @@ final class SessionIndexer {
         reindexing = true
         let cached = entries
         let roots = SessionSourceStore.shared.indexRoots()
+        let parked = ParkedSessions.shared.continuations
         WorkScheduler.shared.run(.init(id: "index-pass", group: WorkScheduler.Group.index, deferrable: false)) {
             // Phase 1 — cheap shallow pass. Returns one entry per
             // jsonl on disk: cache hits are full entries, misses are
@@ -522,6 +601,9 @@ final class SessionIndexer {
                     since = 0
                 }
             }
+            // Counters are final — charge each API call to one session before
+            // anything adds them up.
+            Self.resolveForks(&current, parkedInto: parked)
             let final = current
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -549,6 +631,7 @@ final class SessionIndexer {
         guard !paused, !reindexing else { return }
         reindexing = true
         let roots = SessionSourceStore.shared.indexRoots()
+        let parked = ParkedSessions.shared.continuations
         WorkScheduler.shared.run(.init(id: "index-full", group: WorkScheduler.Group.index, priority: .interactive, deferrable: false)) {
             // Empty cache → every file is a fresh stub → deep-scanned in full.
             let (stubs, stubIds, codexPaths) = Self.rebuildShallow(cache: [], roots: roots)
@@ -565,6 +648,7 @@ final class SessionIndexer {
                     }
                 }
             }
+            Self.resolveForks(&current, parkedInto: parked)
             let final = current
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -1016,6 +1100,180 @@ final class SessionIndexer {
         return result
     }
 
+    // MARK: - Fork families
+
+    // Claude Code forks a conversation into a second transcript on ⌃B, on a
+    // rewind and on a resume from an earlier point: the records so far are
+    // copied verbatim into a new session id and both files stay on disk. The
+    // API calls in that copied prefix appear in two transcripts, so counting
+    // both charges them twice — 8 families and $214 across this machine's
+    // history when the check was written.
+    //
+    // Members are found by the uuid of their first conversation record, which
+    // survives the copy, and each API call is charged to the session that
+    // started earliest among those holding it. What the later ones inherited is
+    // subtracted from their counters and recorded in `inherited`, so a row
+    // reads as what that run itself spent and the rows still sum to the total.
+    //
+    // The overlap cannot grow: after the fork the two processes never write the
+    // same record again. So this runs once per family and again only when the
+    // family gains or loses a member — a growing member is left alone.
+    nonisolated private static func resolveForks(_ entries: inout [SessionIndexEntry],
+                                                 parkedInto: [String: String]) {
+        // Only Claude transcripts carry record uuids; Codex rollouts and the
+        // desktop audit log cannot fork this way and never form a family.
+        var byHead: [String: [Int]] = [:]
+        for i in entries.indices where entries[i].provider == .claude {
+            if entries[i].headUuid == nil {
+                let path = transcriptFile(entries[i])
+                if let head = readHeadUuid(at: path) {
+                    entries[i].headUuid = head
+                } else if FileManager.default.fileExists(atPath: path) {
+                    // Readable, but no conversation record in its head: remember
+                    // that so it is not re-read every pass. A file we could not
+                    // open stays nil and is retried — a transient failure must
+                    // not exile a session from its family for good.
+                    entries[i].headUuid = ""
+                }
+            }
+            let head = entries[i].headUuid ?? ""
+            guard !head.isEmpty else { continue }
+            byHead[head, default: []].append(i)
+        }
+
+        var inFamily = Set<Int>()
+        for (_, members) in byHead where members.count > 1 {
+            // The ⌃B mark is part of the key: learning that link later reorders
+            // the family, and a key of ids alone would not notice.
+            let key = members.map {
+                entries[$0].sessionId + (parkedInto[entries[$0].sessionId] != nil ? "^" : "")
+            }.sorted().joined(separator: ",")
+            inFamily.formUnion(members)
+            // Every member already computed against this exact membership.
+            if members.allSatisfy({ entries[$0].inherited?.familyKey == key }) { continue }
+
+            // Oldest first: the session that ran the calls owns them, the ones
+            // forked off it inherit. Fall back to the transcript's own dates
+            // when a member has no start time.
+            //
+            // A ⌃B park is the exception, and the only fork whose direction we
+            // are told rather than guessing: the parked session is the older
+            // file, but it is the stub — the job it handed the conversation to
+            // is the one that went on spending. Sorting it last leaves it
+            // holding only what it did after the park.
+            let ordered = members.sorted {
+                let parkedA = parkedInto[entries[$0].sessionId] != nil
+                let parkedB = parkedInto[entries[$1].sessionId] != nil
+                if parkedA != parkedB { return parkedB }
+                let a = entries[$0].startedAt ?? entries[$0].lastActivity
+                let b = entries[$1].startedAt ?? entries[$1].lastActivity
+                return a < b
+            }
+            var seen: [String: String] = [:]   // requestId -> first owner
+            for idx in ordered {
+                restoreInherited(&entries[idx])
+                var mine = InheritedUsage(familyKey: key, from: "")
+                for (rid, usage) in requestUsage(at: transcriptFile(entries[idx])) {
+                    guard let owner = seen[rid] else {
+                        seen[rid] = entries[idx].sessionId
+                        continue
+                    }
+                    if mine.from.isEmpty { mine.from = owner }
+                    mine.input += usage.input
+                    mine.cacheCreation += usage.cacheCreation
+                    mine.cacheRead += usage.cacheRead
+                    mine.output += usage.output
+                    mine.turns += 1
+                }
+                entries[idx].inherited = mine
+                applyInherited(&entries[idx])
+            }
+        }
+        // A family that lost a member (its transcript deleted, or a source
+        // narrowed) leaves the survivors holding a subtraction nothing backs.
+        for i in entries.indices where entries[i].inherited != nil && !inFamily.contains(i) {
+            restoreInherited(&entries[i])
+            entries[i].inherited = nil
+        }
+    }
+
+    // A custom source parses its own local snapshot, so its transcript is not
+    // where the encoded-cwd rule would put it.
+    nonisolated private static func transcriptFile(_ e: SessionIndexEntry) -> String {
+        e.transcriptPath ?? jsonlPath(for: e)
+    }
+
+    nonisolated private static func applyInherited(_ e: inout SessionIndexEntry) {
+        guard let inh = e.inherited else { return }
+        e.inputTokens = max(0, e.inputTokens - inh.input)
+        e.cacheCreationTokens = max(0, e.cacheCreationTokens - inh.cacheCreation)
+        e.cacheReadTokens = max(0, e.cacheReadTokens - inh.cacheRead)
+        e.outputTokens = max(0, e.outputTokens - inh.output)
+        e.turns = max(0, e.turns - inh.turns)
+    }
+
+    nonisolated private static func restoreInherited(_ e: inout SessionIndexEntry) {
+        guard let inh = e.inherited else { return }
+        e.inputTokens += inh.input
+        e.cacheCreationTokens += inh.cacheCreation
+        e.cacheReadTokens += inh.cacheRead
+        e.outputTokens += inh.output
+        e.turns += inh.turns
+    }
+
+    // uuid of the first `user` / `assistant` record. Header records (mode,
+    // titles, file-history snapshots) are skipped: they are rewritten per
+    // process and carry no uuid to match on.
+    nonisolated private static func readHeadUuid(at path: String) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 256 * 1024), !head.isEmpty
+        else { return nil }
+        let decoder = JSONDecoder()
+        for line in head.split(separator: 0x0a, omittingEmptySubsequences: true) {
+            guard let rec = try? decoder.decode(HeadRec.self, from: Data(line)),
+                  rec.type == "user" || rec.type == "assistant",
+                  let uuid = rec.uuid, !uuid.isEmpty
+            else { continue }
+            return uuid
+        }
+        return nil
+    }
+
+    nonisolated private struct HeadRec: Decodable {
+        let type: String?
+        let uuid: String?
+    }
+
+    nonisolated private struct RequestUsage {
+        var input: Int64 = 0
+        var cacheCreation: Int64 = 0
+        var cacheRead: Int64 = 0
+        var output: Int64 = 0
+    }
+
+    // requestId → the usage of its first record, the same dedupe foldUsage
+    // applies: Claude writes one record per streamed block, all carrying the
+    // call's cumulative usage.
+    nonisolated private static func requestUsage(at path: String) -> [String: RequestUsage] {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        var out: [String: RequestUsage] = [:]
+        _ = JSONLReader.stream(at: URL(fileURLWithPath: path)) { lineData in
+            guard let rec = try? decoder.decode(AssistantRecord.self, from: lineData),
+                  let rid = rec.requestId, out[rid] == nil
+            else { return }
+            let u = rec.message?.usage
+            out[rid] = RequestUsage(
+                input: u?.inputTokens ?? 0,
+                cacheCreation: u?.cacheCreationInputTokens ?? 0,
+                cacheRead: u?.cacheReadInputTokens ?? 0,
+                output: u?.outputTokens ?? 0)
+        }
+        return out
+    }
+
     // Phase-2 deep scan: locates the jsonl for a stub entry and parses
     // the heavy fields (tokens, title, model, branch, ...). Returns nil
     // if the file disappeared between shallow and deep pass.
@@ -1042,6 +1300,10 @@ final class SessionIndexer {
                 cwd: entry.cwd.isEmpty ? nil : entry.cwd,
                 aiTitle: entry.title,
                 customTitle: entry.name,
+                awaitingPromptTitleAfterClear: entry.awaitingPromptTitleAfterClear,
+                suppressedInheritedAITitle: entry.suppressedInheritedAITitle,
+                clearedFromSessionId: entry.clearedFromSessionId,
+                awaitingClearedFromSessionId: entry.awaitingClearedFromSessionId,
                 linesAdded: entry.linesAdded,
                 linesRemoved: entry.linesRemoved
             )
@@ -1050,6 +1312,10 @@ final class SessionIndexer {
             var out = entry
             out.title = stats.aiTitle
             out.name = stats.customTitle
+            out.awaitingPromptTitleAfterClear = stats.awaitingPromptTitleAfterClear
+            out.suppressedInheritedAITitle = stats.suppressedInheritedAITitle
+            out.clearedFromSessionId = stats.clearedFromSessionId
+            out.awaitingClearedFromSessionId = stats.awaitingClearedFromSessionId
             out.model = stats.model
             out.inputTokens = stats.inputTokens
             out.cacheCreationTokens = stats.cacheCreationTokens
@@ -1311,6 +1577,20 @@ final class SessionIndexer {
         let customTitle: String?
     }
 
+    nonisolated private struct TypedPromptLine: Decodable {
+        let message: Message?
+        struct Message: Decodable { let content: String? }
+    }
+
+    nonisolated private struct SessionLinkLine: Decodable {
+        let sessionId: String?
+        let innerSessionId: String?
+        enum CodingKeys: String, CodingKey {
+            case sessionId
+            case innerSessionId = "session_id"
+        }
+    }
+
     // The newest record timestamp seen in a fold, kept as the raw ISO string.
     // All three providers write the same fixed UTC form
     // ("2026-06-20T08:47:28.128Z"), so string order is time order, and a fold
@@ -1376,6 +1656,13 @@ final class SessionIndexer {
         // the previous values instead of resetting them.
         var aiTitle: String?
         var customTitle: String?
+        // A /clear transcript starts with the previous ai-title, then emits the
+        // clear boundary, then the new task. Persist this across incremental
+        // folds in case those records arrive in separate index passes.
+        var awaitingPromptTitleAfterClear: Bool = false
+        var suppressedInheritedAITitle: String?
+        var clearedFromSessionId: String?
+        var awaitingClearedFromSessionId: Bool = false
         var linesAdded: Int64 = 0
         var linesRemoved: Int64 = 0
     }
@@ -1457,6 +1744,8 @@ final class SessionIndexer {
         // typed user prompts don't.
         let toolUseIdSig = "tool_use_id".data(using: .utf8)!
         let titleSig = "-title\"".data(using: .utf8)!  // ai-title + custom-title
+        let clearStartSig = "\"hookName\":\"SessionStart:clear\"".data(using: .utf8)!
+        let typedPromptSig = "\"promptSource\":\"typed\"".data(using: .utf8)!
         let patchSig = "\"structuredPatch\"".data(using: .utf8)!
         let effortSetSig = "Set effort level to ".data(using: .utf8)!
 
@@ -1482,7 +1771,37 @@ final class SessionIndexer {
                let v = Self.parseSessionEffort(s) {
                 stats.effort = v
             }
+            if lineData.range(of: clearStartSig) != nil {
+                // Claude writes the old session's ai-title before this record.
+                // It is not a description of the conversation that follows.
+                stats.suppressedInheritedAITitle = stats.aiTitle
+                stats.aiTitle = nil
+                stats.awaitingPromptTitleAfterClear = true
+                stats.awaitingClearedFromSessionId = true
+            }
+            if stats.awaitingClearedFromSessionId,
+               let link = try? titleDecoder.decode(SessionLinkLine.self, from: lineData),
+               let outer = link.sessionId,
+               let inner = link.innerSessionId,
+               outer != inner,
+               SessionID.isValid(outer), SessionID.isValid(inner) {
+                stats.clearedFromSessionId = inner
+                stats.awaitingClearedFromSessionId = false
+            }
             if lineData.range(of: userSig) != nil {
+                if stats.awaitingPromptTitleAfterClear,
+                   lineData.range(of: typedPromptSig) != nil,
+                   let rec = try? titleDecoder.decode(TypedPromptLine.self, from: lineData),
+                   let content = rec.message?.content {
+                    let compact = content
+                        .components(separatedBy: .whitespacesAndNewlines)
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " ")
+                    if !compact.isEmpty {
+                        stats.aiTitle = String(compact.prefix(80))
+                        stats.awaitingPromptTitleAfterClear = false
+                    }
+                }
                 if lineData.range(of: toolUseIdSig) == nil {
                     stats.userMessageCount += 1
                 } else if lineData.range(of: patchSig) != nil,
@@ -1519,7 +1838,13 @@ final class SessionIndexer {
                 // last record seen is the newest, so overwrite.
                 if lineData.range(of: titleSig) != nil,
                    let parsed = try? titleDecoder.decode(TitleLine.self, from: lineData) {
-                    if let v = parsed.aiTitle { stats.aiTitle = v }
+                    if let v = parsed.aiTitle {
+                        if v != stats.suppressedInheritedAITitle {
+                            stats.aiTitle = v
+                            stats.awaitingPromptTitleAfterClear = false
+                            stats.suppressedInheritedAITitle = nil
+                        }
+                    }
                     if let v = parsed.customTitle { stats.customTitle = v }
                 }
                 return

@@ -477,6 +477,12 @@ chart.
 - **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Path, Title, Input, Changes and Last Activity
 - **AND** Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
 
+#### Scenario: An IDE creates only Codex session metadata
+- **GIVEN** a Codex rollout contains `session_meta` but no user message, model response or usage
+- **WHEN** the index is published to the table, search, totals or Insights
+- **THEN** that placeholder is not presented as a session
+- **AND** it appears normally if conversation records are later appended to the rollout
+
 #### Scenario: Dropping every narrowing at once
 - **GIVEN** a dragged range, filter text or a selected session is narrowing the table
 - **WHEN** the operator looks at the rows area
@@ -539,10 +545,63 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **AND** a user-interrupted turn does not count as an error
 - **AND** starting or completing a later turn clears the error
 
+#### Scenario: An approved tool is still running
+- **GIVEN** a `-p` / SDK session, which publishes no status of its own, was
+  granted permission and its tool is executing
+- **WHEN** the table refreshes
+- **THEN** the status reads `Busy`, not `Waiting` — Claude Code has no
+  "permission granted" event, so its permission signal stands until the tool
+  finishes, and the running tool is what says the prompt was answered
+- **AND** the menu-bar alarm and the Perm Wait clock leave it alone
+
 #### Scenario: A session with no reachable terminal
 - **WHEN** the table redraws
 - **THEN** that row is dimmed
 - **AND** `-p` and Claude Desktop sessions show their own marker instead of a terminal icon
+
+### Requirement: Charge a forked conversation once
+
+The app SHALL charge every API call to exactly one session, even when Claude
+Code copied the conversation holding it into a second transcript.
+
+#### Scenario: A conversation is forked
+- **GIVEN** ⌃B, a rewind or a resume from an earlier point copies the records so
+  far into a new session id, and both transcripts stay on disk
+- **WHEN** the index is built
+- **THEN** the two are recognised as one conversation by the uuid of their first
+  record, which the copy preserves
+- **AND** the calls in the copied part are charged to whichever session started
+  earlier, and subtracted from the other
+- **AND** every figure on a row is what that run itself spent, so the totals
+  strip and the project group are the sum of the rows they stand under
+
+#### Scenario: A fork adds nothing of its own
+- **WHEN** every call a session holds was already paid for by the one it was
+  forked off
+- **THEN** its row is dimmed, its figures read `—`, and its Title reads
+  `↳ superseded by a fork`
+
+#### Scenario: A session is parked with ⌃B
+- **GIVEN** the conversation moved into a background job and the original
+  transcript stopped mid-turn
+- **WHEN** the table shows both
+- **THEN** the parked row is dimmed, its status reads `Parked` instead of the
+  running clock its own process still publishes, and its Title reads
+  `↳ continued in background`
+- **AND** it keeps its path, model, last activity and whatever it spent after the
+  fork: that part of the conversation lives only in this transcript
+
+#### Scenario: The continuation is filtered out
+- **GIVEN** a dragged range, a search term or a narrowed source leaves the parked
+  session on screen without the job that continued it
+- **THEN** the row reads as an ordinary session — there is nothing on screen for
+  it to defer to
+
+#### Scenario: Both processes are gone
+- **GIVEN** ⌃B publishes the link between the two only while they run
+- **WHEN** the app is restarted after they exit
+- **THEN** the pair is still recognised: the link is recorded the first time it
+  is seen and kept, and the shared-prefix accounting never needed it
 
 ### Requirement: Date a session by its conversation
 
@@ -613,6 +672,7 @@ The app SHALL total the table's numeric columns in a strip under the rows.
 - **WHEN** the table has rows
 - **THEN** a strip under them totals Input, Cache read, Output, Cost, Turns,
   User messages, Changes and Perm wait, each under its own column
+- **AND** Status carries how many of those sessions are running right now
 - **AND** it names the set it adds up — `Total · N sessions`
 - **AND** columns whose values do not add up (model, status, last activity) stay empty
 

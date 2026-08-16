@@ -244,6 +244,12 @@ final class TerminalTracker: NSObject {
         let ghosttyByPid = assignGhostty(ghosttyEligible.filter {
             (ancestry[$0.pid]?.term ?? "ghostty") == "ghostty"
         })
+        // Sessions that publish no status of their own (`-p` / SDK-CLI) cannot
+        // be rescued from a stale permission signal by their own `busy`, so ask
+        // their processes instead. One ps for the whole tick, and only when
+        // such a session is alive.
+        let childAges: [Int: TimeInterval] =
+            sessions.contains { $0.status == nil } ? youngestChildAges() : [:]
         for s in sessions {
             // Claude desktop ("Code" tab) runs in the Claude app, not a
             // terminal. It has a pid + cwd, so the tty / working-dir matchers
@@ -262,7 +268,7 @@ final class TerminalTracker: NSObject {
                     located: true,
                     focused: false)
                 let entry = Entry(
-                    state: state, session_id: s.sessionId,
+                    state: state, tool_running: nil, session_id: s.sessionId,
                     term: "claude-desktop", ref: "com.anthropic.claudefordesktop",
                     bundle_id: "com.anthropic.claudefordesktop",
                     sock: nil, tty: ttys[s.pid], cwd: s.cwd, focused: false, wid: nil)
@@ -296,6 +302,9 @@ final class TerminalTracker: NSObject {
             }
             // Codex has no hook signals / "done" semantics here. Its rollout
             // tail exposes both unresolved approvals and terminal turn errors.
+            let running = childAges.isEmpty
+                ? false
+                : toolRunning(pid: s.pid, sid: s.sessionId, ages: childAges)
             let state: String
             if s.entrypoint == "codex" {
                 if codexWaitingSessionIds.contains(s.sessionId) {
@@ -317,10 +326,12 @@ final class TerminalTracker: NSObject {
                     statusUpdatedAt: s.statusUpdatedAt,
                     turnErrored: claudeTurnErrored(sessionId: s.sessionId, cwd: s.cwd),
                     located: loc != nil,
-                    focused: loc?.focused ?? false)
+                    focused: loc?.focused ?? false,
+                    toolRunning: running)
             }
             let entry = Entry(
                 state: state,
+                tool_running: running ? true : nil,
                 session_id: s.sessionId,
                 term: term,
                 ref: loc?.ref ?? ancestryRef,
@@ -1044,7 +1055,8 @@ final class TerminalTracker: NSObject {
     private func computeState(sid: String, status: String,
                               statusUpdatedAt: Int64?,
                               turnErrored: Bool,
-                              located: Bool, focused: Bool) -> String {
+                              located: Bool, focused: Bool,
+                              toolRunning: Bool = false) -> String {
         let fm = FileManager.default
         let sigPath = stateDir + "/sig-" + sid
         let attPath = stateDir + "/attended-" + sid
@@ -1058,6 +1070,18 @@ final class TerminalTracker: NSObject {
         if status == "busy" && sig == "needs_permission" {
             try? fm.removeItem(atPath: sigPath)
             sig = ""
+        }
+
+        // Same staleness, without a status to catch it: Claude Code has no
+        // "permission granted" event, so needs_permission stands until the next
+        // signal — and for an approved tool that is PostToolUse, i.e. when the
+        // tool *finishes*. A `sleep 570` therefore read as a permission request
+        // for nine minutes. A `-p` / SDK-CLI session writes no status at all, so
+        // its running tool is the only witness that the prompt was answered. The
+        // signal file is left alone: it is the hook's to clear, and the request
+        // may still be live for the next tool.
+        if status.isEmpty && sig == "needs_permission" && toolRunning {
+            sig = "thinking"
         }
 
         // A failed/stalled API stream may return the authoritative session
@@ -1227,10 +1251,15 @@ final class TerminalTracker: NSObject {
         }
     }
 
-    // MARK: - publish (the cc-states.json v1 contract, see SETUP.md)
+    // MARK: - publish (the cc-states.json v1 contract, see docs/file-io.md)
 
     private struct Entry: Encodable {
         let state: String
+        // Optional v1 extension: a tool of this session is executing right now.
+        // Readers that only know the older shape ignore it; it exists so the
+        // monitor's own "trailing tool_use means waiting" guess can be told
+        // apart from an approved tool still running, without a second ps.
+        let tool_running: Bool?
         let session_id: String
         let term: String?
         let ref: String?
@@ -1334,6 +1363,49 @@ final class TerminalTracker: NSObject {
     }
 
     // MARK: - util
+
+    // pid → age of its youngest child, in seconds. A tool Claude approved runs
+    // as a child of the session; one still waiting for approval has none.
+    private func youngestChildAges() -> [Int: TimeInterval] {
+        guard let out = runShell(["/bin/ps", "-axo", "pid=,ppid=,etime="])
+        else { return [:] }
+        var ages: [Int: TimeInterval] = [:]
+        for line in out.split(separator: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 3, let ppid = Int(parts[1]),
+                  let age = Self.parseEtime(String(parts[2])) else { continue }
+            if let known = ages[ppid], known <= age { continue }
+            ages[ppid] = age
+        }
+        return ages
+    }
+
+    // ps(1) elapsed time: [[dd-]hh:]mm:ss.
+    private static func parseEtime(_ s: String) -> TimeInterval? {
+        var rest = Substring(s)
+        var days: TimeInterval = 0
+        if let dash = rest.firstIndex(of: "-") {
+            days = TimeInterval(rest[..<dash]) ?? 0
+            rest = rest[rest.index(after: dash)...]
+        }
+        let parts = rest.split(separator: ":").map { TimeInterval($0) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+        return days * 86400 + parts.reduce(0) { $0 * 60 + ($1 ?? 0) }
+    }
+
+    // True when the session has a child that started no earlier than the
+    // permission signal — the tool the operator just approved, running. Compared
+    // by start time on purpose: an MCP server launched with the session is a
+    // child for the session's whole life and must not mask a real request. The
+    // slack absorbs the second between the hook writing and the tool spawning.
+    private func toolRunning(pid: Int, sid: String, ages: [Int: TimeInterval]) -> Bool {
+        guard let youngest = ages[pid],
+              let attrs = try? FileManager.default
+                .attributesOfItem(atPath: stateDir + "/sig-" + sid),
+              let signalled = attrs[.modificationDate] as? Date
+        else { return false }
+        return youngest <= Date().timeIntervalSince(signalled) + 2
+    }
 
     private func runShell(_ args: [String]) -> String? {
         let process = Process()

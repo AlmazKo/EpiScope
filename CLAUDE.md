@@ -70,6 +70,10 @@ the catalog and packets for analysis runs.
 `docs/file-io.md` is the detailed map of what is read and written, by whom, when
 and how. Read it before touching any file I/O.
 
+`docs/session-state.md` is the map of the five sources a session's status is
+computed from and how they go stale. Read it before touching a status, a badge,
+a notification or the perm-wait clock.
+
 ## Invariants
 
 Break these and the product stops being what it is:

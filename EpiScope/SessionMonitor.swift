@@ -74,6 +74,11 @@ final class SessionMonitor {
     // intentionally open-ended: unknown terminals and desktop apps work without
     // adding another hard-coded kind to EpiScope.
     private(set) var hostBundleIds: [String: String] = [:]
+    // Sessions the tracker sees executing a tool right now. A `-p` / SDK-CLI
+    // session is read as waiting from a trailing tool_use in its transcript,
+    // which looks identical whether the tool is pending approval or running —
+    // this is what tells the two apart, computed off the main thread.
+    private(set) var toolRunning: Set<String> = []
     private var kittyStatesMtime: Date = .distantPast
     private static let kittyStatesURL: URL = FileManager.default
         .homeDirectoryForCurrentUser
@@ -90,6 +95,7 @@ final class SessionMonitor {
             let sessionId: String?
             let term: String?
             let bundleId: String?
+            let toolRunning: Bool?
         }
     }
 
@@ -98,6 +104,7 @@ final class SessionMonitor {
         var fresh: [String: String] = [:]
         var freshTerms: [String: String] = [:]
         var freshBundleIds: [String: String] = [:]
+        var freshToolRunning: Set<String> = []
         if let attrs = try? FileManager.default.attributesOfItem(atPath: Self.kittyStatesURL.path),
            let mtime = attrs[.modificationDate] as? Date,
            // A stale file means the tracker died — don't trust it.
@@ -114,14 +121,17 @@ final class SessionMonitor {
                     fresh[sid] = entry.state
                     if let term = entry.term { freshTerms[sid] = term }
                     if let bundleId = entry.bundleId { freshBundleIds[sid] = bundleId }
+                    if entry.toolRunning == true { freshToolRunning.insert(sid) }
                 }
             }
         }
         guard fresh != kittyStates || freshTerms != terminalKinds
-                || freshBundleIds != hostBundleIds else { return false }
+                || freshBundleIds != hostBundleIds
+                || freshToolRunning != toolRunning else { return false }
         kittyStates = fresh
         terminalKinds = freshTerms
         hostBundleIds = freshBundleIds
+        toolRunning = freshToolRunning
         return true
     }
 
@@ -291,11 +301,16 @@ final class SessionMonitor {
         var found: [SessionInfo] = []
         var live: [String: SessionInfo] = [:]
         // Decoded session files come from the shared store (mtime-gated).
-        for var info in SessionStore.shared.sessions()
+        let infos = SessionStore.shared.sessions()
+        // A parked session and the job that took it over are only ever both on
+        // disk here, and only while they run — learn the pair before the
+        // liveness filter drops either half.
+        let parkedChanged = ParkedSessions.shared.observe(infos)
+        for var info in infos
         where Self.isProcessAlive(pid: info.pid) {
             if info.isWaiting || kittyStates[info.sessionId] == "needs_permission" {
                 found.append(info)
-            } else if info.isSdkCli,
+            } else if info.isSdkCli, !toolRunning.contains(info.sessionId),
                       let pending = Self.detectSdkCliPending(sessionId: info.sessionId, cwd: info.cwd) {
                 info.status = "waiting"
                 info.waitingFor = "approve \(pending.toolName)"
@@ -323,7 +338,7 @@ final class SessionMonitor {
         updateBusyClocks(live: live)
         if waitingChanged { waiting = found }
         if waitingChanged { onUpdate?() }
-        if liveChanged || kittyChanged { onLiveStateChange?() }
+        if liveChanged || kittyChanged || parkedChanged { onLiveStateChange?() }
     }
 
     // When each session began its current busy spell, so the badge can show how

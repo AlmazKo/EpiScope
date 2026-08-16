@@ -40,6 +40,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private let searchIndex: SearchIndex
     private var allEntries: [SessionIndexEntry] = []
     private var filteredEntries: [SessionIndexEntry] = []
+    // Rows whose conversation was handed to a background job that is on screen
+    // too (see ParkedSessions). Recomputed with the filter, because a row can
+    // only defer to a continuation the table is actually showing.
+    private var parkedIds: Set<String> = []
+    // Previous ids named by sessions created through /clear. Unlike parkedIds,
+    // this is historical state and does not depend on whether the continuation
+    // is currently visible under the active filters.
+    private var clearedIds: Set<String> = []
     private var searchTerm: String = ""
     // Embedded full-text search view (card feed), shown in-window as a third
     // mode — like the messages/transcript view, not a separate window.
@@ -403,7 +411,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         guard !chartComputed else { return }
         chartComputed = true
         TokenChartView.computeBuckets(
-            externalEntries: indexer.entries.filter(\.isExternalSource)
+            externalEntries: indexer.userFacingEntries.filter(\.isExternalSource)
         ) { [weak self] buckets, windowEnd in
             self?.chartView.setBuckets(buckets, windowEnd: windowEnd)
         }
@@ -939,7 +947,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // neither show up in the counter nor flood the rest of the
         // pipeline. The indexer itself is also told to skip them (so
         // they don't contribute to the loading indicator either).
-        let raw = indexer.entries
+        let raw = indexer.userFacingEntries
         var kept = showTemporary ? raw : raw.filter { !$0.isTemporary }
         // Same footing as Show Temporary: a setting, applied before the table
         // counts anything, rather than a narrowing the operator undoes here.
@@ -948,6 +956,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             kept = kept.filter { $0.lastActivity >= start }
         }
         allEntries = kept
+        clearedIds = Set(raw.compactMap(\.clearedFromSessionId))
         claudeEffort = Self.readClaudeEffort()
         applyFilter()
     }
@@ -976,6 +985,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 || e.cwd.lowercased().contains(term)
         }
         sortFilteredEntries()
+        refreshParkedIds()
         let newRoots = makeTree(from: filteredEntries)
 
         // A user sort-header click (forceReorder) always takes the full reload,
@@ -1006,6 +1016,27 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         refreshTotals()
     }
 
+    // Rows that are a conversation's leftovers: parked with ⌃B while a
+    // background job carried it on, or forked away from and never touched
+    // again. They keep their figures — the index charged each API call to one
+    // session already — but they are dimmed, because everything they say is
+    // said better by the session that continued. ⌃B is only trusted while the
+    // continuation is on screen; a brushed range or a search term that hides it
+    // leaves nothing to defer to. Returns true when the set changed.
+    @discardableResult
+    private func refreshParkedIds() -> Bool {
+        let visibleIds = Set(filteredEntries.map(\.sessionId))
+        var next = Set(filteredEntries.filter(\.isSuperseded).map(\.sessionId))
+        for sid in visibleIds {
+            guard let continuation = ParkedSessions.shared.continuations[sid],
+                  visibleIds.contains(continuation) else { continue }
+            next.insert(sid)
+        }
+        guard next != parkedIds else { return false }
+        parkedIds = next
+        return true
+    }
+
     // Sums of what the table is showing — the filtered set, not the index, so a
     // dragged range or a search term is answered with its own total rather than
     // the fleet's. Only columns whose figures add up get one: a sum of models or
@@ -1019,9 +1050,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         var input: Int64 = 0, cacheRead: Int64 = 0, output: Int64 = 0
         var added: Int64 = 0, removed: Int64 = 0
         var cost = 0.0
-        var turns = 0, userMessages = 0
+        var turns = 0, userMessages = 0, running = 0
         var waited: TimeInterval = 0
+        // Every row is summed, parked ones included: the index already charged
+        // each API call to a single session (SessionIndex.resolveForks), so a
+        // figure on screen is one this session spent and nobody else's.
         for e in filteredEntries {
+            if monitor.liveSessions[e.sessionId] != nil { running += 1 }
             input += e.inputTokens + e.cacheCreationTokens
             cacheRead += e.cacheReadTokens
             output += e.outputTokens
@@ -1053,9 +1088,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             values[ColumnID.changes] = "+\(added) −\(removed)"
         }
         if waited >= 1 { values[ColumnID.permWait] = Self.formatWait(waited) }
+        // How many of these rows are agents running right now — a count, under
+        // the column whose values it counts, rather than a sum of statuses.
+        if running > 0 { values[ColumnID.status] = "\(running) running" }
 
         totalsRow.setValues(values, alignments: [
             labelColumn: .left,
+            ColumnID.status: .left,
             ColumnID.inputTokens: .right,
             ColumnID.cacheReadTokens: .right,
             ColumnID.outputTokens: .right,
@@ -1114,7 +1153,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let days = TokenChartView.windowDays
             if indexer.pendingDeepScan > 0 {
                 text = "Reading sessions…"
-            } else if chartWindowOnly, !indexer.entries.isEmpty {
+            } else if chartWindowOnly, !indexer.userFacingEntries.isEmpty {
                 // The index is not empty — the window is. Name it, since the
                 // sessions are there and nothing on this screen says why they
                 // are not.
@@ -1271,7 +1310,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // click always lands on the session even when it has no terminal to
         // focus and no live row to highlight.
         if let entry = allEntries.first(where: { $0.sessionId == sessionId })
-            ?? indexer.entries.first(where: { $0.sessionId == sessionId }) {
+            ?? indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) {
             enterDetailsMode(for: entry)
         }
     }
@@ -2118,10 +2157,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func sessionCell(for entry: SessionIndexEntry, node: OutlineNode, columnId id: NSUserInterfaceItemIdentifier) -> NSView? {
+        let parked = parkedIds.contains(entry.sessionId)
         let cell = (outlineView.makeView(withIdentifier: id, owner: self) as? NSTextField) ?? makeTextCell(id: id)
         cell.alignment = .left
         cell.font = .systemFont(ofSize: NSFont.systemFontSize)
         cell.textColor = .labelColor
+        // Only the parked Title carries one, and cells are recycled across rows.
+        cell.toolTip = nil
 
         switch id {
         case ColumnID.colorDot:
@@ -2198,6 +2240,24 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let viewId = NSUserInterfaceItemIdentifier("col.statusBadge")
             let badge = (outlineView.makeView(withIdentifier: viewId, owner: self) as? StatusBadgeView)
                 ?? StatusBadgeView(identifier: viewId)
+            badge.toolTip = nil
+            if parked, ParkedSessions.shared.continuations[entry.sessionId] != nil {
+                // The process behind a parked session is still alive and still
+                // publishes "busy" — it is the job that is busy, and taking the
+                // foreground record at its word left this row's clock running
+                // for as long as the job ran.
+                badge.configure(text: "Parked",
+                                color: .secondaryLabelColor,
+                                background: nil)
+                return badge
+            }
+            if clearedIds.contains(entry.sessionId) {
+                badge.configure(text: "Cleared",
+                                color: .secondaryLabelColor,
+                                background: nil)
+                badge.toolTip = "Conversation continued in a new session after /clear"
+                return badge
+            }
             let trackerState = monitor.kittyStates[entry.sessionId]
             if trackerState == "error" || trackerState == "error_attended" {
                 // Attention is carried by the menu-bar alarm; the table keeps
@@ -2276,6 +2336,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             cell.textColor = nm.isEmpty || hasNoTerminal(entry)
                 ? .secondaryLabelColor : .labelColor
         case ColumnID.title:
+            if parked {
+                let job = ParkedSessions.shared.continuations[entry.sessionId]
+                cell.stringValue = job != nil
+                    ? "↳ continued in background"
+                    : "↳ superseded by a fork"
+                cell.textColor = .secondaryLabelColor
+                cell.toolTip = (entry.title ?? entry.folderName) + "\n\n"
+                    + (job != nil
+                       ? "Parked with ⌃B. The conversation continues in the background job."
+                       : "Forked into another session, which holds every call this one made.")
+                    + "\nWhat it shows here is what it spent that nobody else did."
+                return cell
+            }
             let raw = entry.title ?? ""
             // Collapse all interior whitespace (incl. newlines, tabs)
             // into single spaces so a multi-line user prompt renders
@@ -2359,6 +2432,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         default:
             cell.stringValue = ""
         }
+        // The whole row reads as handed over, not just the columns that emptied.
+        if parked { cell.textColor = .secondaryLabelColor }
         return cell
     }
 
@@ -3116,7 +3191,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // scrolling to the specific message a search result was opened from. Brings
     // the main window forward.
     func showMessages(sessionId: String, highlight query: String, scrollTo locator: String? = nil) {
-        guard let entry = indexer.entries.first(where: { $0.sessionId == sessionId }) else { return }
+        guard let entry = indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) else { return }
         show()
         enterDetailsMode(for: entry, highlight: query, scrollTo: locator)
     }
@@ -3260,7 +3335,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func openSessionLikeTableRow(sessionId: String) {
-        guard let entry = indexer.entries.first(where: { $0.sessionId == sessionId }) else {
+        guard let entry = indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) else {
             NSSound.beep()
             return
         }
@@ -3297,6 +3372,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // "Go to terminal" enables only for a live selection, which can
         // flip as sessions start / die.
         window?.toolbar?.validateVisibleItems()
+        // A park is learned mid-tick, and it moves more than the live columns
+        // below: the row's figures and the totals under them go with it.
+        if refreshParkedIds() {
+            applyFilter()
+            return
+        }
         // The terminal icon, status badge and perm-wait columns depend on
         // live state. Repaint only the visible rows whose live state actually
         // changed since the last repaint — not every visible row. A live-state
@@ -3408,6 +3489,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         for row in visible.location..<(visible.location + visible.length) {
             guard let node = outlineView.item(atRow: row) as? OutlineNode,
                   let sid = node.session?.sessionId,
+                  // The process behind a parked session goes on publishing
+                  // "busy" for as long as the job runs. This writes the badge
+                  // in place, so without the check it puts the clock back a
+                  // second after the row rendered `Parked`.
+                  !parkedIds.contains(sid),
                   let dur = monitor.busyDuration(for: sid),
                   let badge = outlineView.view(atColumn: colIdx, row: row, makeIfNecessary: false) as? StatusBadgeView
             else { continue }

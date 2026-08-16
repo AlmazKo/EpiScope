@@ -37,6 +37,14 @@ struct SessionInfo: Decodable, Equatable {
     // that disambiguates several sessions sharing one cwd in Ghostty.
     var name: String?
 
+    // Ctrl-B parks a session: the conversation moves into a background job that
+    // gets a session id — and a transcript — of its own, while the foreground
+    // record stays behind pointing at it. The two are matched on the *job* id,
+    // which is what both fields carry: `parkedJobId` on the session that was
+    // parked, `jobId` on the job that took it over. Neither is a session id.
+    var jobId: String?
+    var parkedJobId: String?
+
     // User-opened overlays (currently `/btw`) temporarily publish
     // `waiting / dialog open` even though the main turn keeps running. They are
     // not permission/question requests and must not enter the attention path.

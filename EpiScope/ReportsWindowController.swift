@@ -173,7 +173,7 @@ final class ReportsWindowController: NSWindowController {
     }
 
     private func visibleEntries(within seconds: TimeInterval?) -> [SessionIndexEntry] {
-        var out = indexer.entries.filter { !$0.isTemporary }
+        var out = indexer.userFacingEntries.filter { !$0.isTemporary }
         if let seconds {
             let cutoff = Date().addingTimeInterval(-seconds)
             out = out.filter { $0.lastActivity >= cutoff }
@@ -634,7 +634,7 @@ final class ReportsWindowController: NSWindowController {
         in text: NSMutableAttributedString,
         report: AnalysisReport
     ) {
-        let available = Set(indexer.entries.map(\.sessionId))
+        let available = Set(indexer.userFacingEntries.map(\.sessionId))
         var owners: [String: Set<String>] = [:]
 
         for sid in report.scopeSessionIds where available.contains(sid) {

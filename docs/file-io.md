@@ -17,7 +17,7 @@ memory, and cache.
 
 | Path | Contents | Reader | Purpose |
 |---|---|---|---|
-| `~/.claude/sessions/<pid>.json` | pid, sessionId, cwd, entrypoint, status, updatedAt | `SessionStore` (shared) → `SessionMonitor`, `TerminalTracker` | the list of live CC sessions, their status and cwd |
+| `~/.claude/sessions/<pid>.json` | pid, sessionId, cwd, entrypoint, status, updatedAt, `jobId` / `parkedJobId` | `SessionStore` (shared) → `SessionMonitor`, `TerminalTracker`, `ParkedSessions` | the list of live CC sessions, their status and cwd; the only place a ⌃B-parked session names the background job that continued it |
 | `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` | transcript (assistant records with usage, structuredPatch, cwd, gitBranch) | `SessionIndexer` (deepScan), `TokenChartView`, `LimitChart`, `SessionTimeline` (details), `TerminalTracker` (mtime-gated tail) | tokens, cost, changed lines, model; per-session aggregates; limit reconstruction; terminal API-error outcome |
 | `~/.claude/state/cc-rate-limits.json` | real 5h / weekly limits (written by Claude's hooks and status line) | `LimitChart` | exact limits when they exist |
 | `~/.claude/state/sig-<sid>`, `attended-<sid>` | hook signals and EpiScope acknowledgments | `SessionMonitor`, `TerminalTracker` (`computeState`) | session state and whether a finished or failed turn has been visited |
@@ -34,9 +34,10 @@ memory, and cache.
 
 | Path | Writer | When | How |
 |---|---|---|---|
-| `~/.claude/state/cc-states.json` | `TerminalTracker` | every tick (1 s) | atomically (tmp + rename); the v1 contract |
+| `~/.claude/state/cc-states.json` | `TerminalTracker` | every tick (1 s) | atomically (tmp + rename); the v1 contract. Optional `tool_running` marks a session whose tool is executing — the monitor needs it to tell an approved tool from a pending prompt without a second `ps` |
 | `~/.claude/state/permission-wait.json` | `SessionMonitor` | when the wait clocks change | atomically; survives a restart. Alongside the per-session totals it keeps the last 4000 **closed** wait segments — the only record anywhere of *when* a prompt was on screen, which is what the details-mode lifecycle strip paints |
 | `…/Application Support/EpiScope/sessions.json` | `SessionIndexer` | every 30 s if dirty, and on pause or exit | atomically; dates in ms |
+| `…/Application Support/EpiScope/parked-sessions.json` | `ParkedSessions` | when a parked session → continuation pair is first seen | atomically; kept for good, since the link is published only while both processes run and the two transcripts it explains outlive them |
 | `~/.claude/settings.json` (plus `.episcope.bak`) | `ClaudeHooks` | at launch | additively (it only adds our hooks and status line), with a backup |
 | `~/.claude/hooks/episcope-statusline.sh`, `tab-state.sh` | `ClaudeHooks` | at launch | install and migrate; no-clobber for the status line |
 | `…/Application Support/EpiScope/reports/<stamp>-<slug>.md` (plus `.json`) | `ReportStore` | when an analysis finishes | atomically; no retention policy — a report is deleted only from the UI |

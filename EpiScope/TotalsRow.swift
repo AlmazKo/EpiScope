@@ -57,7 +57,11 @@ final class TotalsRowView: NSView {
         for (index, column) in table.tableColumns.enumerated() where !column.isHidden {
             guard let text = values[column.identifier], !text.isEmpty else { continue }
             var rect = convert(table.rect(ofColumn: index), from: table)
-            guard rect.intersects(bounds) else { continue }
+            // Only the horizontal span is the column's; vertically the rect
+            // still describes the table, which sits above this strip — asking
+            // whether it intersects `bounds` was asking whether the table
+            // overlaps the totals, and the answer is always no.
+            guard rect.maxX > 0, rect.minX < bounds.width else { continue }
             rect.origin.y = 0
             rect.size.height = bounds.height
             // The same 4 pt a table cell keeps off the column edge, so a total
