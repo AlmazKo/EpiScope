@@ -4,6 +4,78 @@ All notable changes to EpiScope are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/); versions track the app's
 `MARKETING_VERSION` and the `vX.Y` release tags.
 
+## [0.9] — 2026-08-17
+
+### Added
+- **A proper Settings window** (`⌘,`) brings Alerts, Sources and Insights into
+  one system-style sidebar. It exposes notification permission, previews the
+  selected alert sound, and lets every analysis prompt be edited and restored
+  without finding its file in Application Support.
+- **A totals strip under the session table** adds up the rows currently on
+  screen: tokens, changes, turns, user messages, cost and permission wait. It
+  follows filtering, grouping, column visibility and live session state.
+- **Stop Session** ends a live Claude Code or Codex CLI session from the table.
+  Work in progress and permission prompts require confirmation; Delete stops a
+  running CLI process EpiScope owns first and waits for it to exit before
+  moving its transcript to the Trash.
+- **A 30-day chart window**, with four-hour bars and date guides every two
+  days. The optional *Chart Window Only* setting limits the table to the same
+  period, so the chart, rows and totals describe one fleet slice.
+- **Explicit fork, parked and cleared lifecycle states.** A conversation parked
+  with `⌃B` points to its continuation, a fork that added no work is marked
+  superseded, and `/clear` marks the previous conversation Cleared.
+
+### Changed
+- **Directory replaces Path in the default table.** It shows only the final
+  project-directory name and keeps the table compact; the complete Path is now
+  a separate column, hidden by default and available from the column picker.
+- **Last Activity now means conversation activity**, read from timestamped
+  transcript records. Provider bookkeeping can still update a file's mtime
+  without making an old session look newly active.
+- Claude Desktop Code tabs offer the ordinary CLI actions their mirrored
+  transcripts support — Copy Resume Command and Delete — while Stop remains
+  unavailable because the tab is owned by the desktop app.
+- Parked and cleared sessions remain available as history but no longer count
+  as running, accumulate busy or permission-wait time, animate the menu bar, or
+  raise chimes and notifications.
+
+### Fixed
+- Forked and parked transcripts no longer double-count inherited tokens, turns,
+  user messages or changed lines; each copied record is charged to one session.
+- Empty Codex rollouts created by IDE metadata are hidden until they contain a
+  real conversation. During an index-format upgrade, the previous complete
+  index stays visible until the replacement is ready.
+- Claude technical runtime labels no longer replace the user-facing session
+  description, and new provider-generated prompt wrappers are not mistaken for
+  titles.
+- Custom Sources can point at a mounted home or backup: recognised Claude Code,
+  Codex and Claude Desktop roots are found below the selected directory and
+  merged into the local snapshot. Built-in source rows no longer enable
+  inapplicable Sync, Clear Cache or Remove actions.
+- IntelliJ-family sessions open the existing project instead of creating a new
+  one, and finished turns are surfaced even when the hosting application's
+  window focus cannot be observed.
+- Switching Insights prompt templates cannot save template A's pending text
+  over template B. Empty overrides are rejected, and empty files left by an
+  older release no longer shadow the bundled prompt.
+- Live totals update when a session starts, stops or waits, and repaint when a
+  relevant column is shown or hidden.
+- The 30-day usage and limits grids stay on local midnight across
+  daylight-saving changes.
+- A live Codex session no longer causes a full process-table walk every second;
+  that fallback is limited to SDK-driven Claude sessions that need it.
+
+### Security
+- Stop and Delete no longer trust a PID read from provider-owned state alone.
+  EpiScope validates the executable and structured argv, captures the kernel
+  process start time, rechecks the identity after confirmation, and for Codex
+  verifies the process that owns the exact rollout file. PID reuse or a session
+  restarted while a sheet is open fails closed: nothing is signalled or
+  deleted.
+- `/clear` is recognised only from the exact structured hook-success record;
+  matching text nested inside untrusted transcript content cannot reset a
+  session's title or lifecycle state.
+
 ## [0.8] — 2026-08-09
 
 ### Added

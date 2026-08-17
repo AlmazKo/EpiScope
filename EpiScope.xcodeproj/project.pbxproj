@@ -345,7 +345,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.8;
+				MARKETING_VERSION = 0.9;
 				PRODUCT_BUNDLE_IDENTIFIER = almazko.EpiScope;
 				PRODUCT_NAME = EpiScope;
 				REGISTER_APP_GROUPS = YES;
@@ -380,7 +380,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.8;
+				MARKETING_VERSION = 0.9;
 				PRODUCT_BUNDLE_IDENTIFIER = almazko.EpiScope;
 				PRODUCT_NAME = EpiScope;
 				REGISTER_APP_GROUPS = YES;
