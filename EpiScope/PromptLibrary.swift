@@ -54,11 +54,11 @@ nonisolated enum PromptLibrary {
     }
 
     static func custom(_ name: String) -> String? {
-        try? String(contentsOf: overrideURL(name), encoding: .utf8)
+        usableOverride(try? String(contentsOf: overrideURL(name), encoding: .utf8))
     }
 
     static func isCustomised(_ name: String) -> Bool {
-        FileManager.default.fileExists(atPath: overrideURL(name).path)
+        custom(name) != nil
     }
 
     // Writing the bundled text verbatim still counts as an override — the file
@@ -66,6 +66,12 @@ nonisolated enum PromptLibrary {
     // that only looks like a no-op until the next release changes the default.
     @discardableResult
     static func save(_ text: String, for name: String) -> Bool {
+        // An empty override is never a usable analysis prompt. Refuse the
+        // write and leave the last valid custom copy (or bundled fallback) in
+        // force while the editor reports that the draft was not saved.
+        guard isValidOverride(text) else {
+            return false
+        }
         let fm = FileManager.default
         try? fm.createDirectory(at: overridesDirectory, withIntermediateDirectories: true)
         guard let data = text.data(using: .utf8) else { return false }
@@ -75,6 +81,15 @@ nonisolated enum PromptLibrary {
         } catch {
             return false
         }
+    }
+
+    static func isValidOverride(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func usableOverride(_ text: String?) -> String? {
+        guard let text, isValidOverride(text) else { return nil }
+        return text
     }
 
     // Restoring the default deletes the override, so the app falls back to the

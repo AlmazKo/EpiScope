@@ -782,7 +782,8 @@ final class LimitChartView: NSView {
         let dateAttrs: [NSAttributedString.Key: Any] = [
             .font: Self.tickFont, .foregroundColor: NSColor.labelColor,
         ]
-        let tickHours = TokenChartView.WindowConfig(days: days).tickHours
+        let config = TokenChartView.WindowConfig(days: days)
+        let tickHours = config.tickHours
         let cal = Calendar.current
         let df = DateFormatter()
         df.setLocalizedDateFormatFromTemplate("MMMd")
@@ -818,7 +819,7 @@ final class LimitChartView: NSView {
             lx = max(plot.minX - 4, min(plot.maxX - sz.width + 4, lx))
             str.draw(at: NSPoint(x: lx, y: plot.maxY + 2))
 
-            guard let next = cal.date(byAdding: .hour, value: -tickHours, to: snapped) else { break }
+            guard let next = config.previousTick(before: snapped, calendar: cal) else { break }
             snapped = next
         }
     }

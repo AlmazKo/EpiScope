@@ -164,6 +164,13 @@ without the operator switching to the terminal tab.
 - **THEN** the same name is used as its task description
 - **AND** a technical tracker label never replaces it
 
+#### Scenario: Claude exposes only a technical runtime name
+- **GIVEN** a live session is labelled with a worktree or agent slug such as `episcope-7e`
+- **WHEN** EpiScope renders its user-facing task description
+- **THEN** the slug is used only to find the terminal tab
+- **AND** the first real user prompt is shown when no semantic AI title exists
+- **AND** an `ai-title` immediately paired with the same `agent-name` is treated as technical, preserving the previous semantic title
+
 #### Scenario: The fleet dropdown stays alive while open
 - **GIVEN** the status-bar menu remains open
 - **WHEN** elapsed time advances
@@ -484,6 +491,15 @@ chart.
 - **THEN** that placeholder is not presented as a session
 - **AND** it appears normally if conversation records are later appended to the rollout
 
+#### Scenario: The index format changes on upgrade
+- **GIVEN** the installed version can decode the previous index but must rebuild
+  newly defined fields from the transcripts
+- **WHEN** the app starts the rebuild
+- **THEN** the previous coherent session list remains visible and available to
+  search and Insights until the replacement is complete
+- **AND** the rebuilt index replaces it atomically rather than publishing mixed
+  shallow and deep Codex rows
+
 #### Scenario: Dropping every narrowing at once
 - **GIVEN** a dragged range, filter text or a selected session is narrowing the table
 - **WHEN** the operator looks at the rows area
@@ -575,6 +591,8 @@ Code copied the conversation holding it into a second transcript.
   earlier, and subtracted from the other
 - **AND** every figure on a row is what that run itself spent, so the totals
   strip and the project group are the sum of the rows they stand under
+- **AND** copied user messages and copied Edit/Write line changes are charged
+  once, by the same stable-record rule as copied model calls
 
 #### Scenario: A fork adds nothing of its own
 - **WHEN** every call a session holds was already paid for by the one it was
@@ -591,6 +609,8 @@ Code copied the conversation holding it into a second transcript.
   `↳ continued in background`
 - **AND** it keeps its path, model, last activity and whatever it spent after the
   fork: that part of the conversation lives only in this transcript
+- **AND** its stale process state drives no menu-bar bar, chime, notification,
+  running count, busy clock or permission-wait clock
 
 #### Scenario: The continuation is filtered out
 - **GIVEN** a dragged range, a search term or a narrowed source leaves the parked
@@ -684,6 +704,11 @@ The app SHALL total the table's numeric columns in a strip under the rows.
 - **THEN** every total stays under the column it belongs to
 - **WHEN** the table is empty, or the window is showing a session, search or Insights
 - **THEN** the strip is not there at all
+
+#### Scenario: Live totals change without a reindex
+- **WHEN** a visible session starts, exits, begins waiting or leaves a prompt
+- **THEN** the running count and the open Perm wait total update on the same
+  live-state tick as the row badge
 
 ### Requirement: Limit the table to the chart window
 
@@ -837,6 +862,8 @@ The app SHALL let the operator pick the chart window and the bucket size.
 #### Scenario: The chart recomputes
 - **WHEN** the chart recomputes
 - **THEN** the bucket grid stays anchored to clock boundaries, so bars for past days do not grow
+- **AND** whole-day axis guides advance by calendar days, so midnight labels
+  remain midnight across daylight-saving transitions
 
 #### Scenario: Claude and Codex are both active
 - **WHEN** the aggregate chart recomputes
@@ -1308,6 +1335,17 @@ model and its prompt are one subject — and SHALL keep the way back.
   pane says the bundled default is no longer followed
 - **AND** the placeholders the run fills in are listed, read from the bundled copy
 
+#### Scenario: Switching templates with an unsaved edit
+- **GIVEN** the editor still has a pending debounced save for template A
+- **WHEN** the operator selects template B
+- **THEN** A's text is saved only to A, and B opens its own bundled or custom text
+
+#### Scenario: Emptying a prompt
+- **WHEN** the editor contains only whitespace
+- **THEN** the draft is reported as not saved and does not replace the last
+  usable custom prompt or the bundled fallback
+- **AND** an empty override file left by an older release is ignored on read
+
 #### Scenario: Restoring a default
 - **WHEN** the operator restores the default and confirms
 - **THEN** the user copy moves to the Trash and the bundled prompt runs again,
@@ -1378,6 +1416,23 @@ The app SHALL let the operator stop a running session, performing the shutdown
 - **WHEN** the operator runs `Stop Session`
 - **THEN** nothing is signalled
 
+#### Scenario: The process changes while confirmation is open
+- **GIVEN** a stop or delete sheet captured a live session process
+- **WHEN** that pid exits, is reused or is rebound to another session before confirmation
+- **THEN** nothing is signalled or deleted, because pid, provider, process start
+  time and the current session binding no longer match
+
+#### Scenario: A finished session resumes while delete confirmation is open
+- **GIVEN** the delete sheet opened while no process owned the session
+- **WHEN** that session starts running before the operator confirms
+- **THEN** its transcript remains in place and the operator is told it is now running
+
+#### Scenario: Stop a live Codex session
+- **GIVEN** TerminalTracker has joined a Codex rollout to its real process pid
+- **WHEN** the operator runs `Stop Session`
+- **THEN** EpiScope also proves that the process owns that rollout file
+- **AND** the same identity checks and confirmation behaviour used for Claude apply
+
 #### Scenario: Sessions that cannot be stopped
 - **GIVEN** the session is finished, or runs as a Claude Desktop Code tab
 - **THEN** `Stop Session` is listed with the other session actions but disabled
@@ -1401,6 +1456,8 @@ The app SHALL delete a session only after a confirmation and only to the Trash.
   its shutdown records go with it
 - **AND** a session that has not exited within the wait is left alone —
   transcript in place — and says so
+- **AND** if the app cannot prove which live process owns the session, deletion
+  is refused and the transcript stays in place
 
 #### Scenario: Deleting a running Claude Desktop Code tab
 - **GIVEN** the session runs in the Claude app, which the app does not stop
@@ -1467,6 +1524,14 @@ directories from `Settings → Sources`.
   per-source picker in the toolbar
 - **AND** which sources count at all is decided in `Settings → Sources`,
   the one place that governs them
+
+#### Scenario: Source actions apply only to custom sources
+- **GIVEN** the operator opens a source row's context menu
+- **WHEN** the row is one of the built-in Claude Code, Codex or Claude Desktop roots
+- **THEN** `Sync Now`, `Clear Cache…` and `Remove Source…` are disabled
+- **AND** AppKit validation does not silently re-enable them
+- **WHEN** the row is an enabled custom source
+- **THEN** its applicable actions are enabled, including `Sync Now`
 
 ---
 

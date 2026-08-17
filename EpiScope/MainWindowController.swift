@@ -997,6 +997,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             if term.isEmpty { return true }
             return e.relativePath.lowercased().contains(term)
                 || (e.title?.lowercased().contains(term) ?? false)
+                || (e.promptPreview?.lowercased().contains(term) ?? false)
                 || e.sessionId.lowercased().contains(term)
                 || e.cwd.lowercased().contains(term)
         }
@@ -1072,7 +1073,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // each API call to a single session (SessionIndex.resolveForks), so a
         // figure on screen is one this session spent and nobody else's.
         for e in filteredEntries {
-            if monitor.liveSessions[e.sessionId] != nil { running += 1 }
+            if monitor.isPresentationLive(e.sessionId) { running += 1 }
             input += e.inputTokens + e.cacheCreationTokens
             cacheRead += e.cacheReadTokens
             output += e.outputTokens
@@ -1669,6 +1670,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         else { return }
         col.isHidden.toggle()
         UserDefaults.standard.set(col.isHidden, forKey: Self.columnHiddenKey(raw))
+        refreshTotals()
     }
 
     private static func columnHiddenKey(_ rawIdentifier: String) -> String {
@@ -2344,7 +2346,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             // is hidden while grouping (see applyGroupingColumns).
             let dim = hasNoTerminal(entry)
             if groupByDir {
-                let raw = (entry.name ?? entry.title ?? "")
+                let raw = (entry.name ?? entry.title ?? entry.promptPreview ?? "")
                     .components(separatedBy: .whitespacesAndNewlines)
                     .filter { !$0.isEmpty }.joined(separator: " ")
                 cell.stringValue = raw.isEmpty ? "—" : raw
@@ -2370,14 +2372,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                     ? "↳ continued in background"
                     : "↳ superseded by a fork"
                 cell.textColor = .secondaryLabelColor
-                cell.toolTip = (entry.title ?? entry.folderName) + "\n\n"
+                cell.toolTip = entry.displayTitle + "\n\n"
                     + (job != nil
                        ? "Parked with ⌃B. The conversation continues in the background job."
                        : "Forked into another session, which holds every call this one made.")
                     + "\nWhat it shows here is what it spent that nobody else did."
                 return cell
             }
-            let raw = entry.title ?? ""
+            let raw = entry.title ?? entry.promptPreview ?? ""
             // Collapse all interior whitespace (incl. newlines, tabs)
             // into single spaces so a multi-line user prompt renders
             // as one tidy line in the column.
@@ -2836,6 +2838,36 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return live.pid > 1
     }
 
+    private func processIdentity(for entry: SessionIndexEntry, transcriptURL: URL? = nil)
+        -> SessionControl.ProcessIdentity? {
+        // A Codex rollout is held open by exactly the process that owns the
+        // session. Prefer that join even when the periodic tracker has already
+        // published a pid: a stale sid→pid snapshot must never authorise a
+        // signal after the original process exited and its pid was reused.
+        if entry.provider == .codex {
+            guard let transcriptURL else { return nil }
+            return SessionControl.identityOwningFile(transcriptURL, provider: entry.provider)
+        }
+        if let live = monitor.liveSessions[entry.sessionId], live.pid > 1,
+           let identity = SessionControl.identity(pid: live.pid, provider: entry.provider) {
+            return identity
+        }
+        if let transcriptURL {
+            return SessionControl.identityOwningFile(transcriptURL, provider: entry.provider)
+        }
+        return nil
+    }
+
+    // Re-resolve both halves after a sheet: the live registry must still bind
+    // this session id to the same pid, and the kernel identity behind that pid
+    // must be unchanged. Codex additionally has its rollout-owner join as a
+    // fallback during the tracker's publication delay.
+    private func processIsCurrent(_ expected: SessionControl.ProcessIdentity,
+                                  for entry: SessionIndexEntry,
+                                  transcriptURL: URL? = nil) -> Bool {
+        processIdentity(for: entry, transcriptURL: transcriptURL) == expected
+    }
+
     // A Claude / Codex CLI session: one EpiScope can resume from a shell and
     // whose transcript it owns (so can move to the Trash).
     //
@@ -2876,10 +2908,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // confirmed first, because the answer being written ends with it.
     @objc private func stopClickedSession() {
         guard let entry = actionSession(), canStop(entry),
-              let live = monitor.liveSessions[entry.sessionId] else { return }
+              let live = monitor.liveSessions[entry.sessionId],
+              let transcriptURL = SessionIndexer.transcriptURL(for: entry),
+              let identity = processIdentity(for: entry, transcriptURL: transcriptURL) else {
+            NSSound.beep()
+            return
+        }
         let working = live.isWaiting || monitor.busyDuration(for: entry.sessionId) != nil
         guard working else {
-            performStop(entry, pid: live.pid)
+            performStop(entry, identity: identity, transcriptURL: transcriptURL)
             return
         }
         let name = entry.name ?? entry.title ?? entry.folderName
@@ -2893,8 +2930,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
         let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-            guard resp == .alertFirstButtonReturn else { return }
-            self?.performStop(entry, pid: live.pid)
+            guard let self, resp == .alertFirstButtonReturn,
+                  self.processIsCurrent(identity, for: entry,
+                                        transcriptURL: transcriptURL) else {
+                if resp == .alertFirstButtonReturn { NSSound.beep() }
+                return
+            }
+            self.performStop(entry, identity: identity, transcriptURL: transcriptURL)
         }
         if let window {
             alert.beginSheetModal(for: window, completionHandler: confirm)
@@ -2903,8 +2945,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
     }
 
-    private func performStop(_ entry: SessionIndexEntry, pid: Int) {
-        switch SessionControl.stop(pid: pid, provider: entry.provider) {
+    private func performStop(_ entry: SessionIndexEntry,
+                             identity: SessionControl.ProcessIdentity,
+                             transcriptURL: URL) {
+        guard processIsCurrent(identity, for: entry, transcriptURL: transcriptURL) else {
+            NSSound.beep()
+            return
+        }
+        switch SessionControl.stop(identity) {
         case .stopped:
             // The monitor polls liveness every second, so the row leaves the
             // live set on its own — nothing to refresh here.
@@ -2924,15 +2972,28 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     @objc private func deleteClickedSession() {
         guard let entry = actionSession(), isCliSession(entry),
               let url = SessionIndexer.transcriptURL(for: entry) else { return }
-        let name = entry.name ?? entry.title ?? entry.folderName
-        let stoppablePid = canStop(entry) ? monitor.liveSessions[entry.sessionId]?.pid : nil
+        let name = entry.displayTitle
+        // A Claude Desktop Code tab is CLI-shaped on disk but app-owned at
+        // runtime. Preserve its documented behaviour: warn, never signal it.
+        let identity = isDesktopSession(entry)
+            ? nil
+            : processIdentity(for: entry, transcriptURL: url)
+        let observedLive = monitor.liveSessions[entry.sessionId] != nil || identity != nil
+        // A live CLI whose process cannot be proven is the one case where
+        // deletion must stop before the confirmation sheet. Removing a file
+        // underneath it would either lose the rest of the run or recreate a
+        // misleading partial transcript.
+        if observedLive, !isDesktopSession(entry), identity == nil {
+            reportUnverifiedLiveSession(name: name)
+            return
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete “\(name)”?"
         var info = "\(entry.relativePath)\n\nIts transcript will be moved to the Trash."
-        if stoppablePid != nil {
+        if identity != nil {
             info += "\n\nThis session is running and will be stopped first."
-        } else if monitor.liveSessions[entry.sessionId] != nil {
+        } else if observedLive {
             // Live and not ours to stop — a Claude Desktop Code tab. It writes
             // an ordinary CLI transcript, so it recreates the file on its next
             // message; say what the delete actually leaves behind.
@@ -2945,10 +3006,36 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         alert.buttons.first?.hasDestructiveAction = true
         let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
             guard let self, resp == .alertFirstButtonReturn else { return }
-            if let pid = stoppablePid {
-                self.stopThenDelete(entry, url: url, pid: pid)
+            // Resolve the path again too: a reindex/source change while the
+            // sheet was open must not leave us deleting a stale target.
+            guard let currentURL = SessionIndexer.transcriptURL(for: entry),
+                  currentURL.standardizedFileURL == url.standardizedFileURL else {
+                NSSound.beep()
+                return
+            }
+            if let identity {
+                guard self.processIsCurrent(identity, for: entry,
+                                            transcriptURL: currentURL) else {
+                    NSSound.beep()
+                    return
+                }
+                self.stopThenDelete(entry, url: currentURL, identity: identity)
             } else {
-                self.performDelete(entry, url: url)
+                // A row that was finished when the sheet opened can be resumed
+                // while it is on screen. Re-check before touching its file;
+                // a Desktop tab is allowed only when the sheet already warned
+                // that it was live and could not be stopped.
+                let nowIdentity = self.isDesktopSession(entry)
+                    ? nil
+                    : self.processIdentity(
+                        for: entry, transcriptURL: currentURL)
+                let nowLive = self.monitor.liveSessions[entry.sessionId] != nil
+                    || nowIdentity != nil
+                guard observedLive || !nowLive else {
+                    self.reportSessionBecameLive(name: name)
+                    return
+                }
+                self.performDelete(entry, url: currentURL)
             }
         }
         if let window {
@@ -2961,20 +3048,50 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // The delete waits for the process to actually be gone: a shutting-down CLI
     // still writes its last records, and trashing the file under it would leave
     // those records in a recreated transcript.
-    private func stopThenDelete(_ entry: SessionIndexEntry, url: URL, pid: Int) {
-        guard SessionControl.stop(pid: pid, provider: entry.provider) == .stopped else {
-            // Already gone, or the pid is not this session's process after all —
-            // either way there is nothing running to wait for.
-            performDelete(entry, url: url)
+    private func stopThenDelete(_ entry: SessionIndexEntry, url: URL,
+                                identity: SessionControl.ProcessIdentity) {
+        guard processIsCurrent(identity, for: entry, transcriptURL: url),
+              SessionControl.stop(identity) == .stopped else {
+            // The identity changed between the sheet and the signal, or the
+            // signal itself failed. Do not guess that the transcript is now
+            // safe: a replacement process may already own it.
+            NSSound.beep()
             return
         }
-        SessionControl.waitForExit(pid: pid, timeout: 5) { [weak self] exited in
+        SessionControl.waitForExit(identity, timeout: 5) { [weak self] exited in
             guard let self else { return }
             guard exited else {
                 self.reportStopFailed(name: entry.name ?? entry.title ?? entry.folderName)
                 return
             }
             self.performDelete(entry, url: url)
+        }
+    }
+
+    private func reportUnverifiedLiveSession(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” may still be running"
+        alert.informativeText = "EpiScope could not verify the process that owns this session, "
+            + "so its transcript was left in place. Stop it from its terminal, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private func reportSessionBecameLive(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” is now running"
+        alert.informativeText = "Its transcript was left in place. Stop the session, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
         }
     }
 
@@ -3397,6 +3514,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     @objc private func liveStateChanged() {
         syncWaitTicker()
         syncBusyTicker()
+        refreshTotals()
         // "Go to terminal" enables only for a live selection, which can
         // flip as sessions start / die.
         window?.toolbar?.validateVisibleItems()
@@ -3471,6 +3589,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func tickWaitColumn() {
+        refreshTotals()
         guard window?.isVisible == true,
               let col = outlineView.tableColumn(withIdentifier: ColumnID.permWait),
               !col.isHidden,

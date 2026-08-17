@@ -8,7 +8,7 @@ import Foundation
 //
 // Returns the absolute byte offset just past the last complete line — callers
 // store it as their parse cursor and resume from there next time.
-enum JSONLReader {
+nonisolated enum JSONLReader {
     // Tool results legitimately run to hundreds of KB on one line. Past this
     // they are no longer a record anyone here can use — and because the cursor
     // only advances past complete lines, a single unterminated giant line

@@ -151,10 +151,22 @@ nonisolated struct InheritedUsage: Codable, Equatable, Sendable {
     var cacheRead: Int64 = 0
     var output: Int64 = 0
     var turns: Int = 0
+    // Optional for compatibility with provisional v22 cache entries. New
+    // writes always populate them, including zero.
+    var userMessages: Int? = 0
+    var linesAdded: Int64? = 0
+    var linesRemoved: Int64? = 0
 
     var isEmpty: Bool {
         input == 0 && cacheCreation == 0 && cacheRead == 0 && output == 0 && turns == 0
+            && (userMessages ?? 0) == 0 && (linesAdded ?? 0) == 0
+            && (linesRemoved ?? 0) == 0
     }
+}
+
+nonisolated enum CodexContentState: String, Codable, Sendable {
+    case metadataOnly
+    case conversation
 }
 
 nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
@@ -165,15 +177,21 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     var provider: SessionProvider = .claude
     // `title` is the auto-generated description (Claude's ai-title /
     // Codex's first user prompt). `name` is the user-given label set
-    // via /rename in Claude Code (custom-title record).
+    // via /rename in Claude Code (custom-title record). `technicalName`
+    // is Claude's agent/runtime label and is never user-facing.
     var title: String?
     var name: String?
+    // Used when the provider has not generated a semantic title.
+    var promptPreview: String?
+    // Kept for terminal-tab binding and title classification only.
+    var technicalName: String?
+    // When ai-title changes, retain the semantic predecessor long enough to
+    // undo an immediately paired `agent-name` technical overwrite, including
+    // when those two records straddle incremental index passes.
+    var previousAITitle: String?
     // Claude Code can create a fresh session for /clear while copying the
     // previous session's ai-title into the new transcript before the clear
-    // boundary. Remember the short interval between that boundary and the
-    // first real prompt so an incremental scan cannot strand the stale title.
-    var awaitingPromptTitleAfterClear: Bool = false
-    // Claude may keep appending that inherited title after every subsequent
+    // boundary. Claude may keep appending that inherited title after every subsequent
     // turn. Suppress only this exact value; a genuinely regenerated title is
     // allowed through as soon as it differs.
     var suppressedInheritedAITitle: String?
@@ -254,20 +272,16 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     // and add to the existing token / branch counters instead of
     // re-parsing the whole megabyte stream.
     var lastParsedSize: Int64 = 0
+    // nil is a shallow stub whose content has not been examined yet. Only a
+    // completed deep scan may call a rollout metadata-only.
+    var codexContentState: CodexContentState?
 
     // Some Codex IDE integrations create a rollout containing only
     // `session_meta` (cwd + instructions) before any conversation exists.
     // Keep it in the index cache so a later append is incremental, but do not
     // present it as a session: there is no user task, model response or usage.
     var isMetadataOnlyCodex: Bool {
-        provider == .codex
-            && userMessageCount == 0
-            && turns == 0
-            && inputTokens == 0
-            && cacheCreationTokens == 0
-            && cacheReadTokens == 0
-            && outputTokens == 0
-            && (title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        provider == .codex && codexContentState != .conversation
     }
 
     // uuid of the transcript's first conversation record. Two transcripts that
@@ -286,7 +300,9 @@ nonisolated struct SessionIndexEntry: Codable, Equatable, Sendable {
     var folderName: String { URL(fileURLWithPath: cwd).lastPathComponent }
     var displayTitle: String {
         let t = title?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
-        return t.isEmpty ? folderName : t
+        if !t.isEmpty { return t }
+        let p = promptPreview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return p.isEmpty ? folderName : p
     }
     var relativePath: String {
         let home = NSHomeDirectory()
@@ -327,7 +343,11 @@ nonisolated struct SessionIndex: Codable, Sendable {
     // session's first real prompt.
     // 21: /clear continuations retain the previous session id so its row can
     // carry a terminal Cleared status.
-    static let currentVersion = 21
+    // 22: technical agent names are separated from semantic titles, and the
+    // first real user prompt is retained as a display fallback.
+    // 23: Codex content state is the result of a deep scan; fork inheritance
+    // also owns copied user messages and line changes.
+    static let currentVersion = 23
 
     var version: Int = SessionIndex.currentVersion
     var entries: [SessionIndexEntry] = []
@@ -430,6 +450,9 @@ final class SessionIndexer {
     private var ticksSinceScan = 0
     private static let safetyScanTicks = 30   // ~30 s
     private var reindexing = false
+    // A decodable older index is safe to display while its semantics are
+    // rebuilt, but not safe to use as the next scan's cache.
+    private var rebuildFromProvisionalCache = false
     // True while the main window is closed / miniaturized — nobody is
     // looking at the table, so the 2-second sweep is pure waste. The
     // menu bar runs off SessionMonitor and doesn't need the index.
@@ -548,7 +571,9 @@ final class SessionIndexer {
         if DemoFleet.isEnabled { return }
         guard !paused, !reindexing else { return }
         reindexing = true
-        let cached = entries
+        let provisional = rebuildFromProvisionalCache
+        rebuildFromProvisionalCache = false
+        let cached = provisional ? [] : entries
         let roots = SessionSourceStore.shared.indexRoots()
         let parked = ParkedSessions.shared.continuations
         WorkScheduler.shared.run(.init(id: "index-pass", group: WorkScheduler.Group.index, deferrable: false)) {
@@ -558,7 +583,11 @@ final class SessionIndexer {
             let (allEntries, stubIds, codexPaths) = Self.rebuildShallow(cache: cached, roots: roots)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                if allEntries != self.entries {
+                // On an upgrade the decoded old index remains the coherent
+                // screen/search/report snapshot until every new semantic field
+                // has been rebuilt. Publishing shallow stubs (and later mixed
+                // chunks) is what made all Codex rows disappear on v21→v22.
+                if !provisional, allEntries != self.entries {
                     self.entries = allEntries
                     self.publish()
                 }
@@ -593,10 +622,12 @@ final class SessionIndexer {
                     let remaining = stubIds.count - (idx + 1)
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        self.entries = snapshot
+                        if !provisional {
+                            self.entries = snapshot
+                            self.publish()
+                        }
                         self.pendingDeepScan = max(0, remaining)
                         self.onProgress?()
-                        self.publish()
                     }
                     since = 0
                 }
@@ -674,9 +705,35 @@ final class SessionIndexer {
         // each launch would deep-scan everything from scratch.
         dec.dateDecodingStrategy = .millisecondsSince1970
         guard let data = try? Data(contentsOf: Self.indexURL),
-              let idx = try? dec.decode(SessionIndex.self, from: data),
-              idx.version == SessionIndex.currentVersion else { return }
-        entries = idx.entries
+              let idx = try? dec.decode(SessionIndex.self, from: data) else { return }
+        let loaded = Self.prepareLoadedIndex(idx)
+        entries = loaded.entries
+        guard loaded.requiresRebuild else { return }
+        rebuildFromProvisionalCache = true
+    }
+
+    // Older decodable caches remain a coherent provisional screen while every
+    // transcript is rebuilt from byte zero. Codex's new content-state field is
+    // inferred only for that presentation: unknown must not make real rows
+    // disappear during the upgrade.
+    nonisolated static func prepareLoadedIndex(_ idx: SessionIndex)
+        -> (entries: [SessionIndexEntry], requiresRebuild: Bool) {
+        guard idx.version != SessionIndex.currentVersion else {
+            return (idx.entries, false)
+        }
+        var entries = idx.entries
+        // Optional fields let the immediately previous cache decode. Infer only
+        // its provisional presentation state; the pass itself ignores every
+        // cached counter and rebuilds from byte zero before replacing it.
+        for i in entries.indices where entries[i].provider == .codex {
+            let e = entries[i]
+            let hasConversation = e.userMessageCount > 0 || e.turns > 0
+                || e.inputTokens > 0 || e.cacheCreationTokens > 0
+                || e.cacheReadTokens > 0 || e.outputTokens > 0
+                || !(e.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            entries[i].codexContentState = hasConversation ? .conversation : .metadataOnly
+        }
+        return (entries, true)
     }
 
     nonisolated private static func saveToDisk(_ idx: SessionIndex) {
@@ -1169,13 +1226,13 @@ final class SessionIndexer {
                 let b = entries[$1].startedAt ?? entries[$1].lastActivity
                 return a < b
             }
-            var seen: [String: String] = [:]   // requestId -> first owner
+            var seen: [String: String] = [:]   // stable record key -> first owner
             for idx in ordered {
                 restoreInherited(&entries[idx])
                 var mine = InheritedUsage(familyKey: key, from: "")
-                for (rid, usage) in requestUsage(at: transcriptFile(entries[idx])) {
-                    guard let owner = seen[rid] else {
-                        seen[rid] = entries[idx].sessionId
+                for (recordKey, usage) in forkUsage(at: transcriptFile(entries[idx])) {
+                    guard let owner = seen[recordKey] else {
+                        seen[recordKey] = entries[idx].sessionId
                         continue
                     }
                     if mine.from.isEmpty { mine.from = owner }
@@ -1183,7 +1240,10 @@ final class SessionIndexer {
                     mine.cacheCreation += usage.cacheCreation
                     mine.cacheRead += usage.cacheRead
                     mine.output += usage.output
-                    mine.turns += 1
+                    mine.turns += usage.turns
+                    mine.userMessages = (mine.userMessages ?? 0) + usage.userMessages
+                    mine.linesAdded = (mine.linesAdded ?? 0) + usage.linesAdded
+                    mine.linesRemoved = (mine.linesRemoved ?? 0) + usage.linesRemoved
                 }
                 entries[idx].inherited = mine
                 applyInherited(&entries[idx])
@@ -1210,6 +1270,9 @@ final class SessionIndexer {
         e.cacheReadTokens = max(0, e.cacheReadTokens - inh.cacheRead)
         e.outputTokens = max(0, e.outputTokens - inh.output)
         e.turns = max(0, e.turns - inh.turns)
+        e.userMessageCount = max(0, e.userMessageCount - (inh.userMessages ?? 0))
+        e.linesAdded = max(0, e.linesAdded - (inh.linesAdded ?? 0))
+        e.linesRemoved = max(0, e.linesRemoved - (inh.linesRemoved ?? 0))
     }
 
     nonisolated private static func restoreInherited(_ e: inout SessionIndexEntry) {
@@ -1219,25 +1282,40 @@ final class SessionIndexer {
         e.cacheReadTokens += inh.cacheRead
         e.outputTokens += inh.output
         e.turns += inh.turns
+        e.userMessageCount += inh.userMessages ?? 0
+        e.linesAdded += inh.linesAdded ?? 0
+        e.linesRemoved += inh.linesRemoved ?? 0
     }
 
     // uuid of the first `user` / `assistant` record. Header records (mode,
     // titles, file-history snapshots) are skipped: they are rewritten per
     // process and carry no uuid to match on.
-    nonisolated private static func readHeadUuid(at path: String) -> String? {
+    nonisolated static func readHeadUuid(at path: String) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         else { return nil }
         defer { try? handle.close() }
-        guard let head = try? handle.read(upToCount: 256 * 1024), !head.isEmpty
-        else { return nil }
         let decoder = JSONDecoder()
-        for line in head.split(separator: 0x0a, omittingEmptySubsequences: true) {
-            guard let rec = try? decoder.decode(HeadRec.self, from: Data(line)),
-                  rec.type == "user" || rec.type == "assistant",
-                  let uuid = rec.uuid, !uuid.isEmpty
-            else { continue }
-            return uuid
+        var buffer = Data()
+        while let chunk = try? handle.read(upToCount: 256 * 1024), !chunk.isEmpty {
+            buffer.append(chunk)
+            var start = buffer.startIndex
+            while let newline = buffer[start...].firstIndex(of: 0x0a) {
+                let line = buffer[start..<newline]
+                if line.count <= JSONLReader.maxLineBytes,
+                   let rec = try? decoder.decode(HeadRec.self, from: Data(line)),
+                   rec.type == "user" || rec.type == "assistant",
+                   let uuid = rec.uuid, !uuid.isEmpty {
+                    return uuid
+                }
+                start = buffer.index(after: newline)
+            }
+            buffer = start < buffer.endIndex ? Data(buffer[start...]) : Data()
+            if buffer.count > JSONLReader.maxLineBytes { buffer.removeAll(keepingCapacity: true) }
         }
+        if !buffer.isEmpty,
+           let rec = try? decoder.decode(HeadRec.self, from: buffer),
+           rec.type == "user" || rec.type == "assistant",
+           let uuid = rec.uuid, !uuid.isEmpty { return uuid }
         return nil
     }
 
@@ -1246,30 +1324,65 @@ final class SessionIndexer {
         let uuid: String?
     }
 
-    nonisolated private struct RequestUsage {
+    nonisolated struct ForkUsage {
         var input: Int64 = 0
         var cacheCreation: Int64 = 0
         var cacheRead: Int64 = 0
         var output: Int64 = 0
+        var turns: Int = 0
+        var userMessages: Int = 0
+        var linesAdded: Int64 = 0
+        var linesRemoved: Int64 = 0
     }
 
-    // requestId → the usage of its first record, the same dedupe foldUsage
-    // applies: Claude writes one record per streamed block, all carrying the
-    // call's cumulative usage.
-    nonisolated private static func requestUsage(at path: String) -> [String: RequestUsage] {
+    // Stable transcript record → every aggregate copied into a fork. Assistant
+    // calls key by requestId (streaming blocks share it); human prompts and
+    // patch results key by record uuid. Records without a stable key cannot be
+    // safely called inherited and stay with both rows rather than being guessed.
+    nonisolated static func forkUsage(at path: String) -> [String: ForkUsage] {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        var out: [String: RequestUsage] = [:]
+        let toolUseIdSig = "tool_use_id".data(using: .utf8)!
+        var out: [String: ForkUsage] = [:]
         _ = JSONLReader.stream(at: URL(fileURLWithPath: path)) { lineData in
-            guard let rec = try? decoder.decode(AssistantRecord.self, from: lineData),
-                  let rid = rec.requestId, out[rid] == nil
-            else { return }
-            let u = rec.message?.usage
-            out[rid] = RequestUsage(
-                input: u?.inputTokens ?? 0,
-                cacheCreation: u?.cacheCreationInputTokens ?? 0,
-                cacheRead: u?.cacheReadInputTokens ?? 0,
-                output: u?.outputTokens ?? 0)
+            if let rec = try? decoder.decode(AssistantRecord.self, from: lineData),
+               rec.type == "assistant", let rid = rec.requestId {
+                let key = "a:" + rid
+                guard out[key] == nil else { return }
+                let u = rec.message?.usage
+                out[key] = ForkUsage(
+                    input: u?.inputTokens ?? 0,
+                    cacheCreation: u?.cacheCreationInputTokens ?? 0,
+                    cacheRead: u?.cacheReadInputTokens ?? 0,
+                    output: u?.outputTokens ?? 0, turns: 1)
+                return
+            }
+            guard let rec = try? decoder.decode(ForkUserRecord.self, from: lineData),
+                  rec.type == "user", let uuid = rec.uuid else { return }
+            let key = "u:" + uuid
+            guard out[key] == nil else { return }
+            if rec.toolUseResult == nil && lineData.range(of: toolUseIdSig) == nil {
+                out[key] = ForkUsage(userMessages: 1)
+                return
+            }
+            guard let result = rec.toolUseResult else { return }
+            var usage = ForkUsage()
+            switch result.type {
+            case "update", nil:
+                for hunk in result.structuredPatch ?? [] {
+                    for line in hunk.lines ?? [] {
+                        if line.hasPrefix("+") { usage.linesAdded += 1 }
+                        else if line.hasPrefix("-") { usage.linesRemoved += 1 }
+                    }
+                }
+            case "create":
+                if let content = result.content, !content.isEmpty {
+                    usage.linesAdded = Int64(content.utf8.lazy.filter { $0 == 0x0a }.count) + 1
+                }
+            default:
+                return
+            }
+            out[key] = usage
         }
         return out
     }
@@ -1300,10 +1413,13 @@ final class SessionIndexer {
                 cwd: entry.cwd.isEmpty ? nil : entry.cwd,
                 aiTitle: entry.title,
                 customTitle: entry.name,
-                awaitingPromptTitleAfterClear: entry.awaitingPromptTitleAfterClear,
+                promptPreview: entry.promptPreview,
+                technicalName: entry.technicalName,
+                previousAITitle: entry.previousAITitle,
                 suppressedInheritedAITitle: entry.suppressedInheritedAITitle,
                 clearedFromSessionId: entry.clearedFromSessionId,
                 awaitingClearedFromSessionId: entry.awaitingClearedFromSessionId,
+                headUuid: entry.headUuid.flatMap { $0.isEmpty ? nil : $0 },
                 linesAdded: entry.linesAdded,
                 linesRemoved: entry.linesRemoved
             )
@@ -1312,10 +1428,13 @@ final class SessionIndexer {
             var out = entry
             out.title = stats.aiTitle
             out.name = stats.customTitle
-            out.awaitingPromptTitleAfterClear = stats.awaitingPromptTitleAfterClear
+            out.promptPreview = stats.promptPreview
+            out.technicalName = stats.technicalName
+            out.previousAITitle = stats.previousAITitle
             out.suppressedInheritedAITitle = stats.suppressedInheritedAITitle
             out.clearedFromSessionId = stats.clearedFromSessionId
             out.awaitingClearedFromSessionId = stats.awaitingClearedFromSessionId
+            out.headUuid = stats.headUuid
             out.model = stats.model
             out.inputTokens = stats.inputTokens
             out.cacheCreationTokens = stats.cacheCreationTokens
@@ -1356,6 +1475,11 @@ final class SessionIndexer {
             out.outputTokens = codex.outputTokens
             out.userMessageCount = codex.userMessageCount
             out.turns = codex.turns
+            let hasConversation = codex.userMessageCount > 0 || codex.turns > 0
+                || codex.inputTokens > 0 || codex.cacheCreationTokens > 0
+                || codex.cacheReadTokens > 0 || codex.outputTokens > 0
+                || !(codex.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            out.codexContentState = hasConversation ? .conversation : .metadataOnly
             out.startedAt = codex.startedAt
             out.lastRecordAt = Self.later(entry.lastRecordAt,
                                           Self.parseTimestamp(codex.lastRecordAt))
@@ -1577,9 +1701,33 @@ final class SessionIndexer {
         let customTitle: String?
     }
 
-    nonisolated private struct TypedPromptLine: Decodable {
+    nonisolated private struct UserPromptLine: Decodable {
+        let type: String?
+        let uuid: String?
+        let isMeta: Bool?
+        let promptSource: String?
         let message: Message?
         struct Message: Decodable { let content: String? }
+    }
+
+    nonisolated private struct ClearHookLine: Decodable {
+        let type: String?
+        let attachment: Attachment?
+        struct Attachment: Decodable {
+            let type: String?
+            let hookEvent: String?
+            let hookName: String?
+        }
+
+        var isClearStart: Bool {
+            type == "attachment" && attachment?.type == "hook_success"
+                && attachment?.hookEvent == "SessionStart"
+                && attachment?.hookName == "SessionStart:clear"
+        }
+    }
+
+    nonisolated private struct AgentNameLine: Decodable {
+        let agentName: String?
     }
 
     nonisolated private struct SessionLinkLine: Decodable {
@@ -1656,13 +1804,13 @@ final class SessionIndexer {
         // the previous values instead of resetting them.
         var aiTitle: String?
         var customTitle: String?
-        // A /clear transcript starts with the previous ai-title, then emits the
-        // clear boundary, then the new task. Persist this across incremental
-        // folds in case those records arrive in separate index passes.
-        var awaitingPromptTitleAfterClear: Bool = false
+        var promptPreview: String?
+        var technicalName: String?
+        var previousAITitle: String?
         var suppressedInheritedAITitle: String?
         var clearedFromSessionId: String?
         var awaitingClearedFromSessionId: Bool = false
+        var headUuid: String?
         var linesAdded: Int64 = 0
         var linesRemoved: Int64 = 0
     }
@@ -1685,7 +1833,15 @@ final class SessionIndexer {
         }
     }
 
+    nonisolated private struct ForkUserRecord: Decodable {
+        let type: String?
+        let uuid: String?
+        let toolUseResult: PatchLine.ToolUseResult?
+    }
+
     nonisolated private struct AssistantRecord: Decodable {
+        let type: String?
+        let uuid: String?
         let message: Message?
         let gitBranch: String?
         let cwd: String?
@@ -1729,6 +1885,35 @@ final class SessionIndexer {
         return token.isEmpty ? nil : String(token)
     }
 
+    // Claude's transcript labels typed prompts inconsistently across versions:
+    // recent records carry promptSource=typed, while older slash commands do
+    // not. Structured local-command chatter is recognisable by its wrappers and
+    // must not become the session description.
+    nonisolated private static func promptPreview(from rec: UserPromptLine) -> String? {
+        guard rec.type == "user", rec.isMeta != true, rec.promptSource != "system",
+              let content = rec.message?.content else { return nil }
+        let compact = content
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        // Provider-generated envelopes consistently occupy an XML-like outer
+        // element, while typed/sdk/queued prompts are plain text or slash
+        // commands. A positive record-shape check plus this legacy envelope
+        // rule survives new wrapper names without maintaining a denylist.
+        guard !compact.isEmpty, !compact.hasPrefix("<") else { return nil }
+        return String(compact.prefix(80))
+    }
+
+    nonisolated static func promptPreview(in lineData: Data) -> String? {
+        guard let record = try? JSONDecoder().decode(UserPromptLine.self, from: lineData)
+        else { return nil }
+        return promptPreview(from: record)
+    }
+
+    nonisolated static func isClearStartRecord(_ lineData: Data) -> Bool {
+        (try? JSONDecoder().decode(ClearHookLine.self, from: lineData))?.isClearStart == true
+    }
+
     // Streams the transcript from `offset` and folds the heavy fields without
     // ever holding the whole file in memory.
     nonisolated private static func foldUsage(
@@ -1744,8 +1929,8 @@ final class SessionIndexer {
         // typed user prompts don't.
         let toolUseIdSig = "tool_use_id".data(using: .utf8)!
         let titleSig = "-title\"".data(using: .utf8)!  // ai-title + custom-title
-        let clearStartSig = "\"hookName\":\"SessionStart:clear\"".data(using: .utf8)!
-        let typedPromptSig = "\"promptSource\":\"typed\"".data(using: .utf8)!
+        let agentNameSig = "\"type\":\"agent-name\"".data(using: .utf8)!
+        let clearStartSig = "SessionStart:clear".data(using: .utf8)!
         let patchSig = "\"structuredPatch\"".data(using: .utf8)!
         let effortSetSig = "Set effort level to ".data(using: .utf8)!
 
@@ -1771,12 +1956,14 @@ final class SessionIndexer {
                let v = Self.parseSessionEffort(s) {
                 stats.effort = v
             }
-            if lineData.range(of: clearStartSig) != nil {
+            if lineData.range(of: clearStartSig) != nil,
+               Self.isClearStartRecord(lineData) {
                 // Claude writes the old session's ai-title before this record.
                 // It is not a description of the conversation that follows.
                 stats.suppressedInheritedAITitle = stats.aiTitle
                 stats.aiTitle = nil
-                stats.awaitingPromptTitleAfterClear = true
+                stats.previousAITitle = nil
+                stats.promptPreview = nil
                 stats.awaitingClearedFromSessionId = true
             }
             if stats.awaitingClearedFromSessionId,
@@ -1789,17 +1976,12 @@ final class SessionIndexer {
                 stats.awaitingClearedFromSessionId = false
             }
             if lineData.range(of: userSig) != nil {
-                if stats.awaitingPromptTitleAfterClear,
-                   lineData.range(of: typedPromptSig) != nil,
-                   let rec = try? titleDecoder.decode(TypedPromptLine.self, from: lineData),
-                   let content = rec.message?.content {
-                    let compact = content
-                        .components(separatedBy: .whitespacesAndNewlines)
-                        .filter { !$0.isEmpty }
-                        .joined(separator: " ")
-                    if !compact.isEmpty {
-                        stats.aiTitle = String(compact.prefix(80))
-                        stats.awaitingPromptTitleAfterClear = false
+                if let rec = try? titleDecoder.decode(UserPromptLine.self, from: lineData) {
+                    if stats.headUuid == nil, rec.type == "user",
+                       let uuid = rec.uuid, !uuid.isEmpty { stats.headUuid = uuid }
+                    if stats.promptPreview == nil,
+                       let preview = Self.promptPreview(from: rec) {
+                        stats.promptPreview = preview
                     }
                 }
                 if lineData.range(of: toolUseIdSig) == nil {
@@ -1833,15 +2015,26 @@ final class SessionIndexer {
                 return
             }
             if lineData.range(of: assistantSig) == nil {
-                // Not user, not assistant — the only other record type
-                // we care about is a title. Forward order means the
-                // last record seen is the newest, so overwrite.
+                // Claude sometimes promotes an internal agent slug into
+                // ai-title, immediately followed by the same agent-name. Undo
+                // that overwrite and retain the last semantic title.
+                if lineData.range(of: agentNameSig) != nil,
+                   let parsed = try? titleDecoder.decode(AgentNameLine.self, from: lineData),
+                   let v = parsed.agentName, !v.isEmpty {
+                    stats.technicalName = v
+                    if stats.aiTitle == v {
+                        stats.aiTitle = stats.previousAITitle
+                        stats.previousAITitle = nil
+                    }
+                }
+                // Forward order means the last semantic title wins.
                 if lineData.range(of: titleSig) != nil,
                    let parsed = try? titleDecoder.decode(TitleLine.self, from: lineData) {
                     if let v = parsed.aiTitle {
-                        if v != stats.suppressedInheritedAITitle {
+                        if v != stats.suppressedInheritedAITitle,
+                           v != stats.technicalName {
+                            if v != stats.aiTitle { stats.previousAITitle = stats.aiTitle }
                             stats.aiTitle = v
-                            stats.awaitingPromptTitleAfterClear = false
                             stats.suppressedInheritedAITitle = nil
                         }
                     }
@@ -1850,6 +2043,8 @@ final class SessionIndexer {
                 return
             }
             guard let rec = try? decoder.decode(AssistantRecord.self, from: lineData) else { return }
+            if stats.headUuid == nil, rec.type == "assistant",
+               let uuid = rec.uuid, !uuid.isEmpty { stats.headUuid = uuid }
             if let branch = rec.gitBranch, !branch.isEmpty {
                 stats.lastGitBranch = branch
             }

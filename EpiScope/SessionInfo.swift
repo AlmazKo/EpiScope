@@ -6,7 +6,7 @@ import Foundation
 // command we put on the clipboard. Real ids are uuids, with a local_ prefix in
 // the Claude desktop store, so anything carrying a separator or a quote is a
 // forgery rather than a session and gets dropped before it can name a file.
-enum SessionID {
+nonisolated enum SessionID {
     static func isValid(_ sid: String) -> Bool {
         guard !sid.isEmpty, sid.count <= 128 else { return false }
         return sid.utf8.allSatisfy { c in
@@ -16,7 +16,7 @@ enum SessionID {
     }
 }
 
-struct SessionInfo: Decodable, Equatable {
+nonisolated struct SessionInfo: Decodable, Equatable {
     let pid: Int
     let sessionId: String
     let cwd: String
@@ -32,9 +32,10 @@ struct SessionInfo: Decodable, Equatable {
     // has been busy ("thinking" elapsed).
     var statusUpdatedAt: Int64?
     var entrypoint: String?
-    // Optional session label from ~/.claude/sessions/<pid>.json (e.g. a
-    // worktree name). Claude sets the terminal tab title to it, so it's the key
-    // that disambiguates several sessions sharing one cwd in Ghostty.
+    // Technical runtime label from ~/.claude/sessions/<pid>.json (e.g. a
+    // worktree slug). Claude sets the terminal tab title to it, so it is useful
+    // for disambiguating several sessions sharing one cwd in Ghostty, but it is
+    // not a user-facing task description.
     var name: String?
 
     // Ctrl-B parks a session: the conversation moves into a background job that
@@ -65,4 +66,14 @@ struct SessionInfo: Decodable, Equatable {
         guard let ms = statusUpdatedAt ?? updatedAt else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
     }
+}
+
+// Process ownership discovered by TerminalTracker. Unlike SessionInfo this is
+// not provider status: it is the pid/cwd observation needed to join Codex's
+// rollout-based waiting verdict to the real process that owns the rollout.
+nonisolated struct TrackedLiveProcess: Equatable, Sendable {
+    let pid: Int
+    let sessionId: String
+    let cwd: String
+    let provider: SessionProvider
 }

@@ -38,6 +38,10 @@ final class TerminalTracker: NSObject {
     // window) — routed here because this class is the UNUserNotification
     // delegate for the whole app.
     var onReportNotificationClick: (() -> Void)?
+    // The monitor owns UI status, but Codex publishes no session-state file.
+    // Hand it the pid → rollout join this tracker already paid to discover so
+    // Stop/Delete do not invent a second lsof/process scanner.
+    var onLiveProcessesChange: (([String: TrackedLiveProcess]) -> Void)?
 
     static let interval: TimeInterval = 1.0
     static let jobId = "terminal-tracker"
@@ -90,6 +94,7 @@ final class TerminalTracker: NSObject {
     // notification state machine can treat them as needs_permission without a
     // second filesystem scan.
     private var codexWaitingSessionIds: Set<String> = []
+    private var suppressedSessionIds: Set<String> = []
     // CC liveness/tty without a `ps` every tick: each pid is ps'd once (to
     // resolve its tty and confirm it's really a claude process), then liveness
     // is a cheap kill(0). ccChecked holds every pid already ps'd (claude or
@@ -99,6 +104,7 @@ final class TerminalTracker: NSObject {
     // Codex pid → (rollout sessionId, cwd, rollout path). A process holds these for
     // its lifetime, so lsof runs once per pid, not every tick.
     private var codexInfoCache: [Int: (sessionId: String, cwd: String, rolloutPath: String)] = [:]
+    private var lastPublishedLiveProcesses: [String: TrackedLiveProcess] = [:]
 
     // Transcript tails are only decoded after the file changes. The state
     // tracker ticks every second, so this keeps a settled session to one stat
@@ -196,6 +202,17 @@ final class TerminalTracker: NSObject {
         let (codex, codexTtys) = codexCache
         sessions += codex
         ttys.merge(codexTtys) { a, _ in a }
+        var liveProcesses: [String: TrackedLiveProcess] = [:]
+        for session in sessions {
+            let provider: SessionProvider = session.entrypoint == "codex" ? .codex : .claude
+            liveProcesses[session.sessionId] = TrackedLiveProcess(
+                pid: session.pid, sessionId: session.sessionId,
+                cwd: session.cwd, provider: provider)
+        }
+        if liveProcesses != lastPublishedLiveProcesses {
+            lastPublishedLiveProcesses = liveProcesses
+            onLiveProcessesChange?(liveProcesses)
+        }
         // Window location (kitty ref/sock, iTerm/Terminal tty, Ghostty
         // surface) is stable between moves, and session state comes from the
         // hook sig files, not these queries — so refresh all the terminal
@@ -249,7 +266,7 @@ final class TerminalTracker: NSObject {
         // their processes instead. One ps for the whole tick, and only when
         // such a session is alive.
         let childAges: [Int: TimeInterval] =
-            sessions.contains { $0.status == nil } ? youngestChildAges() : [:]
+            Self.needsChildAgeScan(sessions) ? youngestChildAges() : [:]
         for s in sessions {
             // Claude desktop ("Code" tab) runs in the Claude app, not a
             // terminal. It has a pid + cwd, so the tty / working-dir matchers
@@ -302,9 +319,9 @@ final class TerminalTracker: NSObject {
             }
             // Codex has no hook signals / "done" semantics here. Its rollout
             // tail exposes both unresolved approvals and terminal turn errors.
-            let running = childAges.isEmpty
-                ? false
-                : toolRunning(pid: s.pid, sid: s.sessionId, ages: childAges)
+            let running = s.isSdkCli && !childAges.isEmpty
+                ? toolRunning(pid: s.pid, sid: s.sessionId, ages: childAges)
+                : false
             let state: String
             if s.entrypoint == "codex" {
                 if codexWaitingSessionIds.contains(s.sessionId) {
@@ -346,7 +363,7 @@ final class TerminalTracker: NSObject {
         }
 
         publish(states)
-        notifyTransitions(bySid)
+        notifyTransitions(bySid.filter { !suppressedSessionIds.contains($0.key) })
         cleanupSignals(liveSids: Set(sessions.map(\.sessionId)))
     }
 
@@ -1188,6 +1205,12 @@ final class TerminalTracker: NSObject {
         }
     }
 
+    func updateSuppressedSessionIds(_ ids: Set<String>) {
+        queue.async { [weak self] in
+            self?.suppressedSessionIds = ids
+        }
+    }
+
     // The user opened this session's home via EpiScope. Window focus can't
     // always be detected (notably the Claude desktop app), so acknowledge
     // explicitly: record the attended mark and wipe a pending `done` signal so
@@ -1378,6 +1401,10 @@ final class TerminalTracker: NSObject {
             ages[ppid] = age
         }
         return ages
+    }
+
+    nonisolated static func needsChildAgeScan(_ sessions: [SessionInfo]) -> Bool {
+        sessions.contains(where: \.isSdkCli)
     }
 
     // ps(1) elapsed time: [[dd-]hh:]mm:ss.

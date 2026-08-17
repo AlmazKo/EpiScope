@@ -57,6 +57,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let fleetTextWidth = menuContentWidth - 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // An application-hosted XCTest bundle launches this executable first.
+        // Keep it as an inert host: the normal single-instance guard would see
+        // the user's running EpiScope, terminate the runner and prevent XCTest
+        // from ever attaching; scanners would also touch real session state.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return
+        }
         // Single instance only: a second EpiScope would race the first
         // on cc-states.json (two publishers). If one's already running,
         // bring it forward and quit this one.
@@ -98,7 +105,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Finished (done) state lives in kittyStates, which changes here
             // rather than via onUpdate — refresh the icon so the yellow blink
             // tracks it.
-            self?.render()
+            if let self {
+                TerminalTracker.shared.updateSuppressedSessionIds(
+                    self.monitor.suppressedSessionIds)
+                self.render()
+            }
             NotificationCenter.default.post(name: .signalLiveStateChanged, object: nil)
             // Only reindex when the set of live sessions changed (one
             // appeared or died) — then the table needs a new/removed row.
@@ -118,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and db opened before indexer.start() so the initial publish lands.
         indexer.onEntriesUpdated = { [weak self] entries in
             self?.searchIndex.reconcile(entries: entries)
+            self?.monitor.updateClearedSessionIds(Set(entries.compactMap(\.clearedFromSessionId)))
             // Feed the tracker each session's terminal label for Ghostty
             // binding, plus the description used as notification/menu context.
             // Claude Desktop's sidebar name is its canonical user-facing task
@@ -128,7 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let label = e.title ?? e.name, !label.isEmpty {
                     titles[e.sessionId] = label
                 }
-                let description = e.isClaudeDesktop ? (e.name ?? e.title) : e.title
+                let description = e.isClaudeDesktop
+                    ? (e.name ?? e.title ?? e.promptPreview)
+                    : (e.title ?? e.promptPreview)
                 if let description, !description.isEmpty {
                     descriptions[e.sessionId] = description
                 }
@@ -144,6 +158,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         searchIndex.open()
 
+        TerminalTracker.shared.onLiveProcessesChange = { [weak monitor] processes in
+            DispatchQueue.main.async {
+                monitor?.updateTrackedProcesses(processes)
+            }
+        }
         monitor.start()
         SessionSourceStore.shared.start()
         indexer.start()
@@ -300,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let waitingIds = Set(monitor.waiting.map(\.sessionId))
         var fleet: [FleetSession] = []
         for (sid, info) in monitor.liveSessions {
+            guard !monitor.suppressedSessionIds.contains(sid) else { continue }
             let state: FleetState?
             if waitingIds.contains(sid) {
                 state = .request
@@ -936,7 +956,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func formattedTitle(for session: SessionInfo) -> NSAttributedString {
         let mainFont = NSFont.menuFont(ofSize: 0)
         let rawDescription = sessionDescriptions[session.sessionId]
-            ?? session.name
             ?? session.folderName
         let oneLineDescription = rawDescription
             .split(whereSeparator: \.isWhitespace)

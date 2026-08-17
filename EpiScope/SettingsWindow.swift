@@ -659,6 +659,8 @@ final class InsightsSettingsViewController: SettingsPaneViewController, NSTextVi
     private let status = NSTextField(labelWithString: "")
     private let restore = NSButton()
     private var saveWork: DispatchWorkItem?
+    private var loadedTemplateName = PromptLibrary.templates.first?.name ?? ""
+    private var saveFailed = false
 
     private var template: PromptLibrary.Template {
         PromptLibrary.templates[max(0, min(picker.indexOfSelectedItem,
@@ -845,6 +847,8 @@ final class InsightsSettingsViewController: SettingsPaneViewController, NSTextVi
 
     private func loadTemplate() {
         let t = template
+        loadedTemplateName = t.name
+        saveFailed = false
         editor.string = PromptLibrary.custom(t.name) ?? PromptLibrary.bundled(t.name) ?? ""
         // A template opens at its first line. Setting the string leaves the
         // scroll where the previous one was read to, which looks like the top
@@ -859,13 +863,15 @@ final class InsightsSettingsViewController: SettingsPaneViewController, NSTextVi
     }
 
     private func refreshStatus() {
-        let customised = PromptLibrary.isCustomised(template.name)
+        let customised = PromptLibrary.isCustomised(loadedTemplateName)
         restore.isEnabled = customised
-        status.stringValue = customised
+        if saveFailed {
+            status.stringValue = "Not saved — prompt cannot be empty"
+        } else {
             // The group heading already explains what editing does; this line
             // only reports which of the two states the template is in.
-            ? "Edited"
-            : "Bundled default"
+            status.stringValue = customised ? "Edited" : "Bundled default"
+        }
     }
 
     @objc private func pickTemplate() {
@@ -877,11 +883,12 @@ final class InsightsSettingsViewController: SettingsPaneViewController, NSTextVi
     // write per keystroke would churn a file the analysis queue reads.
     func textDidChange(_ notification: Notification) {
         saveWork?.cancel()
-        let name = template.name
+        let name = loadedTemplateName
         let text = editor.string
         let work = DispatchWorkItem { [weak self] in
-            PromptLibrary.save(text, for: name)
+            let saved = PromptLibrary.save(text, for: name)
             self?.saveWork = nil
+            self?.saveFailed = !saved
             self?.refreshStatus()
         }
         saveWork = work
@@ -892,12 +899,13 @@ final class InsightsSettingsViewController: SettingsPaneViewController, NSTextVi
         guard let work = saveWork else { return }
         work.cancel()
         saveWork = nil
-        PromptLibrary.save(editor.string, for: template.name)
+        saveFailed = !PromptLibrary.save(editor.string, for: loadedTemplateName)
         refreshStatus()
     }
 
     @objc private func restoreDefault() {
-        let t = template
+        guard let t = PromptLibrary.templates.first(where: { $0.name == loadedTemplateName })
+        else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Restore the default “\(t.title)” prompt?"
@@ -1111,6 +1119,9 @@ final class SourcesSettingsViewController: SettingsPaneViewController, NSTableVi
     // in a button bar that has to explain which row it means.
     private func rowMenu() -> NSMenu {
         let menu = NSMenu()
+        // menuNeedsUpdate owns enablement. AppKit's default automatic pass
+        // otherwise re-enables every item whose target responds to its action.
+        menu.autoenablesItems = false
         menu.delegate = self
         for (title, action) in [("Sync Now", #selector(retrySource)),
                                 ("Clear Cache…", #selector(clearCache)),
@@ -1220,7 +1231,8 @@ final class SourcesSettingsViewController: SettingsPaneViewController, NSTableVi
 
     @objc private func retrySource() {
         let row = targetRow
-        guard row >= 0, row < sources.count else { return }
+        guard row >= 0, row < sources.count,
+              !sources[row].id.hasPrefix("builtin."), sources[row].enabled else { return }
         store.sync(sourceID: sources[row].id, force: true)
     }
 
