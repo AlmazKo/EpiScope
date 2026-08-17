@@ -131,7 +131,7 @@ without the operator switching to the terminal tab.
 #### Scenario: A session stops on a prompt
 - **WHEN** any session enters the waiting-for-permission state
 - **THEN** its bar turns red, stops scrolling and blinks at 1 Hz
-- **AND** the selected system sound plays if `Settings → Sound` is on
+- **AND** the sound picked in `Settings → Alerts` plays, unless it is None
 
 #### Scenario: A session waits for an answer
 - **WHEN** a session finishes a step and waits on the operator
@@ -163,6 +163,13 @@ without the operator switching to the terminal tab.
 - **WHEN** EpiScope shows that session in the fleet dropdown
 - **THEN** the same name is used as its task description
 - **AND** a technical tracker label never replaces it
+
+#### Scenario: Claude exposes only a technical runtime name
+- **GIVEN** a live session is labelled with a worktree or agent slug such as `episcope-7e`
+- **WHEN** EpiScope renders its user-facing task description
+- **THEN** the slug is used only to find the terminal tab
+- **AND** the first real user prompt is shown when no semantic AI title exists
+- **AND** an `ai-title` immediately paired with the same `agent-name` is treated as technical, preserving the previous semantic title
 
 #### Scenario: The fleet dropdown stays alive while open
 - **GIVEN** the status-bar menu remains open
@@ -373,9 +380,11 @@ session.
 #### Scenario: An IDE terminal
 - **GIVEN** the session runs in a JetBrains IDE terminal
 - **WHEN** the operator opens the session
-- **THEN** the app passes the nearest project root through the running IDE's command-line launcher
+- **THEN** the project path comes from the session transcript rather than the IDE agent process cwd
+- **AND** the app passes the nearest project root through the running IDE's command-line launcher
 - **AND** the IDE selects the corresponding macOS project tab
 - **AND** it reuses the open project instead of initializing and disposing a duplicate
+- **AND** an unrecognised or stale cwd only activates the IDE and is never opened as a project
 - **AND** the app does not attempt to select a terminal tab inside the project
 
 #### Scenario: A previously unknown application host
@@ -472,8 +481,24 @@ chart.
 
 #### Scenario: The main window opens
 - **WHEN** the operator opens the main window
-- **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Path, Title, Input, Changes and Last Activity
-- **AND** Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
+- **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Directory, Title, Input, Changes and Last Activity
+- **AND** Directory contains only the project's final directory name
+- **AND** Path, Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
+
+#### Scenario: An IDE creates only Codex session metadata
+- **GIVEN** a Codex rollout contains `session_meta` but no user message, model response or usage
+- **WHEN** the index is published to the table, search, totals or Insights
+- **THEN** that placeholder is not presented as a session
+- **AND** it appears normally if conversation records are later appended to the rollout
+
+#### Scenario: The index format changes on upgrade
+- **GIVEN** the installed version can decode the previous index but must rebuild
+  newly defined fields from the transcripts
+- **WHEN** the app starts the rebuild
+- **THEN** the previous coherent session list remains visible and available to
+  search and Insights until the replacement is complete
+- **AND** the rebuilt index replaces it atomically rather than publishing mixed
+  shallow and deep Codex rows
 
 #### Scenario: Dropping every narrowing at once
 - **GIVEN** a dragged range, filter text or a selected session is narrowing the table
@@ -512,6 +537,15 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **WHEN** the operator opens its window
 - **THEN** the status resets
 
+#### Scenario: A finished turn in a host whose focus cannot be watched
+- **GIVEN** the session runs somewhere no adapter reports window focus — a
+  JetBrains terminal, the Claude app
+- **WHEN** its Stop hook reports the turn finished
+- **THEN** the status still reads `Finished`, because opening the session
+  through EpiScope clears it and the next turn overwrites it
+- **AND** an idle status alone never becomes `Finished` there: that guess leaves
+  nothing to clear, so it would never go away
+
 #### Scenario: A failed stream ends a live turn
 - **GIVEN** Claude's API stream fails and no Stop hook fires
 - **WHEN** Claude's live session status returns from `busy` to `idle`
@@ -528,10 +562,83 @@ The app SHALL show each session's state as one of `Waiting`, `Busy`, `Finished`,
 - **AND** a user-interrupted turn does not count as an error
 - **AND** starting or completing a later turn clears the error
 
+#### Scenario: An approved tool is still running
+- **GIVEN** a `-p` / SDK session, which publishes no status of its own, was
+  granted permission and its tool is executing
+- **WHEN** the table refreshes
+- **THEN** the status reads `Busy`, not `Waiting` — Claude Code has no
+  "permission granted" event, so its permission signal stands until the tool
+  finishes, and the running tool is what says the prompt was answered
+- **AND** the menu-bar alarm and the Perm Wait clock leave it alone
+
 #### Scenario: A session with no reachable terminal
 - **WHEN** the table redraws
 - **THEN** that row is dimmed
 - **AND** `-p` and Claude Desktop sessions show their own marker instead of a terminal icon
+
+### Requirement: Charge a forked conversation once
+
+The app SHALL charge every API call to exactly one session, even when Claude
+Code copied the conversation holding it into a second transcript.
+
+#### Scenario: A conversation is forked
+- **GIVEN** ⌃B, a rewind or a resume from an earlier point copies the records so
+  far into a new session id, and both transcripts stay on disk
+- **WHEN** the index is built
+- **THEN** the two are recognised as one conversation by the uuid of their first
+  record, which the copy preserves
+- **AND** the calls in the copied part are charged to whichever session started
+  earlier, and subtracted from the other
+- **AND** every figure on a row is what that run itself spent, so the totals
+  strip and the project group are the sum of the rows they stand under
+- **AND** copied user messages and copied Edit/Write line changes are charged
+  once, by the same stable-record rule as copied model calls
+
+#### Scenario: A fork adds nothing of its own
+- **WHEN** every call a session holds was already paid for by the one it was
+  forked off
+- **THEN** its row is dimmed, its figures read `—`, and its Title reads
+  `↳ superseded by a fork`
+
+#### Scenario: A session is parked with ⌃B
+- **GIVEN** the conversation moved into a background job and the original
+  transcript stopped mid-turn
+- **WHEN** the table shows both
+- **THEN** the parked row is dimmed, its status reads `Parked` instead of the
+  running clock its own process still publishes, and its Title reads
+  `↳ continued in background`
+- **AND** it keeps its path, model, last activity and whatever it spent after the
+  fork: that part of the conversation lives only in this transcript
+- **AND** its stale process state drives no menu-bar bar, chime, notification,
+  running count, busy clock or permission-wait clock
+
+#### Scenario: The continuation is filtered out
+- **GIVEN** a dragged range, a search term or a narrowed source leaves the parked
+  session on screen without the job that continued it
+- **THEN** the row reads as an ordinary session — there is nothing on screen for
+  it to defer to
+
+#### Scenario: Both processes are gone
+- **GIVEN** ⌃B publishes the link between the two only while they run
+- **WHEN** the app is restarted after they exit
+- **THEN** the pair is still recognised: the link is recorded the first time it
+  is seen and kept, and the shared-prefix accounting never needed it
+
+### Requirement: Date a session by its conversation
+
+The app SHALL report last activity as the newest timestamped record in the
+transcript, not as the file's modification time.
+
+#### Scenario: The CLI touches an old transcript
+- **GIVEN** the session's last message is days old
+- **WHEN** the CLI appends bookkeeping records (mode, permission-mode, titles,
+  agent names) or rewrites the file while it merely sits open
+- **THEN** Last Activity keeps naming the last message, and the sort keeps the
+  session where it belongs
+
+#### Scenario: A transcript with no timestamped record
+- **GIVEN** the file carries no record with a time of its own
+- **THEN** the file's modification time is used
 
 ### Requirement: Tie the selection to the chart
 
@@ -578,6 +685,52 @@ that billed tokens inside that range.
 - **THEN** the range clears rather than filtering the table from behind a chart that no longer shows it
 - **AND** the selected session survives it — only a click on the chart means the operator asked for everything back
 
+### Requirement: Add up what the table shows
+
+The app SHALL total the table's numeric columns in a strip under the rows.
+
+#### Scenario: The totals strip
+- **WHEN** the table has rows
+- **THEN** a strip under them totals Input, Cache read, Output, Cost, Turns,
+  User messages, Changes and Perm wait, each under its own column
+- **AND** Status carries how many of those sessions are running right now
+- **AND** it names the set it adds up — `Total · N sessions`
+- **AND** columns whose values do not add up (model, status, last activity) stay empty
+
+#### Scenario: The totals follow the table
+- **WHEN** a range is dragged, the filter text changes or a source is narrowed
+- **THEN** the totals describe the filtered set, not the whole index
+- **WHEN** a column is resized, reordered, hidden, or the table is scrolled sideways
+- **THEN** every total stays under the column it belongs to
+- **WHEN** the table is empty, or the window is showing a session, search or Insights
+- **THEN** the strip is not there at all
+
+#### Scenario: Live totals change without a reindex
+- **WHEN** a visible session starts, exits, begins waiting or leaves a prompt
+- **THEN** the running count and the open Perm wait total update on the same
+  live-state tick as the row badge
+
+### Requirement: Limit the table to the chart window
+
+The app SHALL offer a setting that keeps in the table only sessions last active
+inside the chart window, and it SHALL be off by default.
+
+#### Scenario: The toggle is on
+- **GIVEN** `Settings → Chart Window Only` is on
+- **WHEN** the table rebuilds
+- **THEN** it holds only sessions whose last activity falls inside the chart window
+- **AND** the count, the grouping and the chart all read that same set
+- **AND** changing `Settings → Chart Window` changes which sessions those are
+
+#### Scenario: The window holds nothing
+- **GIVEN** the setting is on and the index is not empty
+- **WHEN** no session was active inside the window
+- **THEN** the empty table names the window and the setting responsible
+
+#### Scenario: The toggle is off
+- **WHEN** the app is first run
+- **THEN** the setting is off and the table is the whole history
+
 ### Requirement: Group by project
 
 The app SHALL be able to group the table and the chart by working directory.
@@ -606,6 +759,38 @@ The app SHALL index incrementally and show progress while it works.
 - **WHEN** the shallow pass republishes it before the deep scan lands
 - **THEN** the row keeps the numbers from the previous pass
 - **AND** it never blanks its title, project and cost between ticks
+
+### Requirement: Keep settings in one window with sections
+
+The app SHALL offer a settings window shaped like System Settings — a sidebar of
+sections, each shown as islands — and SHALL keep the settings that need more
+than a menu item there.
+
+#### Scenario: Opening Settings
+- **WHEN** the operator presses ⌘, or picks `EpiScope → Settings…`
+- **THEN** a settings window opens with a source-list sidebar naming its
+  sections — `Alerts`, `Sources` and `Insights` — each with its own tinted icon
+- **AND** the section on screen is titled above its content
+- **AND** its controls sit in rounded islands, one row per control, with the
+  explanation under the island rather than beside the control
+
+#### Scenario: One place per setting
+- **WHEN** a setting has a section in this window
+- **THEN** the menu bar does not carry a second way to reach it
+
+#### Scenario: The banner permission
+- **WHEN** `Settings → Alerts` appears
+- **THEN** it reads the current notification grant from the system rather than a
+  pref of its own, and says which of the three states it is in
+- **WHEN** the grant has never been asked for
+- **THEN** the button asks for it, and the state updates on the answer
+- **WHEN** it was granted or refused
+- **THEN** the button opens System Settings, which owns the switch from then on
+
+#### Scenario: Choosing the alert sound
+- **WHEN** the operator picks a sound in `Settings → Alerts`
+- **THEN** it plays once, through the same player the alarm itself uses
+- **AND** `None` silences the alarm without touching the banner
 
 ### Requirement: Keep the filter across navigation
 
@@ -665,8 +850,9 @@ SHALL price them from the model price table.
 The app SHALL let the operator pick the chart window and the bucket size.
 
 #### Scenario: Choosing the window
-- **WHEN** `Settings → Chart Window` is set to 1, 2, 5 or 7 days
+- **WHEN** `Settings → Chart Window` is set to 1, 2, 5, 7 or 30 days
 - **THEN** the bars rebuild for that window
+- **AND** the axis widens its tick spacing so the labels stay apart
 
 #### Scenario: Choosing the bucket size
 - **WHEN** `Settings → Chart Bars` is set to Auto, 5 min, 15 min or 1 hour
@@ -676,6 +862,8 @@ The app SHALL let the operator pick the chart window and the bucket size.
 #### Scenario: The chart recomputes
 - **WHEN** the chart recomputes
 - **THEN** the bucket grid stays anchored to clock boundaries, so bars for past days do not grow
+- **AND** whole-day axis guides advance by calendar days, so midnight labels
+  remain midnight across daylight-saving transitions
 
 #### Scenario: Claude and Codex are both active
 - **WHEN** the aggregate chart recomputes
@@ -1126,13 +1314,46 @@ The app SHALL run the analysis locally.
 The app SHALL limit the Insights settings to a switch and a model choice.
 
 #### Scenario: The settings for Insights
-- **WHEN** the operator opens Settings
-- **THEN** only `Automatic Insights` (on/off) and `Analysis Model` are offered
+- **WHEN** the operator opens `Settings → Insights`
+- **THEN** only automatic runs (on/off) and the analysis model are offered
 - **AND** `Analysis Model` groups its choices by the CLI that runs them: Claude
   Code (Sonnet 4.6 by default, Sonnet 5, Opus 5, Opus 4.8, Haiku 4.5) and Codex
 - **AND** the Codex choice names no model of its own — it runs whatever
   `~/.codex/config.toml` selects, because which models a CLI accepts depends on
   its version and the account's plan
+
+### Requirement: Let the prompts be edited and put back
+
+The analysis prompts already ship as files an override can replace. The app
+SHALL make that override editable under `Settings → Insights` — the run, its
+model and its prompt are one subject — and SHALL keep the way back.
+
+#### Scenario: Editing a prompt
+- **GIVEN** `Settings → Insights` is open on one of the prompt templates
+- **WHEN** the operator edits it
+- **THEN** the edit is saved as the user copy that runs from then on, and the
+  pane says the bundled default is no longer followed
+- **AND** the placeholders the run fills in are listed, read from the bundled copy
+
+#### Scenario: Switching templates with an unsaved edit
+- **GIVEN** the editor still has a pending debounced save for template A
+- **WHEN** the operator selects template B
+- **THEN** A's text is saved only to A, and B opens its own bundled or custom text
+
+#### Scenario: Emptying a prompt
+- **WHEN** the editor contains only whitespace
+- **THEN** the draft is reported as not saved and does not replace the last
+  usable custom prompt or the bundled fallback
+- **AND** an empty override file left by an older release is ignored on read
+
+#### Scenario: Restoring a default
+- **WHEN** the operator restores the default and confirms
+- **THEN** the user copy moves to the Trash and the bundled prompt runs again,
+  including whatever later releases change in it
+
+#### Scenario: A prompt that was never edited
+- **WHEN** the pane opens on a template with no user copy
+- **THEN** it shows the bundled text and offers nothing to restore
 
 **Out of scope:** a manual run over an arbitrary scope, and an ask-a-question
 field. Both were removed on purpose — the surface stays automatic.
@@ -1158,6 +1379,13 @@ by hand.
 - **WHEN** the operator runs `Copy Resume Command` on a Codex session
 - **THEN** the clipboard holds `codex resume <id>`
 
+#### Scenario: A Claude Desktop Code tab
+- **GIVEN** the session ran in the Claude app's Code tab
+- **THEN** `Copy Resume Command` and `Delete Session…` are offered, because it is
+  ordinary Claude Code and its transcript is the CLI's own
+- **AND** a local-agent-mode session is offered neither: the CLI cannot address a
+  session it never wrote
+
 ### Requirement: Reach the original transcript
 
 The app SHALL reveal the session's own file without copying or changing it.
@@ -1165,6 +1393,51 @@ The app SHALL reveal the session's own file without copying or changing it.
 #### Scenario: Reveal Transcript in Finder
 - **WHEN** the operator runs `Reveal Transcript in Finder`
 - **THEN** Finder opens the session's `.jsonl`
+
+### Requirement: End a running session from the table
+
+The app SHALL let the operator stop a running session, performing the shutdown
+`/exit` performs inside it, and SHALL signal only the provider's own process.
+
+#### Scenario: Stop an idle session
+- **GIVEN** the session is running and neither working nor waiting on the operator
+- **WHEN** the operator runs `Stop Session`
+- **THEN** its process is asked to terminate, with no confirmation
+- **AND** the row leaves the live set on the next monitor tick
+
+#### Scenario: Stop a session mid-turn
+- **GIVEN** the session is working or holding a permission prompt
+- **WHEN** the operator runs `Stop Session`
+- **THEN** a confirmation names what ends with it
+- **AND** nothing is signalled unless it is confirmed
+
+#### Scenario: The pid does not belong to the session
+- **GIVEN** the published pid is stale, forged or reused by another program
+- **WHEN** the operator runs `Stop Session`
+- **THEN** nothing is signalled
+
+#### Scenario: The process changes while confirmation is open
+- **GIVEN** a stop or delete sheet captured a live session process
+- **WHEN** that pid exits, is reused or is rebound to another session before confirmation
+- **THEN** nothing is signalled or deleted, because pid, provider, process start
+  time and the current session binding no longer match
+
+#### Scenario: A finished session resumes while delete confirmation is open
+- **GIVEN** the delete sheet opened while no process owned the session
+- **WHEN** that session starts running before the operator confirms
+- **THEN** its transcript remains in place and the operator is told it is now running
+
+#### Scenario: Stop a live Codex session
+- **GIVEN** TerminalTracker has joined a Codex rollout to its real process pid
+- **WHEN** the operator runs `Stop Session`
+- **THEN** EpiScope also proves that the process owns that rollout file
+- **AND** the same identity checks and confirmation behaviour used for Claude apply
+
+#### Scenario: Sessions that cannot be stopped
+- **GIVEN** the session is finished, or runs as a Claude Desktop Code tab
+- **THEN** `Stop Session` is listed with the other session actions but disabled
+- **AND** it is not listed at all where no session action applies — an external
+  source's session, or the local-agent-mode store
 
 ### Requirement: Make deletion reversible and confirmed
 
@@ -1176,9 +1449,20 @@ The app SHALL delete a session only after a confirmation and only to the Trash.
 - **AND** the details of that session close if they are open
 
 #### Scenario: Deleting a running session
-- **GIVEN** the session is still running
+- **GIVEN** the session is still running and the app may signal its process
+- **WHEN** the operator confirms the delete
+- **THEN** the session is stopped first, and the sheet said so
+- **AND** the transcript moves to the Trash only once the process has exited, so
+  its shutdown records go with it
+- **AND** a session that has not exited within the wait is left alone —
+  transcript in place — and says so
+- **AND** if the app cannot prove which live process owns the session, deletion
+  is refused and the transcript stays in place
+
+#### Scenario: Deleting a running Claude Desktop Code tab
+- **GIVEN** the session runs in the Claude app, which the app does not stop
 - **WHEN** the confirmation sheet appears
-- **THEN** it says that the session is still running
+- **THEN** it says so, and says the delete removes only what has been written so far
 
 ### Requirement: Keep temporary sessions out of the index
 
@@ -1204,7 +1488,7 @@ files owned by other tools.
 
 The app SHALL keep the built-in Claude Code, Codex and Claude Desktop roots
 working without configuration and SHALL let the operator add read-only session
-directories from `Settings → Session Sources…`.
+directories from `Settings → Sources`.
 
 #### Scenario: Add a mounted agent home
 - **GIVEN** a directory contains a recognised Claude Code, Codex or Claude Desktop layout
@@ -1212,6 +1496,13 @@ directories from `Settings → Session Sources…`.
 - **THEN** EpiScope synchronises recognised transcript files into its own local snapshot
 - **AND** never mounts, writes to or deletes from the selected directory
 - **AND** sessions keep their original globally unique `sessionId`
+
+#### Scenario: The layout sits below the selected directory
+- **GIVEN** the selected directory is a mounted home, a backup, or holds several agent homes side by side
+- **WHEN** the source synchronises
+- **THEN** every recognised root below it is found, whatever its depth
+- **AND** their transcripts merge into one snapshot per provider
+- **AND** the sessions appear in the main table like any other source
 
 #### Scenario: An external source becomes unavailable
 - **GIVEN** the source has completed at least one successful synchronisation
@@ -1231,8 +1522,16 @@ directories from `Settings → Session Sources…`.
 - **WHEN** the Sessions window opens
 - **THEN** the table shows sessions from every enabled source together, with no
   per-source picker in the toolbar
-- **AND** which sources count at all is decided in `Settings → Session Sources…`,
+- **AND** which sources count at all is decided in `Settings → Sources`,
   the one place that governs them
+
+#### Scenario: Source actions apply only to custom sources
+- **GIVEN** the operator opens a source row's context menu
+- **WHEN** the row is one of the built-in Claude Code, Codex or Claude Desktop roots
+- **THEN** `Sync Now`, `Clear Cache…` and `Remove Source…` are disabled
+- **AND** AppKit validation does not silently re-enable them
+- **WHEN** the row is an enabled custom source
+- **THEN** its applicable actions are enabled, including `Sync Now`
 
 ---
 

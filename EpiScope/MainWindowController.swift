@@ -9,6 +9,8 @@ extension Notification.Name {
     // Fired by AppDelegate when the user toggles Show Temporary in the
     // Settings submenu. MainWindowController reapplies the filter.
     static let signalShowTemporaryChanged = Notification.Name("episcope.showTemporaryChanged")
+    // Same, for the toggle that ties the table to the chart window.
+    static let signalChartWindowOnlyChanged = Notification.Name("episcope.chartWindowOnlyChanged")
     // Fired by ReportStore.save() whenever an analysis report is written (a
     // background daily/weekly insight, or a user-run retro/question).
     // MainWindowController refreshes the unread badge on the Insights item.
@@ -29,12 +31,23 @@ extension Notification.Name {
 // Expansion state is preserved across reloads keyed by cwd.
 
 @MainActor
-final class MainWindowController: NSWindowController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate {
+// NSMenuItemValidation is declared here rather than left implicit: without the
+// conformance validateMenuItem is not @objc, AppKit never finds it, and every
+// row action stays enabled on a row it does not apply to.
+final class MainWindowController: NSWindowController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let indexer: SessionIndexer
     private let monitor: SessionMonitor
     private let searchIndex: SearchIndex
     private var allEntries: [SessionIndexEntry] = []
     private var filteredEntries: [SessionIndexEntry] = []
+    // Rows whose conversation was handed to a background job that is on screen
+    // too (see ParkedSessions). Recomputed with the filter, because a row can
+    // only defer to a continuation the table is actually showing.
+    private var parkedIds: Set<String> = []
+    // Previous ids named by sessions created through /clear. Unlike parkedIds,
+    // this is historical state and does not depend on whether the continuation
+    // is currently visible under the active filters.
+    private var clearedIds: Set<String> = []
     private var searchTerm: String = ""
     // Embedded full-text search view (card feed), shown in-window as a third
     // mode — like the messages/transcript view, not a separate window.
@@ -65,6 +78,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     private static let listChartHeight: CGFloat = 110
     private static let detailsChartHeight: CGFloat = 168
     private var chartHeight = NSLayoutConstraint()
+    // Totals for what the table currently shows, under the rows they add up.
+    private let totalsRow = TotalsRowView()
+    private var totalsHeight = NSLayoutConstraint()
     private let limitChartView = LimitChartView()
     // Ticks the limit gauges' reset countdown while a limit mode is on.
     private var limitTickTimer: Timer? { willSet { limitTickTimer?.invalidate() } }
@@ -204,6 +220,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         set { UserDefaults.standard.set(newValue, forKey: Self.showTempKey) }
     }
 
+    // Off by default: the table is the whole history, and the chart window is a
+    // reading of the recent part of it. Turning this on makes them one view.
+    private static let chartWindowOnlyKey = "limitTableToChartWindow"
+    private var chartWindowOnly: Bool {
+        UserDefaults.standard.bool(forKey: Self.chartWindowOnlyKey)
+    }
+
     private enum ColumnID {
         static let colorDot = NSUserInterfaceItemIdentifier("col.colorDot")
         static let permWait = NSUserInterfaceItemIdentifier("col.permWait")
@@ -211,7 +234,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // Raw string kept as "col.kitty" for saved column-state compat.
         static let terminal = NSUserInterfaceItemIdentifier("col.kitty")
         static let status = NSUserInterfaceItemIdentifier("col.status")
-        static let path = NSUserInterfaceItemIdentifier("col.path")
+        // Keep the old raw id: before Directory and Path were split, col.path
+        // was the visible default column. Reusing it preserves that visibility
+        // and position when an existing installation updates.
+        static let directory = NSUserInterfaceItemIdentifier("col.path")
+        static let path = NSUserInterfaceItemIdentifier("col.fullPath")
         static let name = NSUserInterfaceItemIdentifier("col.name")
         static let title = NSUserInterfaceItemIdentifier("col.title")
         static let model = NSUserInterfaceItemIdentifier("col.model")
@@ -276,6 +303,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             self,
             selector: #selector(handleShowTemporaryChanged),
             name: .signalShowTemporaryChanged,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleChartWindowOnlyChanged),
+            name: .signalChartWindowOnlyChanged,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -382,7 +415,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         guard !chartComputed else { return }
         chartComputed = true
         TokenChartView.computeBuckets(
-            externalEntries: indexer.entries.filter(\.isExternalSource)
+            externalEntries: indexer.userFacingEntries.filter(\.isExternalSource)
         ) { [weak self] buckets, windowEnd in
             self?.chartView.setBuckets(buckets, windowEnd: windowEnd)
         }
@@ -614,15 +647,23 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
         content.addSubview(transcriptScroll)
 
+        totalsRow.translatesAutoresizingMaskIntoConstraints = false
+        totalsRow.table = outlineView
+        content.addSubview(totalsRow)
+
         configureOutline()
         restoreColumnVisibility()
         scroll.documentView = outlineView
+        totalsRow.observe(scrollView: scroll)
         // Right-click the header to pick columns. The header is where a user
         // looks for this first; Settings → Columns stays as the discoverable
         // path and both drive the same toggle, so their ticks cannot disagree.
         outlineView.headerView?.menu = columnsMenu
 
         chartHeight = chartView.heightAnchor.constraint(equalToConstant: Self.listChartHeight)
+        // Collapsed to nothing outside the list, and while the table is empty:
+        // a strip of zeroes under no rows is noise.
+        totalsHeight = totalsRow.heightAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             chartView.topAnchor.constraint(equalTo: content.topAnchor),
             chartView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -646,7 +687,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.bottomAnchor.constraint(equalTo: totalsRow.topAnchor),
+
+            totalsRow.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            totalsRow.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            totalsRow.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            totalsHeight,
 
             // Centred on the rows area, below the header the table keeps drawing.
             emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
@@ -727,8 +773,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         outlineView.columnAutoresizingStyle = .sequentialColumnAutoresizingStyle
 
         // Default order: 1 Color, 2 Vendor icon, 3 Model, 4 Status,
-        // 5 Path, 6 Title, 7 Input, 8 Last Activity. Everything else
-        // (Name / Started / User msgs / Branch / Cache / Output / Cost)
+        // 5 Directory, 6 Title, 7 Input, 8 Last Activity. Everything else
+        // (Path / Name / Started / User msgs / Branch / Cache / Output / Cost)
         // ships hidden; users can re-enable them from Settings → Columns.
 
         let sessionColor = NSTableColumn(identifier: ColumnID.sessionColor)
@@ -778,13 +824,25 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         permWait.isHidden = true
         outlineView.addTableColumn(permWait)
 
+        let directory = NSTableColumn(identifier: ColumnID.directory)
+        directory.title = "Directory"
+        directory.width = 180
+        directory.minWidth = 100
+        directory.sortDescriptorPrototype = NSSortDescriptor(
+            key: SortKey.directory.rawValue, ascending: true)
+        outlineView.addTableColumn(directory)
+        outlineView.outlineTableColumn = directory  // disclosure arrows + group indentation live here
+
+        // The full path is useful on demand, but too wide for the default
+        // table. Its new id has no inherited visibility setting, so it starts
+        // hidden on both fresh installs and upgrades.
         let path = NSTableColumn(identifier: ColumnID.path)
         path.title = "Path"
         path.width = 250
         path.minWidth = 140
         path.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.path.rawValue, ascending: true)
+        path.isHidden = true
         outlineView.addTableColumn(path)
-        outlineView.outlineTableColumn = path  // disclosure arrows + group indentation live here
 
         let title = NSTableColumn(identifier: ColumnID.title)
         title.title = "Title"
@@ -905,8 +963,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // neither show up in the counter nor flood the rest of the
         // pipeline. The indexer itself is also told to skip them (so
         // they don't contribute to the loading indicator either).
-        let raw = indexer.entries
-        allEntries = showTemporary ? raw : raw.filter { !$0.isTemporary }
+        let raw = indexer.userFacingEntries
+        var kept = showTemporary ? raw : raw.filter { !$0.isTemporary }
+        // Same footing as Show Temporary: a setting, applied before the table
+        // counts anything, rather than a narrowing the operator undoes here.
+        if chartWindowOnly {
+            let start = Date().addingTimeInterval(-Double(TokenChartView.windowDays) * 24 * 3600)
+            kept = kept.filter { $0.lastActivity >= start }
+        }
+        allEntries = kept
+        clearedIds = Set(raw.compactMap(\.clearedFromSessionId))
         claudeEffort = Self.readClaudeEffort()
         applyFilter()
     }
@@ -931,10 +997,12 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             if term.isEmpty { return true }
             return e.relativePath.lowercased().contains(term)
                 || (e.title?.lowercased().contains(term) ?? false)
+                || (e.promptPreview?.lowercased().contains(term) ?? false)
                 || e.sessionId.lowercased().contains(term)
                 || e.cwd.lowercased().contains(term)
         }
         sortFilteredEntries()
+        refreshParkedIds()
         let newRoots = makeTree(from: filteredEntries)
 
         // A user sort-header click (forceReorder) always takes the full reload,
@@ -962,6 +1030,98 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
 
         refreshStatusLabel()
         refreshEmptyState()
+        refreshTotals()
+    }
+
+    // Rows that are a conversation's leftovers: parked with ⌃B while a
+    // background job carried it on, or forked away from and never touched
+    // again. They keep their figures — the index charged each API call to one
+    // session already — but they are dimmed, because everything they say is
+    // said better by the session that continued. ⌃B is only trusted while the
+    // continuation is on screen; a brushed range or a search term that hides it
+    // leaves nothing to defer to. Returns true when the set changed.
+    @discardableResult
+    private func refreshParkedIds() -> Bool {
+        let visibleIds = Set(filteredEntries.map(\.sessionId))
+        var next = Set(filteredEntries.filter(\.isSuperseded).map(\.sessionId))
+        for sid in visibleIds {
+            guard let continuation = ParkedSessions.shared.continuations[sid],
+                  visibleIds.contains(continuation) else { continue }
+            next.insert(sid)
+        }
+        guard next != parkedIds else { return false }
+        parkedIds = next
+        return true
+    }
+
+    // Sums of what the table is showing — the filtered set, not the index, so a
+    // dragged range or a search term is answered with its own total rather than
+    // the fleet's. Only columns whose figures add up get one: a sum of models or
+    // of last-activity times would be a number that means nothing.
+    private func refreshTotals() {
+        let visible = windowMode == .list && !filteredEntries.isEmpty
+        totalsHeight.constant = visible ? TotalsRowView.height : 0
+        totalsRow.isHidden = !visible
+        guard visible else { return }
+
+        var input: Int64 = 0, cacheRead: Int64 = 0, output: Int64 = 0
+        var added: Int64 = 0, removed: Int64 = 0
+        var cost = 0.0
+        var turns = 0, userMessages = 0, running = 0
+        var waited: TimeInterval = 0
+        // Every row is summed, parked ones included: the index already charged
+        // each API call to a single session (SessionIndex.resolveForks), so a
+        // figure on screen is one this session spent and nobody else's.
+        for e in filteredEntries {
+            if monitor.isPresentationLive(e.sessionId) { running += 1 }
+            input += e.inputTokens + e.cacheCreationTokens
+            cacheRead += e.cacheReadTokens
+            output += e.outputTokens
+            added += e.linesAdded
+            removed += e.linesRemoved
+            cost += e.costUSD
+            turns += e.turns
+            userMessages += e.userMessageCount
+            waited += monitor.permissionWait(for: e.sessionId)
+        }
+
+        let count = filteredEntries.count
+        // The label goes in the first wide column still on screen; with Directory
+        // hidden it would otherwise be a strip of figures nobody labelled.
+        let labelColumn = [ColumnID.directory, ColumnID.title, ColumnID.path,
+                           ColumnID.name, ColumnID.model]
+            .first { id in
+                outlineView.tableColumns.contains { $0.identifier == id && !$0.isHidden }
+            } ?? ColumnID.directory
+        var values: [NSUserInterfaceItemIdentifier: String] = [
+            labelColumn: "Total · \(count) session\(count == 1 ? "" : "s")",
+            ColumnID.inputTokens: Self.formatTokens(input),
+            ColumnID.cacheReadTokens: Self.formatTokens(cacheRead),
+            ColumnID.outputTokens: Self.formatTokens(output),
+            ColumnID.cost: Self.formatCost(cost),
+            ColumnID.turns: turns > 0 ? "\(turns)" : "",
+            ColumnID.userMessages: userMessages > 0 ? "\(userMessages)" : "",
+        ]
+        if added > 0 || removed > 0 {
+            values[ColumnID.changes] = "+\(added) −\(removed)"
+        }
+        if waited >= 1 { values[ColumnID.permWait] = Self.formatWait(waited) }
+        // How many of these rows are agents running right now — a count, under
+        // the column whose values it counts, rather than a sum of statuses.
+        if running > 0 { values[ColumnID.status] = "\(running) running" }
+
+        totalsRow.setValues(values, alignments: [
+            labelColumn: .left,
+            ColumnID.status: .left,
+            ColumnID.inputTokens: .right,
+            ColumnID.cacheReadTokens: .right,
+            ColumnID.outputTokens: .right,
+            ColumnID.cost: .right,
+            ColumnID.turns: .right,
+            ColumnID.userMessages: .right,
+            ColumnID.changes: .right,
+            ColumnID.permWait: .right,
+        ])
     }
 
     // What an empty table means, in its own words. Naming the narrowing that
@@ -1008,9 +1168,18 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         let text: String
         switch (allEntries.isEmpty, ranged, term.isEmpty) {
         case (true, _, _):
-            text = indexer.pendingDeepScan > 0
-                ? "Reading sessions…"
-                : "No sessions yet. Start one in Claude Code or Codex and it shows up here."
+            let days = TokenChartView.windowDays
+            if indexer.pendingDeepScan > 0 {
+                text = "Reading sessions…"
+            } else if chartWindowOnly, !indexer.userFacingEntries.isEmpty {
+                // The index is not empty — the window is. Name it, since the
+                // sessions are there and nothing on this screen says why they
+                // are not.
+                text = "No sessions in the last \(days == 1 ? "day" : "\(days) days")"
+                    + " — Settings → Chart Window Only."
+            } else {
+                text = "No sessions yet. Start one in Claude Code or Codex and it shows up here."
+            }
         case (false, true, false):
             text = "Nothing matching “\(term)” in the selected range."
         case (false, true, true):
@@ -1159,7 +1328,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // click always lands on the session even when it has no terminal to
         // focus and no live row to highlight.
         if let entry = allEntries.first(where: { $0.sessionId == sessionId })
-            ?? indexer.entries.first(where: { $0.sessionId == sessionId }) {
+            ?? indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) {
             enterDetailsMode(for: entry)
         }
     }
@@ -1397,13 +1566,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if window?.isVisible == true { reloadChart() }
     }
 
-    // Grouping pivots the table to directories: the Path column becomes a
-    // left-most "Directory" column (where the group headers live), and slides
-    // back to its place when grouping is off.
+    // Grouping moves the Directory outline column left, where its group headers
+    // live, and slides it back to its default place when grouping is off.
     private func applyGroupingColumns(_ grouping: Bool) {
-        guard let path = outlineView.tableColumn(withIdentifier: ColumnID.path),
-              let cur = outlineView.tableColumns.firstIndex(of: path) else { return }
-        path.title = grouping ? "Directory" : "Path"
+        guard let directory = outlineView.tableColumn(withIdentifier: ColumnID.directory),
+              let cur = outlineView.tableColumns.firstIndex(of: directory) else { return }
         // Index 3 = right after the colour / provider / terminal icon columns.
         let target = grouping ? 3 : 6
         if cur != target, target < outlineView.tableColumns.count {
@@ -1503,6 +1670,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         else { return }
         col.isHidden.toggle()
         UserDefaults.standard.set(col.isHidden, forKey: Self.columnHiddenKey(raw))
+        refreshTotals()
     }
 
     private static func columnHiddenKey(_ rawIdentifier: String) -> String {
@@ -1529,7 +1697,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // window) and recompute against the new range.
     func chartWindowChanged() {
         guard window?.isVisible == true else { return }
+        // With the table tied to the window, changing the window changes which
+        // sessions exist as far as the table is concerned.
+        if chartWindowOnly { refreshFromIndex() }
         reloadChart()
+    }
+
+    @objc func handleChartWindowOnlyChanged() {
+        guard window?.isVisible == true else { return }
+        refreshFromIndex()
+        refreshStatusLabel()
     }
 
     @objc private func chartModeChanged() {
@@ -1564,7 +1741,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Four used to: Model, Name and Started moved the arrow and reordered
     // nothing, which is the worst kind of wrong because it looks like it worked.
     private enum SortKey: String {
-        case model, permWait, path, title, inputTokens, changes
+        case model, permWait, directory, path, title, inputTokens, changes
         case name, startedAt, userMessages, turns, branch
         case cacheReadTokens, outputTokens, cost, activity
     }
@@ -1574,6 +1751,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
               let key = sort.key.flatMap(SortKey.init(rawValue:)) else { return }
         let asc = sort.ascending
         switch key {
+        case .directory:
+            filteredEntries.sort { cmp($0.folderName, $1.folderName, ascending: asc) }
         case .path:
             filteredEntries.sort { cmp($0.relativePath, $1.relativePath, ascending: asc) }
         case .title:
@@ -1907,12 +2086,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             // Group rows: only render content in the outline column;
             // other columns stay blank so the disclosure arrow + label
             // sit cleanly without competing text.
-            if id == ColumnID.path {
+            if id == ColumnID.directory {
                 let groupId = NSUserInterfaceItemIdentifier("col.group")
                 let cell = (outlineView.makeView(withIdentifier: groupId, owner: self) as? NSTextField) ?? makeTextCell(id: groupId)
                 cell.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
                 cell.alignment = .left
-                cell.stringValue = "\(displayPath(forCwd: cwd))   (\(children.count))"
+                cell.stringValue = "\(directoryName(forCwd: cwd))   (\(children.count))"
+                cell.toolTip = displayPath(forCwd: cwd)
                 return cell
             }
             // The colour now belongs to the directory: its swatch sits on the
@@ -1996,11 +2176,19 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return cwd
     }
 
+    private func directoryName(forCwd cwd: String) -> String {
+        let name = URL(fileURLWithPath: cwd).lastPathComponent
+        return name.isEmpty ? cwd : name
+    }
+
     private func sessionCell(for entry: SessionIndexEntry, node: OutlineNode, columnId id: NSUserInterfaceItemIdentifier) -> NSView? {
+        let parked = parkedIds.contains(entry.sessionId)
         let cell = (outlineView.makeView(withIdentifier: id, owner: self) as? NSTextField) ?? makeTextCell(id: id)
         cell.alignment = .left
         cell.font = .systemFont(ofSize: NSFont.systemFontSize)
         cell.textColor = .labelColor
+        // Only the parked Title carries one, and cells are recycled across rows.
+        cell.toolTip = nil
 
         switch id {
         case ColumnID.colorDot:
@@ -2077,6 +2265,24 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             let viewId = NSUserInterfaceItemIdentifier("col.statusBadge")
             let badge = (outlineView.makeView(withIdentifier: viewId, owner: self) as? StatusBadgeView)
                 ?? StatusBadgeView(identifier: viewId)
+            badge.toolTip = nil
+            if parked, ParkedSessions.shared.continuations[entry.sessionId] != nil {
+                // The process behind a parked session is still alive and still
+                // publishes "busy" — it is the job that is busy, and taking the
+                // foreground record at its word left this row's clock running
+                // for as long as the job ran.
+                badge.configure(text: "Parked",
+                                color: .secondaryLabelColor,
+                                background: nil)
+                return badge
+            }
+            if clearedIds.contains(entry.sessionId) {
+                badge.configure(text: "Cleared",
+                                color: .secondaryLabelColor,
+                                background: nil)
+                badge.toolTip = "Conversation continued in a new session after /clear"
+                return badge
+            }
             let trackerState = monitor.kittyStates[entry.sessionId]
             if trackerState == "error" || trackerState == "error_attended" {
                 // Attention is carried by the menu-bar alarm; the table keeps
@@ -2122,8 +2328,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 }
             } else if entry.provider == .claudeDesktop,
                       Date().timeIntervalSince(entry.lastActivity) < 360 {
-                // Claude desktop has no live hooks; treat a recently-appended
-                // transcript as the agent actively working.
+                // Claude desktop has no live hooks; treat a record written in
+                // the last few minutes as the agent actively working.
                 badge.configure(text: "Active",
                                 color: .white,
                                 background: NSColor.systemGreen.withAlphaComponent(0.85))
@@ -2133,29 +2339,47 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                                 background: nil)
             }
             return badge
-        case ColumnID.path:
+        case ColumnID.directory:
             // Grouped: the directory is the group header, so the outline
             // column shows the session's own label here (no dead space). Flat:
-            // the per-session path. The redundant Title column is hidden while
-            // grouping (see applyGroupingColumns).
+            // only the final directory component. The redundant Title column
+            // is hidden while grouping (see applyGroupingColumns).
             let dim = hasNoTerminal(entry)
             if groupByDir {
-                let raw = (entry.name ?? entry.title ?? "")
+                let raw = (entry.name ?? entry.title ?? entry.promptPreview ?? "")
                     .components(separatedBy: .whitespacesAndNewlines)
                     .filter { !$0.isEmpty }.joined(separator: " ")
                 cell.stringValue = raw.isEmpty ? "—" : raw
                 cell.textColor = raw.isEmpty || dim ? .secondaryLabelColor : .labelColor
             } else {
-                cell.stringValue = entry.relativePath
+                cell.stringValue = entry.folderName
                 cell.textColor = dim ? .secondaryLabelColor : .labelColor
+                cell.toolTip = entry.relativePath
             }
+        case ColumnID.path:
+            cell.stringValue = entry.relativePath
+            cell.textColor = hasNoTerminal(entry) ? .secondaryLabelColor : .labelColor
+            cell.toolTip = entry.cwd
         case ColumnID.name:
             let nm = (entry.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             cell.stringValue = nm.isEmpty ? "—" : nm
             cell.textColor = nm.isEmpty || hasNoTerminal(entry)
                 ? .secondaryLabelColor : .labelColor
         case ColumnID.title:
-            let raw = entry.title ?? ""
+            if parked {
+                let job = ParkedSessions.shared.continuations[entry.sessionId]
+                cell.stringValue = job != nil
+                    ? "↳ continued in background"
+                    : "↳ superseded by a fork"
+                cell.textColor = .secondaryLabelColor
+                cell.toolTip = entry.displayTitle + "\n\n"
+                    + (job != nil
+                       ? "Parked with ⌃B. The conversation continues in the background job."
+                       : "Forked into another session, which holds every call this one made.")
+                    + "\nWhat it shows here is what it spent that nobody else did."
+                return cell
+            }
+            let raw = entry.title ?? entry.promptPreview ?? ""
             // Collapse all interior whitespace (incl. newlines, tabs)
             // into single spaces so a multi-line user prompt renders
             // as one tidy line in the column.
@@ -2238,6 +2462,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         default:
             cell.stringValue = ""
         }
+        // The whole row reads as handed over, not just the columns that emptied.
+        if parked { cell.textColor = .secondaryLabelColor }
         return cell
     }
 
@@ -2551,6 +2777,15 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         return item
     }()
 
+    // Ends the session's process the way `/exit` does from inside it. Shown
+    // only while it is running — see menuNeedsUpdate.
+    private lazy var stopMenuItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Stop Session",
+                              action: #selector(stopClickedSession), keyEquivalent: "")
+        item.target = self
+        return item
+    }()
+
     private func makeRowContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.delegate = self
@@ -2563,6 +2798,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         analyze.target = self
         menu.addItem(analyze)
         menu.addItem(resumeMenuItem)
+        menu.addItem(stopMenuItem)
         menu.addItem(deleteSeparator)
         menu.addItem(deleteMenuItem)
         return menu
@@ -2581,15 +2817,67 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         resumeMenuItem.isHidden = !cli
         deleteMenuItem.isHidden = !cli
         deleteSeparator.isHidden = !cli
+        // Stop rides with the other session actions and greys out instead of
+        // vanishing: a row that cannot be stopped — finished, or a Code tab the
+        // app owns — should say the action exists and does not apply, not leave
+        // the menu a different shape each time it opens. validateMenuItem
+        // decides enablement.
+        stopMenuItem.isHidden = !cli
+    }
+
+    // Stoppable: a session of ours that is running right now, under a pid we
+    // are allowed to signal. An external source's session runs on another
+    // machine. A Claude Desktop one is excluded even where it has a process of
+    // its own — a Code tab does — because ending it closes a tab in the app
+    // rather than performing the /exit that was typed into it.
+    private func canStop(_ entry: SessionIndexEntry) -> Bool {
+        guard !entry.isExternalSource, !isDesktopSession(entry),
+              entry.provider.stoppableProcess != nil,
+              let live = monitor.liveSessions[entry.sessionId]
+        else { return false }
+        return live.pid > 1
+    }
+
+    private func processIdentity(for entry: SessionIndexEntry, transcriptURL: URL? = nil)
+        -> SessionControl.ProcessIdentity? {
+        // A Codex rollout is held open by exactly the process that owns the
+        // session. Prefer that join even when the periodic tracker has already
+        // published a pid: a stale sid→pid snapshot must never authorise a
+        // signal after the original process exited and its pid was reused.
+        if entry.provider == .codex {
+            guard let transcriptURL else { return nil }
+            return SessionControl.identityOwningFile(transcriptURL, provider: entry.provider)
+        }
+        if let live = monitor.liveSessions[entry.sessionId], live.pid > 1,
+           let identity = SessionControl.identity(pid: live.pid, provider: entry.provider) {
+            return identity
+        }
+        if let transcriptURL {
+            return SessionControl.identityOwningFile(transcriptURL, provider: entry.provider)
+        }
+        return nil
+    }
+
+    // Re-resolve both halves after a sheet: the live registry must still bind
+    // this session id to the same pid, and the kernel identity behind that pid
+    // must be unchanged. Codex additionally has its rollout-owner join as a
+    // fallback during the tracker's publication delay.
+    private func processIsCurrent(_ expected: SessionControl.ProcessIdentity,
+                                  for entry: SessionIndexEntry,
+                                  transcriptURL: URL? = nil) -> Bool {
+        processIdentity(for: entry, transcriptURL: transcriptURL) == expected
     }
 
     // A Claude / Codex CLI session: one EpiScope can resume from a shell and
-    // whose transcript it owns (so can move to the Trash). Excludes the
-    // app-managed Claude desktop store.
+    // whose transcript it owns (so can move to the Trash).
+    //
+    // A Claude Desktop *Code tab* qualifies: it is ordinary Claude Code, and its
+    // transcript sits in ~/.claude/projects, exactly where `claude --resume`
+    // looks. Only the local-agent-mode store is out — it is the app's own, and
+    // the CLI cannot address a session it never wrote.
     private func isCliSession(_ entry: SessionIndexEntry) -> Bool {
         !entry.isExternalSource
             && (entry.provider == .claude || entry.provider == .codex)
-            && !isDesktopSession(entry)
     }
 
     // `cd '<cwd>' && claude --resume <id>` (codex: `codex resume <id>`),
@@ -2614,31 +2902,212 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    // Stop a session — the shutdown `/exit` performs, asked for from the table.
+    // An idle session goes straight through: that is the /exit the operator
+    // would have typed. One mid-turn or holding a permission prompt is
+    // confirmed first, because the answer being written ends with it.
+    @objc private func stopClickedSession() {
+        guard let entry = actionSession(), canStop(entry),
+              let live = monitor.liveSessions[entry.sessionId],
+              let transcriptURL = SessionIndexer.transcriptURL(for: entry),
+              let identity = processIdentity(for: entry, transcriptURL: transcriptURL) else {
+            NSSound.beep()
+            return
+        }
+        let working = live.isWaiting || monitor.busyDuration(for: entry.sessionId) != nil
+        guard working else {
+            performStop(entry, identity: identity, transcriptURL: transcriptURL)
+            return
+        }
+        let name = entry.name ?? entry.title ?? entry.folderName
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Stop “\(name)”?"
+        alert.informativeText = live.isWaiting
+            ? "\(entry.relativePath)\n\nIt is waiting for you; the request it is holding ends with it."
+            : "\(entry.relativePath)\n\nIt is working right now; the turn in progress ends with it."
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard let self, resp == .alertFirstButtonReturn,
+                  self.processIsCurrent(identity, for: entry,
+                                        transcriptURL: transcriptURL) else {
+                if resp == .alertFirstButtonReturn { NSSound.beep() }
+                return
+            }
+            self.performStop(entry, identity: identity, transcriptURL: transcriptURL)
+        }
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: confirm)
+        } else {
+            confirm(alert.runModal())
+        }
+    }
+
+    private func performStop(_ entry: SessionIndexEntry,
+                             identity: SessionControl.ProcessIdentity,
+                             transcriptURL: URL) {
+        guard processIsCurrent(identity, for: entry, transcriptURL: transcriptURL) else {
+            NSSound.beep()
+            return
+        }
+        switch SessionControl.stop(identity) {
+        case .stopped:
+            // The monitor polls liveness every second, so the row leaves the
+            // live set on its own — nothing to refresh here.
+            break
+        case .notRunning, .failed:
+            NSSound.beep()
+        }
+    }
+
     // Delete a session: confirm, then move its transcript to the Trash
     // (recoverable) and reindex so the row drops.
+    //
+    // Deleting a running session stops it first — there is no version of this
+    // that leaves the process alive. The CLI does not hold the transcript open,
+    // so a session that keeps running recreates the file at the same path on its
+    // next message: "delete" would land as a truncation nobody asked for.
     @objc private func deleteClickedSession() {
         guard let entry = actionSession(), isCliSession(entry),
               let url = SessionIndexer.transcriptURL(for: entry) else { return }
-        let name = entry.name ?? entry.title ?? entry.folderName
+        let name = entry.displayTitle
+        // A Claude Desktop Code tab is CLI-shaped on disk but app-owned at
+        // runtime. Preserve its documented behaviour: warn, never signal it.
+        let identity = isDesktopSession(entry)
+            ? nil
+            : processIdentity(for: entry, transcriptURL: url)
+        let observedLive = monitor.liveSessions[entry.sessionId] != nil || identity != nil
+        // A live CLI whose process cannot be proven is the one case where
+        // deletion must stop before the confirmation sheet. Removing a file
+        // underneath it would either lose the rest of the run or recreate a
+        // misleading partial transcript.
+        if observedLive, !isDesktopSession(entry), identity == nil {
+            reportUnverifiedLiveSession(name: name)
+            return
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Delete “\(name)”?"
         var info = "\(entry.relativePath)\n\nIts transcript will be moved to the Trash."
-        if monitor.liveSessions[entry.sessionId] != nil {
-            info += "\n\nThis session is still running."
+        if identity != nil {
+            info += "\n\nThis session is running and will be stopped first."
+        } else if observedLive {
+            // Live and not ours to stop — a Claude Desktop Code tab. It writes
+            // an ordinary CLI transcript, so it recreates the file on its next
+            // message; say what the delete actually leaves behind.
+            info += "\n\nThis session runs in the Claude app, which EpiScope cannot "
+                + "stop. Deleting now removes only what it has written so far."
         }
         alert.informativeText = info
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
         let confirm: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-            guard resp == .alertFirstButtonReturn else { return }
-            self?.performDelete(entry, url: url)
+            guard let self, resp == .alertFirstButtonReturn else { return }
+            // Resolve the path again too: a reindex/source change while the
+            // sheet was open must not leave us deleting a stale target.
+            guard let currentURL = SessionIndexer.transcriptURL(for: entry),
+                  currentURL.standardizedFileURL == url.standardizedFileURL else {
+                NSSound.beep()
+                return
+            }
+            if let identity {
+                guard self.processIsCurrent(identity, for: entry,
+                                            transcriptURL: currentURL) else {
+                    NSSound.beep()
+                    return
+                }
+                self.stopThenDelete(entry, url: currentURL, identity: identity)
+            } else {
+                // A row that was finished when the sheet opened can be resumed
+                // while it is on screen. Re-check before touching its file;
+                // a Desktop tab is allowed only when the sheet already warned
+                // that it was live and could not be stopped.
+                let nowIdentity = self.isDesktopSession(entry)
+                    ? nil
+                    : self.processIdentity(
+                        for: entry, transcriptURL: currentURL)
+                let nowLive = self.monitor.liveSessions[entry.sessionId] != nil
+                    || nowIdentity != nil
+                guard observedLive || !nowLive else {
+                    self.reportSessionBecameLive(name: name)
+                    return
+                }
+                self.performDelete(entry, url: currentURL)
+            }
         }
         if let window {
             alert.beginSheetModal(for: window, completionHandler: confirm)
         } else {
             confirm(alert.runModal())
+        }
+    }
+
+    // The delete waits for the process to actually be gone: a shutting-down CLI
+    // still writes its last records, and trashing the file under it would leave
+    // those records in a recreated transcript.
+    private func stopThenDelete(_ entry: SessionIndexEntry, url: URL,
+                                identity: SessionControl.ProcessIdentity) {
+        guard processIsCurrent(identity, for: entry, transcriptURL: url),
+              SessionControl.stop(identity) == .stopped else {
+            // The identity changed between the sheet and the signal, or the
+            // signal itself failed. Do not guess that the transcript is now
+            // safe: a replacement process may already own it.
+            NSSound.beep()
+            return
+        }
+        SessionControl.waitForExit(identity, timeout: 5) { [weak self] exited in
+            guard let self else { return }
+            guard exited else {
+                self.reportStopFailed(name: entry.name ?? entry.title ?? entry.folderName)
+                return
+            }
+            self.performDelete(entry, url: url)
+        }
+    }
+
+    private func reportUnverifiedLiveSession(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” may still be running"
+        alert.informativeText = "EpiScope could not verify the process that owns this session, "
+            + "so its transcript was left in place. Stop it from its terminal, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private func reportSessionBecameLive(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” is now running"
+        alert.informativeText = "Its transcript was left in place. Stop the session, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    // Nothing was deleted, so say so rather than beeping: the operator asked for
+    // two things and got neither.
+    private func reportStopFailed(name: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "“\(name)” did not stop"
+        alert.informativeText = "Its transcript was left in place. Stop the session "
+            + "from its terminal, then delete it."
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
         }
     }
 
@@ -2692,6 +3161,9 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if item.action == #selector(copyResumeCommand)
             || item.action == #selector(deleteClickedSession) {
             return clickedSession().map(isCliSession) ?? false
+        }
+        if item.action == #selector(stopClickedSession) {
+            return clickedSession().map(canStop) ?? false
         }
         return true
     }
@@ -2864,7 +3336,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // scrolling to the specific message a search result was opened from. Brings
     // the main window forward.
     func showMessages(sessionId: String, highlight query: String, scrollTo locator: String? = nil) {
-        guard let entry = indexer.entries.first(where: { $0.sessionId == sessionId }) else { return }
+        guard let entry = indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) else { return }
         show()
         enterDetailsMode(for: entry, highlight: query, scrollTo: locator)
     }
@@ -2903,6 +3375,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             emptyLabel.isHidden = true
             clearFiltersButton.isHidden = true
         }
+        refreshTotals()
         transcriptScroll.isHidden = !isDetails
         sessionChartView.isHidden = !isDetails
         divider.isHidden = isSearch || isInsights
@@ -3007,7 +3480,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func openSessionLikeTableRow(sessionId: String) {
-        guard let entry = indexer.entries.first(where: { $0.sessionId == sessionId }) else {
+        guard let entry = indexer.userFacingEntries.first(where: { $0.sessionId == sessionId }) else {
             NSSound.beep()
             return
         }
@@ -3041,9 +3514,16 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     @objc private func liveStateChanged() {
         syncWaitTicker()
         syncBusyTicker()
+        refreshTotals()
         // "Go to terminal" enables only for a live selection, which can
         // flip as sessions start / die.
         window?.toolbar?.validateVisibleItems()
+        // A park is learned mid-tick, and it moves more than the live columns
+        // below: the row's figures and the totals under them go with it.
+        if refreshParkedIds() {
+            applyFilter()
+            return
+        }
         // The terminal icon, status badge and perm-wait columns depend on
         // live state. Repaint only the visible rows whose live state actually
         // changed since the last repaint — not every visible row. A live-state
@@ -3051,7 +3531,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // row's badge differs, and reloading a row recreates its cell views.
         var dirtyCols = IndexSet()
         for id in [ColumnID.terminal, ColumnID.status, ColumnID.permWait,
-                   ColumnID.path, ColumnID.name, ColumnID.title] {
+                   ColumnID.directory, ColumnID.path, ColumnID.name, ColumnID.title] {
             if let col = outlineView.tableColumn(withIdentifier: id),
                !col.isHidden,
                let colIdx = outlineView.tableColumns.firstIndex(of: col) {
@@ -3109,6 +3589,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     }
 
     private func tickWaitColumn() {
+        refreshTotals()
         guard window?.isVisible == true,
               let col = outlineView.tableColumn(withIdentifier: ColumnID.permWait),
               !col.isHidden,
@@ -3155,6 +3636,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         for row in visible.location..<(visible.location + visible.length) {
             guard let node = outlineView.item(atRow: row) as? OutlineNode,
                   let sid = node.session?.sessionId,
+                  // The process behind a parked session goes on publishing
+                  // "busy" for as long as the job runs. This writes the badge
+                  // in place, so without the check it puts the clock back a
+                  // second after the row rendered `Parked`.
+                  !parkedIds.contains(sid),
                   let dur = monitor.busyDuration(for: sid),
                   let badge = outlineView.view(atColumn: colIdx, row: row, makeIfNecessary: false) as? StatusBadgeView
             else { continue }
@@ -3640,17 +4126,6 @@ final class ColorDotView: NSView {
         return s
     }()
 
-    private static let anthropicImage: NSImage? = loadIcon(name: "anthropic")
-    private static let openaiImage: NSImage? = loadIcon(name: "openai")
-
-    private static func loadIcon(name: String) -> NSImage? {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "svg"),
-              let img = NSImage(contentsOf: url) else { return nil }
-        img.size = NSSize(width: 14, height: 14)
-        img.isTemplate = true
-        return img
-    }
-
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         self.identifier = identifier
@@ -3672,9 +4147,7 @@ final class ColorDotView: NSView {
         if self.provider != provider || imageView.image == nil {
             self.provider = provider
             // Codex → OpenAI; Claude (CLI or desktop) → Anthropic.
-            imageView.image = (provider == .codex)
-                ? Self.openaiImage
-                : Self.anthropicImage
+            imageView.image = ProviderIcon.image(for: provider, size: 14)
         }
         if self.isLoading != isLoading {
             self.isLoading = isLoading

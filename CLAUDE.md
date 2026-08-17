@@ -22,8 +22,13 @@ SourceKit reports cross-file `Cannot find type 'X' in scope` for symbols that
 live in the same module. Those diagnostics are **false** in this environment —
 do not chase them, confirm with a build instead.
 
-There is no test target. Verify a change by building, and by running the app
-when the change is visible:
+Run the regression suite through the shared scheme:
+
+```bash
+xcodebuild -project EpiScope.xcodeproj -scheme EpiScope -configuration Debug test
+```
+
+For visible changes, also run the app:
 
 ```bash
 open ~/Library/Developer/Xcode/DerivedData/EpiScope-*/Build/Products/Debug/EpiScope.app
@@ -69,6 +74,10 @@ the catalog and packets for analysis runs.
 
 `docs/file-io.md` is the detailed map of what is read and written, by whom, when
 and how. Read it before touching any file I/O.
+
+`docs/session-state.md` is the map of the five sources a session's status is
+computed from and how they go stale. Read it before touching a status, a badge,
+a notification or the perm-wait clock.
 
 ## Invariants
 

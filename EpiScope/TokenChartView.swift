@@ -34,7 +34,8 @@ final class TokenChartView: NSView {
             switch days {
             case ...2: return 15 * 60   // 1d → 96, 2d → 192 columns
             case ...5: return 30 * 60   // 5d → 240 columns
-            default:   return 60 * 60   // 7d → 168 columns
+            case ...7: return 60 * 60   // 7d → 168 columns
+            default:   return 4 * 3600  // 30d → 180 columns
             }
         }
         var bucketCount: Int { Int(windowSeconds / bucketSeconds) }
@@ -42,12 +43,25 @@ final class TokenChartView: NSView {
             switch days {
             case 1:  return 2
             case 2:  return 4
-            default: return 12
+            case ...7: return 12
+            // Every tick lands on midnight and draws a date; 12 h would print
+            // sixty labels over the same width.
+            default: return 48          // 30d → 15 ticks
             }
+        }
+
+        // Whole-day guides are wall-clock dates, not elapsed-hour intervals.
+        // Across DST, subtracting 48 hours from midnight lands at 23:00/01:00;
+        // subtracting two calendar days preserves the midnight label.
+        func previousTick(before date: Date, calendar: Calendar) -> Date? {
+            if tickHours >= 24, tickHours.isMultiple(of: 24) {
+                return calendar.date(byAdding: .day, value: -(tickHours / 24), to: date)
+            }
+            return calendar.date(byAdding: .hour, value: -tickHours, to: date)
         }
     }
 
-    nonisolated static let windowDayChoices = [1, 2, 5, 7]
+    nonisolated static let windowDayChoices = [1, 2, 5, 7, 30]
     nonisolated private static let windowDaysKey = "chartWindowDays"
     nonisolated static var windowDays: Int {
         get {
@@ -1069,7 +1083,7 @@ final class TokenChartView: NSView {
             labelX = max(plotRect.minX - 4, min(plotRect.maxX - sz.width + 4, labelX))
             str.draw(at: NSPoint(x: labelX, y: plotRect.minY - 13))
 
-            guard let next = cal.date(byAdding: .hour, value: -tickHours, to: snapped) else { break }
+            guard let next = config.previousTick(before: snapped, calendar: cal) else { break }
             snapped = next
         }
     }

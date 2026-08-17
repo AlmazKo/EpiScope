@@ -127,7 +127,7 @@ final class SearchViewController: NSViewController {
             updateStatus()
             return
         }
-        let byId = Dictionary(indexer.entries.map { ($0.sessionId, $0) }, uniquingKeysWith: { a, _ in a })
+        let byId = Dictionary(indexer.userFacingEntries.map { ($0.sessionId, $0) }, uniquingKeysWith: { a, _ in a })
         for hit in hits {
             let card = SearchResultCardView(hit: hit, entry: byId[hit.sessionId])
             let sid = hit.sessionId

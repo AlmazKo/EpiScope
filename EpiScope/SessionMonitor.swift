@@ -26,6 +26,10 @@ final class SessionMonitor {
     // in MainWindowController) read this; the menu bar icon still only
     // cares about `waiting`.
     private(set) var liveSessions: [String: SessionInfo] = [:]
+    // Lifecycle-terminal rows remain in raw liveSessions for process control
+    // and host icons, but never drive presentation state or attention.
+    private(set) var suppressedSessionIds: Set<String> = []
+    private var clearedSessionIds: Set<String> = []
     var onUpdate: (() -> Void)?
     // Fired whenever the live status map changes — even on transitions
     // (busy → idle, etc.) that don't move the waiting set. Used by the
@@ -40,6 +44,9 @@ final class SessionMonitor {
     // heavy) and cached here; sample() consumes the cache and never blocks
     // on disk. Refreshed on a background queue, at most one read in flight.
     private var codexLive: [SessionInfo] = []
+    // Actual Codex pids come from TerminalTracker's existing lsof join. This
+    // stays main-actor state; the tracker callback hops here before updating it.
+    private var trackedProcesses: [String: TrackedLiveProcess] = [:]
     private var codexRefreshing = false
     private let codexQueue = DispatchQueue(label: "episcope.codex-poll", qos: .utility)
 
@@ -74,6 +81,11 @@ final class SessionMonitor {
     // intentionally open-ended: unknown terminals and desktop apps work without
     // adding another hard-coded kind to EpiScope.
     private(set) var hostBundleIds: [String: String] = [:]
+    // Sessions the tracker sees executing a tool right now. A `-p` / SDK-CLI
+    // session is read as waiting from a trailing tool_use in its transcript,
+    // which looks identical whether the tool is pending approval or running —
+    // this is what tells the two apart, computed off the main thread.
+    private(set) var toolRunning: Set<String> = []
     private var kittyStatesMtime: Date = .distantPast
     private static let kittyStatesURL: URL = FileManager.default
         .homeDirectoryForCurrentUser
@@ -90,6 +102,7 @@ final class SessionMonitor {
             let sessionId: String?
             let term: String?
             let bundleId: String?
+            let toolRunning: Bool?
         }
     }
 
@@ -98,6 +111,7 @@ final class SessionMonitor {
         var fresh: [String: String] = [:]
         var freshTerms: [String: String] = [:]
         var freshBundleIds: [String: String] = [:]
+        var freshToolRunning: Set<String> = []
         if let attrs = try? FileManager.default.attributesOfItem(atPath: Self.kittyStatesURL.path),
            let mtime = attrs[.modificationDate] as? Date,
            // A stale file means the tracker died — don't trust it.
@@ -114,14 +128,17 @@ final class SessionMonitor {
                     fresh[sid] = entry.state
                     if let term = entry.term { freshTerms[sid] = term }
                     if let bundleId = entry.bundleId { freshBundleIds[sid] = bundleId }
+                    if entry.toolRunning == true { freshToolRunning.insert(sid) }
                 }
             }
         }
         guard fresh != kittyStates || freshTerms != terminalKinds
-                || freshBundleIds != hostBundleIds else { return false }
+                || freshBundleIds != hostBundleIds
+                || freshToolRunning != toolRunning else { return false }
         kittyStates = fresh
         terminalKinds = freshTerms
         hostBundleIds = freshBundleIds
+        toolRunning = freshToolRunning
         return true
     }
 
@@ -191,6 +208,31 @@ final class SessionMonitor {
         return total
     }
 
+    func isPresentationLive(_ sessionId: String) -> Bool {
+        liveSessions[sessionId] != nil && !suppressedSessionIds.contains(sessionId)
+    }
+
+    func updateClearedSessionIds(_ ids: Set<String>) {
+        guard ids != clearedSessionIds else { return }
+        clearedSessionIds = ids
+        if refreshSuppressedSessionIds() { onLiveStateChange?() }
+    }
+
+    @discardableResult
+    private func refreshSuppressedSessionIds() -> Bool {
+        let next = Self.suppressionSet(
+            cleared: clearedSessionIds,
+            parkedInto: ParkedSessions.shared.continuations)
+        guard next != suppressedSessionIds else { return false }
+        suppressedSessionIds = next
+        return true
+    }
+
+    nonisolated static func suppressionSet(cleared: Set<String>,
+                                           parkedInto: [String: String]) -> Set<String> {
+        cleared.union(parkedInto.keys)
+    }
+
     private func updateWaitClocks(nowWaiting: Set<String>) {
         let now = Date()
         var dirty = false
@@ -258,6 +300,10 @@ final class SessionMonitor {
         }
     }
 
+    func updateTrackedProcesses(_ processes: [String: TrackedLiveProcess]) {
+        trackedProcesses = processes
+    }
+
     func start() {
         guard !started else { return }
         started = true
@@ -291,11 +337,17 @@ final class SessionMonitor {
         var found: [SessionInfo] = []
         var live: [String: SessionInfo] = [:]
         // Decoded session files come from the shared store (mtime-gated).
-        for var info in SessionStore.shared.sessions()
+        let infos = SessionStore.shared.sessions()
+        // A parked session and the job that took it over are only ever both on
+        // disk here, and only while they run — learn the pair before the
+        // liveness filter drops either half.
+        let parkedLearned = ParkedSessions.shared.observe(infos)
+        let lifecycleChanged = refreshSuppressedSessionIds()
+        for var info in infos
         where Self.isProcessAlive(pid: info.pid) {
             if info.isWaiting || kittyStates[info.sessionId] == "needs_permission" {
                 found.append(info)
-            } else if info.isSdkCli,
+            } else if info.isSdkCli, !toolRunning.contains(info.sessionId),
                       let pending = Self.detectSdkCliPending(sessionId: info.sessionId, cwd: info.cwd) {
                 info.status = "waiting"
                 info.waitingFor = "approve \(pending.toolName)"
@@ -307,23 +359,37 @@ final class SessionMonitor {
         // Codex sessions: served from the background-refreshed cache (no
         // disk I/O on the main thread). Keyed by the rollout uuid the
         // indexer uses. Kick the next refresh for the following tick.
-        for codex in codexLive {
+        var codexWaiting: [String: SessionInfo] = [:]
+        for session in codexLive { codexWaiting[session.sessionId] = session }
+        for process in trackedProcesses.values where process.provider == .codex {
+            let pending = codexWaiting[process.sessionId]
+            let codex = SessionInfo(
+                pid: process.pid, sessionId: process.sessionId, cwd: process.cwd,
+                status: pending?.status, waitingFor: pending?.waitingFor,
+                updatedAt: pending?.updatedAt, entrypoint: "codex")
             live[codex.sessionId] = codex
             if codex.isWaiting { found.append(codex) }
         }
         refreshCodexLiveAsync()
 
+        found.removeAll { suppressedSessionIds.contains($0.sessionId) }
         found.sort { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
         updateWaitClocks(nowWaiting: Set(found.map(\.sessionId)))
 
         let liveChanged = !sameLiveStatus(live, liveSessions)
+        let processBindingsChanged = !Self.sameProcessBindings(live, liveSessions)
         let kittyChanged = refreshKittyStates()
         let waitingChanged = found != waiting
-        if liveChanged { liveSessions = live }
+        // pid/cwd/provider bindings are operational state, not just paint.
+        // Refresh them even when a restarted session kept the same status.
+        liveSessions = live
         updateBusyClocks(live: live)
         if waitingChanged { waiting = found }
         if waitingChanged { onUpdate?() }
-        if liveChanged || kittyChanged { onLiveStateChange?() }
+        if liveChanged || processBindingsChanged || kittyChanged
+                || parkedLearned || lifecycleChanged {
+            onLiveStateChange?()
+        }
     }
 
     // When each session began its current busy spell, so the badge can show how
@@ -341,7 +407,7 @@ final class SessionMonitor {
     private func updateBusyClocks(live: [String: SessionInfo]) {
         let now = Date()
         var nowBusy = Set<String>()
-        for (sid, info) in live where !info.isWaiting {
+        for (sid, info) in live where !info.isWaiting && !suppressedSessionIds.contains(sid) {
             if info.status == "busy" || kittyStates[sid] == "thinking" { nowBusy.insert(sid) }
         }
         for sid in nowBusy where busySince[sid] == nil {
@@ -360,6 +426,16 @@ final class SessionMonitor {
         guard a.count == b.count else { return false }
         for (k, v) in a {
             guard let other = b[k], other.status == v.status else { return false }
+        }
+        return true
+    }
+
+    nonisolated static func sameProcessBindings(_ a: [String: SessionInfo],
+                                                _ b: [String: SessionInfo]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (sid, info) in a {
+            guard let other = b[sid], other.pid == info.pid, other.cwd == info.cwd,
+                  other.entrypoint == info.entrypoint else { return false }
         }
         return true
     }
@@ -449,10 +525,10 @@ final class SessionMonitor {
     // its newest record is a `function_call` with no matching
     // `function_call_output` yet (the agent paused for the user to
     // approve a command/patch) and the file has settled.
-    private static let codexSessionsDir = FileManager.default.homeDirectoryForCurrentUser
+    nonisolated private static let codexSessionsDir = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".codex/sessions", directoryHint: .isDirectory)
-    private static let codexRecentWindow: TimeInterval = 10 * 60   // "live" rollout
-    private static let codexSettleAge: TimeInterval = 2            // skip mid-write
+    nonisolated private static let codexRecentWindow: TimeInterval = 10 * 60
+    nonisolated private static let codexSettleAge: TimeInterval = 2
 
     nonisolated private struct CodexRec: Decodable {
         let type: String?
@@ -464,7 +540,7 @@ final class SessionMonitor {
         }
     }
 
-    private static func readCodexSessions() -> [SessionInfo] {
+    nonisolated private static func readCodexSessions() -> [SessionInfo] {
         let fm = FileManager.default
         let now = Date()
         // Active rollouts live in the start-date folder; today + yesterday

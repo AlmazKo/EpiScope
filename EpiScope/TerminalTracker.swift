@@ -38,6 +38,10 @@ final class TerminalTracker: NSObject {
     // window) — routed here because this class is the UNUserNotification
     // delegate for the whole app.
     var onReportNotificationClick: (() -> Void)?
+    // The monitor owns UI status, but Codex publishes no session-state file.
+    // Hand it the pid → rollout join this tracker already paid to discover so
+    // Stop/Delete do not invent a second lsof/process scanner.
+    var onLiveProcessesChange: (([String: TrackedLiveProcess]) -> Void)?
 
     static let interval: TimeInterval = 1.0
     static let jobId = "terminal-tracker"
@@ -90,6 +94,7 @@ final class TerminalTracker: NSObject {
     // notification state machine can treat them as needs_permission without a
     // second filesystem scan.
     private var codexWaitingSessionIds: Set<String> = []
+    private var suppressedSessionIds: Set<String> = []
     // CC liveness/tty without a `ps` every tick: each pid is ps'd once (to
     // resolve its tty and confirm it's really a claude process), then liveness
     // is a cheap kill(0). ccChecked holds every pid already ps'd (claude or
@@ -99,6 +104,7 @@ final class TerminalTracker: NSObject {
     // Codex pid → (rollout sessionId, cwd, rollout path). A process holds these for
     // its lifetime, so lsof runs once per pid, not every tick.
     private var codexInfoCache: [Int: (sessionId: String, cwd: String, rolloutPath: String)] = [:]
+    private var lastPublishedLiveProcesses: [String: TrackedLiveProcess] = [:]
 
     // Transcript tails are only decoded after the file changes. The state
     // tracker ticks every second, so this keeps a settled session to one stat
@@ -196,6 +202,17 @@ final class TerminalTracker: NSObject {
         let (codex, codexTtys) = codexCache
         sessions += codex
         ttys.merge(codexTtys) { a, _ in a }
+        var liveProcesses: [String: TrackedLiveProcess] = [:]
+        for session in sessions {
+            let provider: SessionProvider = session.entrypoint == "codex" ? .codex : .claude
+            liveProcesses[session.sessionId] = TrackedLiveProcess(
+                pid: session.pid, sessionId: session.sessionId,
+                cwd: session.cwd, provider: provider)
+        }
+        if liveProcesses != lastPublishedLiveProcesses {
+            lastPublishedLiveProcesses = liveProcesses
+            onLiveProcessesChange?(liveProcesses)
+        }
         // Window location (kitty ref/sock, iTerm/Terminal tty, Ghostty
         // surface) is stable between moves, and session state comes from the
         // hook sig files, not these queries — so refresh all the terminal
@@ -244,6 +261,12 @@ final class TerminalTracker: NSObject {
         let ghosttyByPid = assignGhostty(ghosttyEligible.filter {
             (ancestry[$0.pid]?.term ?? "ghostty") == "ghostty"
         })
+        // Sessions that publish no status of their own (`-p` / SDK-CLI) cannot
+        // be rescued from a stale permission signal by their own `busy`, so ask
+        // their processes instead. One ps for the whole tick, and only when
+        // such a session is alive.
+        let childAges: [Int: TimeInterval] =
+            Self.needsChildAgeScan(sessions) ? youngestChildAges() : [:]
         for s in sessions {
             // Claude desktop ("Code" tab) runs in the Claude app, not a
             // terminal. It has a pid + cwd, so the tty / working-dir matchers
@@ -262,7 +285,7 @@ final class TerminalTracker: NSObject {
                     located: true,
                     focused: false)
                 let entry = Entry(
-                    state: state, session_id: s.sessionId,
+                    state: state, tool_running: nil, session_id: s.sessionId,
                     term: "claude-desktop", ref: "com.anthropic.claudefordesktop",
                     bundle_id: "com.anthropic.claudefordesktop",
                     sock: nil, tty: ttys[s.pid], cwd: s.cwd, focused: false, wid: nil)
@@ -296,6 +319,9 @@ final class TerminalTracker: NSObject {
             }
             // Codex has no hook signals / "done" semantics here. Its rollout
             // tail exposes both unresolved approvals and terminal turn errors.
+            let running = s.isSdkCli && !childAges.isEmpty
+                ? toolRunning(pid: s.pid, sid: s.sessionId, ages: childAges)
+                : false
             let state: String
             if s.entrypoint == "codex" {
                 if codexWaitingSessionIds.contains(s.sessionId) {
@@ -317,10 +343,12 @@ final class TerminalTracker: NSObject {
                     statusUpdatedAt: s.statusUpdatedAt,
                     turnErrored: claudeTurnErrored(sessionId: s.sessionId, cwd: s.cwd),
                     located: loc != nil,
-                    focused: loc?.focused ?? false)
+                    focused: loc?.focused ?? false,
+                    toolRunning: running)
             }
             let entry = Entry(
                 state: state,
+                tool_running: running ? true : nil,
                 session_id: s.sessionId,
                 term: term,
                 ref: loc?.ref ?? ancestryRef,
@@ -335,7 +363,7 @@ final class TerminalTracker: NSObject {
         }
 
         publish(states)
-        notifyTransitions(bySid)
+        notifyTransitions(bySid.filter { !suppressedSessionIds.contains($0.key) })
         cleanupSignals(liveSids: Set(sessions.map(\.sessionId)))
     }
 
@@ -424,7 +452,9 @@ final class TerminalTracker: NSObject {
         return (alive, ttys)
     }
 
-    // lsof the codex pid → its open rollout jsonl (→ session uuid) + cwd.
+    // lsof the codex pid → its open rollout jsonl (→ session uuid). The
+    // process cwd is only a fallback: IDE-hosted ACP agents execute from their
+    // installation cache, while session_meta keeps the actual project cwd.
     private func codexLsof(pid: Int) -> (sessionId: String, cwd: String, rolloutPath: String)? {
         guard let out = runShell(["/usr/sbin/lsof", "-p", String(pid), "-Fn"]) else { return nil }
         var sessionId: String?
@@ -444,7 +474,40 @@ final class TerminalTracker: NSObject {
             }
         }
         guard let sid = sessionId, let rolloutPath else { return nil }
-        return (sid, cwd, rolloutPath)
+        let projectCwd = Self.codexSessionCwd(at: rolloutPath) ?? cwd
+        return (sid, projectCwd, rolloutPath)
+    }
+
+    // Read only the first complete JSONL record. Codex writes session_meta
+    // first; bounding this read keeps an untrusted or half-written rollout
+    // from making the 1 s tracker load the whole transcript.
+    nonisolated private static func codexSessionCwd(at path: String) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        else { return nil }
+        defer { try? handle.close() }
+
+        var line = Data()
+        let chunkSize = 64 << 10
+        let maxFirstLineBytes = 8 << 20
+        while line.count <= maxFirstLineBytes,
+              let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            line.append(chunk)
+            if let newline = line.firstIndex(of: 0x0a) {
+                line = Data(line[..<newline])
+                break
+            }
+        }
+        guard !line.isEmpty, line.count <= maxFirstLineBytes else { return nil }
+
+        struct MetaRecord: Decodable {
+            let type: String?
+            let payload: Payload?
+            struct Payload: Decodable { let cwd: String? }
+        }
+        guard let record = try? JSONDecoder().decode(MetaRecord.self, from: line),
+              record.type == "session_meta",
+              let cwd = record.payload?.cwd, cwd.hasPrefix("/") else { return nil }
+        return cwd
     }
 
     // MARK: - kitty adapter
@@ -1009,7 +1072,8 @@ final class TerminalTracker: NSObject {
     private func computeState(sid: String, status: String,
                               statusUpdatedAt: Int64?,
                               turnErrored: Bool,
-                              located: Bool, focused: Bool) -> String {
+                              located: Bool, focused: Bool,
+                              toolRunning: Bool = false) -> String {
         let fm = FileManager.default
         let sigPath = stateDir + "/sig-" + sid
         let attPath = stateDir + "/attended-" + sid
@@ -1023,6 +1087,18 @@ final class TerminalTracker: NSObject {
         if status == "busy" && sig == "needs_permission" {
             try? fm.removeItem(atPath: sigPath)
             sig = ""
+        }
+
+        // Same staleness, without a status to catch it: Claude Code has no
+        // "permission granted" event, so needs_permission stands until the next
+        // signal — and for an approved tool that is PostToolUse, i.e. when the
+        // tool *finishes*. A `sleep 570` therefore read as a permission request
+        // for nine minutes. A `-p` / SDK-CLI session writes no status at all, so
+        // its running tool is the only witness that the prompt was answered. The
+        // signal file is left alone: it is the hook's to clear, and the request
+        // may still be live for the next tool.
+        if status.isEmpty && sig == "needs_permission" && toolRunning {
+            sig = "thinking"
         }
 
         // A failed/stalled API stream may return the authoritative session
@@ -1058,10 +1134,18 @@ final class TerminalTracker: NSObject {
         }
 
         if !located {
-            // No focus signal exists for this session, so the attended
-            // dance can't apply — never derive an unacknowledgeable "done".
             if sig == "needs_permission" || status == "waiting" { return "needs_permission" }
             if sig == "thinking" || status == "busy" { return "thinking" }
+            // A Stop hook is a fact the session reported, and it can be cleared
+            // without focus: opening the session through EpiScope deletes the
+            // signal, and the next turn overwrites it. What must not happen for
+            // a session with no focus signal is *deriving* done from an idle
+            // status — that guess has nothing to delete, so it would stick.
+            //
+            // A JetBrains-hosted session is exactly this case (ancestry finds
+            // its app, no adapter finds its window), and it spent a long time
+            // reporting Idle when the turn had actually finished.
+            if sig == "done" { return "done" }
             return "idle"
         }
 
@@ -1118,6 +1202,12 @@ final class TerminalTracker: NSObject {
     func updateCodexWaitingSessionIds(_ ids: Set<String>) {
         queue.async { [weak self] in
             self?.codexWaitingSessionIds = ids
+        }
+    }
+
+    func updateSuppressedSessionIds(_ ids: Set<String>) {
+        queue.async { [weak self] in
+            self?.suppressedSessionIds = ids
         }
     }
 
@@ -1184,10 +1274,15 @@ final class TerminalTracker: NSObject {
         }
     }
 
-    // MARK: - publish (the cc-states.json v1 contract, see SETUP.md)
+    // MARK: - publish (the cc-states.json v1 contract, see docs/file-io.md)
 
     private struct Entry: Encodable {
         let state: String
+        // Optional v1 extension: a tool of this session is executing right now.
+        // Readers that only know the older shape ignore it; it exists so the
+        // monitor's own "trailing tool_use means waiting" guess can be told
+        // apart from an approved tool still running, without a second ps.
+        let tool_running: Bool?
         let session_id: String
         let term: String?
         let ref: String?
@@ -1291,6 +1386,53 @@ final class TerminalTracker: NSObject {
     }
 
     // MARK: - util
+
+    // pid → age of its youngest child, in seconds. A tool Claude approved runs
+    // as a child of the session; one still waiting for approval has none.
+    private func youngestChildAges() -> [Int: TimeInterval] {
+        guard let out = runShell(["/bin/ps", "-axo", "pid=,ppid=,etime="])
+        else { return [:] }
+        var ages: [Int: TimeInterval] = [:]
+        for line in out.split(separator: "\n") {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 3, let ppid = Int(parts[1]),
+                  let age = Self.parseEtime(String(parts[2])) else { continue }
+            if let known = ages[ppid], known <= age { continue }
+            ages[ppid] = age
+        }
+        return ages
+    }
+
+    nonisolated static func needsChildAgeScan(_ sessions: [SessionInfo]) -> Bool {
+        sessions.contains(where: \.isSdkCli)
+    }
+
+    // ps(1) elapsed time: [[dd-]hh:]mm:ss.
+    private static func parseEtime(_ s: String) -> TimeInterval? {
+        var rest = Substring(s)
+        var days: TimeInterval = 0
+        if let dash = rest.firstIndex(of: "-") {
+            days = TimeInterval(rest[..<dash]) ?? 0
+            rest = rest[rest.index(after: dash)...]
+        }
+        let parts = rest.split(separator: ":").map { TimeInterval($0) }
+        guard !parts.isEmpty, parts.allSatisfy({ $0 != nil }) else { return nil }
+        return days * 86400 + parts.reduce(0) { $0 * 60 + ($1 ?? 0) }
+    }
+
+    // True when the session has a child that started no earlier than the
+    // permission signal — the tool the operator just approved, running. Compared
+    // by start time on purpose: an MCP server launched with the session is a
+    // child for the session's whole life and must not mask a real request. The
+    // slack absorbs the second between the hook writing and the tool spawning.
+    private func toolRunning(pid: Int, sid: String, ages: [Int: TimeInterval]) -> Bool {
+        guard let youngest = ages[pid],
+              let attrs = try? FileManager.default
+                .attributesOfItem(atPath: stateDir + "/sig-" + sid),
+              let signalled = attrs[.modificationDate] as? Date
+        else { return false }
+        return youngest <= Date().timeIntervalSince(signalled) + 2
+    }
 
     private func runShell(_ args: [String]) -> String? {
         let process = Process()
