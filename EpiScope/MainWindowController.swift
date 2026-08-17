@@ -234,7 +234,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // Raw string kept as "col.kitty" for saved column-state compat.
         static let terminal = NSUserInterfaceItemIdentifier("col.kitty")
         static let status = NSUserInterfaceItemIdentifier("col.status")
-        static let path = NSUserInterfaceItemIdentifier("col.path")
+        // Keep the old raw id: before Directory and Path were split, col.path
+        // was the visible default column. Reusing it preserves that visibility
+        // and position when an existing installation updates.
+        static let directory = NSUserInterfaceItemIdentifier("col.path")
+        static let path = NSUserInterfaceItemIdentifier("col.fullPath")
         static let name = NSUserInterfaceItemIdentifier("col.name")
         static let title = NSUserInterfaceItemIdentifier("col.title")
         static let model = NSUserInterfaceItemIdentifier("col.model")
@@ -769,8 +773,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         outlineView.columnAutoresizingStyle = .sequentialColumnAutoresizingStyle
 
         // Default order: 1 Color, 2 Vendor icon, 3 Model, 4 Status,
-        // 5 Path, 6 Title, 7 Input, 8 Last Activity. Everything else
-        // (Name / Started / User msgs / Branch / Cache / Output / Cost)
+        // 5 Directory, 6 Title, 7 Input, 8 Last Activity. Everything else
+        // (Path / Name / Started / User msgs / Branch / Cache / Output / Cost)
         // ships hidden; users can re-enable them from Settings → Columns.
 
         let sessionColor = NSTableColumn(identifier: ColumnID.sessionColor)
@@ -820,13 +824,25 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         permWait.isHidden = true
         outlineView.addTableColumn(permWait)
 
+        let directory = NSTableColumn(identifier: ColumnID.directory)
+        directory.title = "Directory"
+        directory.width = 180
+        directory.minWidth = 100
+        directory.sortDescriptorPrototype = NSSortDescriptor(
+            key: SortKey.directory.rawValue, ascending: true)
+        outlineView.addTableColumn(directory)
+        outlineView.outlineTableColumn = directory  // disclosure arrows + group indentation live here
+
+        // The full path is useful on demand, but too wide for the default
+        // table. Its new id has no inherited visibility setting, so it starts
+        // hidden on both fresh installs and upgrades.
         let path = NSTableColumn(identifier: ColumnID.path)
         path.title = "Path"
         path.width = 250
         path.minWidth = 140
         path.sortDescriptorPrototype = NSSortDescriptor(key: SortKey.path.rawValue, ascending: true)
+        path.isHidden = true
         outlineView.addTableColumn(path)
-        outlineView.outlineTableColumn = path  // disclosure arrows + group indentation live here
 
         let title = NSTableColumn(identifier: ColumnID.title)
         title.title = "Title"
@@ -1069,12 +1085,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         }
 
         let count = filteredEntries.count
-        // The label goes in the first wide column still on screen; with Path
+        // The label goes in the first wide column still on screen; with Directory
         // hidden it would otherwise be a strip of figures nobody labelled.
-        let labelColumn = [ColumnID.path, ColumnID.title, ColumnID.name, ColumnID.model]
+        let labelColumn = [ColumnID.directory, ColumnID.title, ColumnID.path,
+                           ColumnID.name, ColumnID.model]
             .first { id in
                 outlineView.tableColumns.contains { $0.identifier == id && !$0.isHidden }
-            } ?? ColumnID.path
+            } ?? ColumnID.directory
         var values: [NSUserInterfaceItemIdentifier: String] = [
             labelColumn: "Total · \(count) session\(count == 1 ? "" : "s")",
             ColumnID.inputTokens: Self.formatTokens(input),
@@ -1548,13 +1565,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if window?.isVisible == true { reloadChart() }
     }
 
-    // Grouping pivots the table to directories: the Path column becomes a
-    // left-most "Directory" column (where the group headers live), and slides
-    // back to its place when grouping is off.
+    // Grouping moves the Directory outline column left, where its group headers
+    // live, and slides it back to its default place when grouping is off.
     private func applyGroupingColumns(_ grouping: Bool) {
-        guard let path = outlineView.tableColumn(withIdentifier: ColumnID.path),
-              let cur = outlineView.tableColumns.firstIndex(of: path) else { return }
-        path.title = grouping ? "Directory" : "Path"
+        guard let directory = outlineView.tableColumn(withIdentifier: ColumnID.directory),
+              let cur = outlineView.tableColumns.firstIndex(of: directory) else { return }
         // Index 3 = right after the colour / provider / terminal icon columns.
         let target = grouping ? 3 : 6
         if cur != target, target < outlineView.tableColumns.count {
@@ -1724,7 +1739,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
     // Four used to: Model, Name and Started moved the arrow and reordered
     // nothing, which is the worst kind of wrong because it looks like it worked.
     private enum SortKey: String {
-        case model, permWait, path, title, inputTokens, changes
+        case model, permWait, directory, path, title, inputTokens, changes
         case name, startedAt, userMessages, turns, branch
         case cacheReadTokens, outputTokens, cost, activity
     }
@@ -1734,6 +1749,8 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
               let key = sort.key.flatMap(SortKey.init(rawValue:)) else { return }
         let asc = sort.ascending
         switch key {
+        case .directory:
+            filteredEntries.sort { cmp($0.folderName, $1.folderName, ascending: asc) }
         case .path:
             filteredEntries.sort { cmp($0.relativePath, $1.relativePath, ascending: asc) }
         case .title:
@@ -2067,12 +2084,13 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
             // Group rows: only render content in the outline column;
             // other columns stay blank so the disclosure arrow + label
             // sit cleanly without competing text.
-            if id == ColumnID.path {
+            if id == ColumnID.directory {
                 let groupId = NSUserInterfaceItemIdentifier("col.group")
                 let cell = (outlineView.makeView(withIdentifier: groupId, owner: self) as? NSTextField) ?? makeTextCell(id: groupId)
                 cell.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
                 cell.alignment = .left
-                cell.stringValue = "\(displayPath(forCwd: cwd))   (\(children.count))"
+                cell.stringValue = "\(directoryName(forCwd: cwd))   (\(children.count))"
+                cell.toolTip = displayPath(forCwd: cwd)
                 return cell
             }
             // The colour now belongs to the directory: its swatch sits on the
@@ -2154,6 +2172,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         if cwd.hasPrefix(home + "/") { return "~" + cwd.dropFirst(home.count) }
         if cwd == home { return "~" }
         return cwd
+    }
+
+    private func directoryName(forCwd cwd: String) -> String {
+        let name = URL(fileURLWithPath: cwd).lastPathComponent
+        return name.isEmpty ? cwd : name
     }
 
     private func sessionCell(for entry: SessionIndexEntry, node: OutlineNode, columnId id: NSUserInterfaceItemIdentifier) -> NSView? {
@@ -2314,11 +2337,11 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                                 background: nil)
             }
             return badge
-        case ColumnID.path:
+        case ColumnID.directory:
             // Grouped: the directory is the group header, so the outline
             // column shows the session's own label here (no dead space). Flat:
-            // the per-session path. The redundant Title column is hidden while
-            // grouping (see applyGroupingColumns).
+            // only the final directory component. The redundant Title column
+            // is hidden while grouping (see applyGroupingColumns).
             let dim = hasNoTerminal(entry)
             if groupByDir {
                 let raw = (entry.name ?? entry.title ?? "")
@@ -2327,9 +2350,14 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
                 cell.stringValue = raw.isEmpty ? "—" : raw
                 cell.textColor = raw.isEmpty || dim ? .secondaryLabelColor : .labelColor
             } else {
-                cell.stringValue = entry.relativePath
+                cell.stringValue = entry.folderName
                 cell.textColor = dim ? .secondaryLabelColor : .labelColor
+                cell.toolTip = entry.relativePath
             }
+        case ColumnID.path:
+            cell.stringValue = entry.relativePath
+            cell.textColor = hasNoTerminal(entry) ? .secondaryLabelColor : .labelColor
+            cell.toolTip = entry.cwd
         case ColumnID.name:
             let nm = (entry.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             cell.stringValue = nm.isEmpty ? "—" : nm
@@ -3385,7 +3413,7 @@ final class MainWindowController: NSWindowController, NSOutlineViewDataSource, N
         // row's badge differs, and reloading a row recreates its cell views.
         var dirtyCols = IndexSet()
         for id in [ColumnID.terminal, ColumnID.status, ColumnID.permWait,
-                   ColumnID.path, ColumnID.name, ColumnID.title] {
+                   ColumnID.directory, ColumnID.path, ColumnID.name, ColumnID.title] {
             if let col = outlineView.tableColumn(withIdentifier: id),
                !col.isHidden,
                let colIdx = outlineView.tableColumns.firstIndex(of: col) {

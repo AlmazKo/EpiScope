@@ -474,8 +474,9 @@ chart.
 
 #### Scenario: The main window opens
 - **WHEN** the operator opens the main window
-- **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Path, Title, Input, Changes and Last Activity
-- **AND** Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
+- **THEN** the table shows Color, AI (provider), App (hosting application), Model, Status, Directory, Title, Input, Changes and Last Activity
+- **AND** Directory contains only the project's final directory name
+- **AND** Path, Perm Wait, Name, Started, User msgs, Turns, Branch, Cache, Output and Cost are hidden until they are turned on
 
 #### Scenario: An IDE creates only Codex session metadata
 - **GIVEN** a Codex rollout contains `session_meta` but no user message, model response or usage
