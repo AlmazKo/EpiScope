@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="episcope.png" width="88" alt="EpiScope icon">
+  <img src="docs/img/episcope.png" width="88" alt="EpiScope icon">
 </p>
 
 <h1 align="center">EpiScope</h1>

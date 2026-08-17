@@ -12,8 +12,8 @@ coloured exactly like the real one.
 
 Reads the index of whoever runs it, so its output never leaves this machine:
 
-    ./make-demo-fleet.py            # rebuild the document
-    ./make-demo-fleet.py --stdout   # preview without writing
+    ./scripts/make-demo-fleet.py            # rebuild the document
+    ./scripts/make-demo-fleet.py --stdout   # preview without writing
 
 Then `defaults write almazko.EpiScope demoFleet -bool YES` and relaunch.
 """
